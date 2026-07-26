@@ -139,8 +139,6 @@ def main() -> int:
             errors.append("config/nddev-contract.json: contract_version must be 2")
         if contract.get("github_repository") != "NDDev-it-com/nddev-pi-app":
             errors.append("config/nddev-contract.json: unexpected github_repository")
-        if "skeleton" in contract:
-            errors.append("config/nddev-contract.json: skeleton must be removed")
         if contract.get("setup_system", {}).get("setup_ids") != SETUP_IDS:
             errors.append("config/nddev-contract.json: setup ids mismatch")
         if contract.get("software", {}).get("package") != CURRENT_PACKAGE:

@@ -84,32 +84,17 @@ CHILD_ENV_ALLOWLIST = {
     "COLORTERM",
     "SYSTEMROOT",
 }
-PROVIDER_SECRET_NAMES = {
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_OAUTH_TOKEN",
-    "OPENAI_API_KEY",
-    "AZURE_OPENAI_API_KEY",
-    "GOOGLE_API_KEY",
-    "GEMINI_API_KEY",
-    "GROQ_API_KEY",
-    "XAI_API_KEY",
-    "OPENROUTER_API_KEY",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "MOONSHOT_API_KEY",
-    "KIMI_API_KEY",
-    "QWEN_TOKEN_PLAN_API_KEY",
-    "ZAI_API_KEY",
-}
-PACKAGE_MANAGER_SECRET_NAMES = {
+SENSITIVE_ENVIRONMENT_SUFFIXES = (
+    "_API_KEY",
+    "_AUTH_TOKEN",
+    "_TOKEN",
+    "_SECRET",
+)
+SENSITIVE_ENVIRONMENT_EXACT = {
+    "BUN_AUTH_TOKEN",
+    "BUN_CONFIG_REGISTRY",
     "NODE_AUTH_TOKEN",
     "NPM_TOKEN",
-    "BUN_AUTH_TOKEN",
-    "npm_config_userconfig",
-    "npm_config_prefix",
 }
 PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent"
 PI_PACKAGE_VERSION = "0.82.1"
@@ -253,6 +238,32 @@ def is_current_user_owner(info: os.stat_result) -> bool:
 def require_current_user_owner(info: os.stat_result, label: str) -> None:
     if not is_current_user_owner(info):
         fail(f"{label} must be owned by the current user")
+
+
+def is_sensitive_environment_name(name: str) -> bool:
+    upper = name.upper()
+    lower = name.lower()
+    if upper.startswith("AWS_"):
+        return True
+    if lower.startswith("npm_config_"):
+        return True
+    if upper in SENSITIVE_ENVIRONMENT_EXACT:
+        return True
+    return upper.endswith(SENSITIVE_ENVIRONMENT_SUFFIXES)
+
+
+def assert_no_sensitive_environment(env: dict[str, str], label: str) -> None:
+    leaked = sorted(name for name in env if is_sensitive_environment_name(name))
+    if leaked:
+        fail(f"{label} contains sensitive environment variables: {', '.join(leaked)}")
+
+
+def child_base_environment() -> dict[str, str]:
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name in CHILD_ENV_ALLOWLIST and not is_sensitive_environment_name(name)
+    }
 
 
 def stat_optional(path: Path, label: str) -> os.stat_result | None:
@@ -1224,7 +1235,7 @@ def safe_bun_env(stage_workspace: Path) -> dict[str, str]:
         stage_workspace / "bin",
     ):
         directory.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
-    return {
+    env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(xdg_config),
@@ -1233,6 +1244,8 @@ def safe_bun_env(stage_workspace: Path) -> dict[str, str]:
         "BUN_INSTALL_BIN": str(stage_workspace / "bin"),
         "BUN_INSTALL_CACHE_DIR": str(cache),
     }
+    assert_no_sensitive_environment(env, "bun installer environment")
+    return env
 
 
 def read_process_output(handle: Any, label: str) -> str:
@@ -1294,6 +1307,7 @@ def resolve_node_runtime(stage_workspace: Path) -> dict[str, str]:
     for directory in (tmp, home):
         directory.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
     env = {"HOME": str(home), "TMPDIR": str(tmp), "PATH": "/usr/bin:/bin"}
+    assert_no_sensitive_environment(env, "node probe environment")
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
             completed = subprocess.run(
@@ -1346,6 +1360,7 @@ def run_stage_version_probe(
         "PATH": f"{node_parent}{os.pathsep}/usr/bin:/bin",
         "TMPDIR": str(tmp),
     }
+    assert_no_sensitive_environment(env, "staged Pi version probe environment")
     command = [str(stage_current / "bin" / PI_COMMAND), "--version"]
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
@@ -1962,7 +1977,7 @@ def software_plan(target: Path) -> dict[str, Any]:
 
 
 def build_child_env(target: Path, node_runtime: dict[str, str]) -> dict[str, str]:
-    child_env = {name: value for name, value in os.environ.items() if name in CHILD_ENV_ALLOWLIST}
+    child_env = child_base_environment()
     runtime_home = target / ".nddev-pi-runtime" / "home"
     xdg_config = target / ".nddev-pi-runtime" / "xdg-config"
     xdg_data = target / ".nddev-pi-runtime" / "xdg-data"
@@ -2006,6 +2021,7 @@ def build_child_env(target: Path, node_runtime: dict[str, str]) -> dict[str, str
             "PI_TELEMETRY": "0",
         }
     )
+    assert_no_sensitive_environment(child_env, "Pi child environment")
     return child_env
 
 
