@@ -12,6 +12,8 @@ global package installation.
 - Command: `pi`
 - Package: `@earendil-works/pi-coding-agent`
 - Tested version: `0.82.1`
+- Package bin: `dist/cli.js`
+- Node requirement: `>=22.19.0`
 - Official repository: <https://github.com/earendil-works/pi>
 - Official docs: <https://pi.dev/docs/latest>
 
@@ -28,10 +30,22 @@ python3 cli-tools/nddev_pi.py status --target /absolute/pi-target
 python3 cli-tools/nddev_pi.py switch --setup balanced --target /absolute/pi-target
 python3 cli-tools/nddev_pi.py restore --backup 0 --target /absolute/pi-target
 python3 cli-tools/nddev_pi.py remove --target /absolute/pi-target
+python3 cli-tools/nddev_pi.py software-plan --target /absolute/pi-target
+python3 cli-tools/nddev_pi.py software-status --target /absolute/pi-target
+python3 cli-tools/nddev_pi.py software-install --target /absolute/pi-target
+python3 cli-tools/nddev_pi.py software-update --target /absolute/pi-target
 python3 cli-tools/nddev_pi.py launch --target /absolute/pi-target -- --help
 ```
 
-`launch` starts `pi` with target-local `HOME`, `PI_CODING_AGENT_DIR`,
+`software-install` uses `bun add --global --exact
+@earendil-works/pi-coding-agent@0.82.1` in an isolated staging directory with
+target-owned `BUN_INSTALL_GLOBAL_DIR`, `BUN_INSTALL_BIN`, `BUN_INSTALL_CACHE_DIR`,
+`HOME`, `XDG_CONFIG_HOME`, and `TMPDIR`. The package declares no consumer
+`preinstall`, `install`, or `postinstall` lifecycle script, so the manager does
+not use Bun `--trust`.
+
+`launch` starts the target-owned `<target>/bin/pi` wrapper with target-local
+`HOME`, `XDG_*`, `TMPDIR`, `PATH`, `PI_CODING_AGENT_DIR`,
 `PI_CODING_AGENT_SESSION_DIR`, and `PI_PACKAGE_DIR`. Provider API keys are not
 forwarded.
 

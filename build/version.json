@@ -6,7 +6,10 @@
   "pi_package_name": "@earendil-works/pi-coding-agent",
   "pi_coding_agent_tested": "0.82.1",
   "pi_command": "pi",
+  "pi_package_bin": "dist/cli.js",
   "pi_node_requires": ">=22.19.0",
+  "pi_registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+  "pi_registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
   "runtime_baseline_ref": "references/pi-baseline.json",
   "nddev_builder_package_version": "0.1.0"
 }

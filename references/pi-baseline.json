@@ -25,8 +25,26 @@
     "command": "pi",
     "bin": "dist/cli.js",
     "install_docs": "https://pi.dev/docs/latest",
-    "install_script": "https://pi.dev/install.sh",
-    "official_install_command": "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+    "install_script": "https://pi.dev/install.sh"
+  },
+  "manager_installation": {
+    "tool": "bun",
+    "argv": ["add", "--global", "--exact", "@earendil-works/pi-coding-agent@0.82.1"],
+    "trust": false,
+    "consumer_lifecycle_scripts": {
+      "preinstall": null,
+      "install": null,
+      "postinstall": null,
+      "prepublishOnly": "npm run clean && npm run build && npm run shrinkwrap"
+    },
+    "staging_environment": {
+      "BUN_INSTALL_GLOBAL_DIR": "<stage>/install/global",
+      "BUN_INSTALL_BIN": "<stage>/bin",
+      "BUN_INSTALL_CACHE_DIR": "<stage>/cache",
+      "HOME": "<stage>/home",
+      "XDG_CONFIG_HOME": "<stage>/xdg-config",
+      "TMPDIR": "<stage>/tmp"
+    }
   },
   "configuration": {
     "global_settings": "~/.pi/agent/settings.json",

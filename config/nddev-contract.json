@@ -55,12 +55,37 @@
     "package": "@earendil-works/pi-coding-agent",
     "current_version": "0.82.1",
     "command": "pi",
+    "bin": "dist/cli.js",
+    "node_requirement": ">=22.19.0",
+    "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+    "registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
     "repository": "https://github.com/earendil-works/pi",
-    "status_command": "python3 cli-tools/nddev_pi.py software-status [--json]",
-    "install_command": "python3 cli-tools/nddev_pi.py software-install [--json]",
-    "update_command": "python3 cli-tools/nddev_pi.py software-update [--json]",
-    "install_execution": "dry-run-metadata-only",
-    "update_execution": "dry-run-metadata-only"
+    "plan_command": "python3 cli-tools/nddev_pi.py software-plan --target <absolute-dir> [--json]",
+    "status_command": "python3 cli-tools/nddev_pi.py software-status --target <absolute-dir> [--json]",
+    "install_command": "python3 cli-tools/nddev_pi.py software-install --target <absolute-dir> [--json]",
+    "update_command": "python3 cli-tools/nddev_pi.py software-update --target <absolute-dir> [--json]",
+    "install_execution": "bun add --global --exact in isolated target-owned staging, then atomic swap",
+    "update_execution": "safe partial repair/update through isolated staging and rollback",
+    "installer": {
+      "tool": "bun",
+      "argv": ["add", "--global", "--exact", "@earendil-works/pi-coding-agent@0.82.1"],
+      "trust": false,
+      "env": {
+        "BUN_INSTALL_GLOBAL_DIR": "<stage>/install/global",
+        "BUN_INSTALL_BIN": "<stage>/bin",
+        "BUN_INSTALL_CACHE_DIR": "<stage>/cache",
+        "HOME": "<stage>/home",
+        "XDG_CONFIG_HOME": "<stage>/xdg-config",
+        "TMPDIR": "<stage>/tmp"
+      }
+    },
+    "target_owned": {
+      "software_root": ".nddev-pi-software/current",
+      "entrypoint": "bin/pi",
+      "stamp_file": "NDDEV-PI-SOFTWARE.json",
+      "status_executes_target_binary": false,
+      "launch_uses_target_entrypoint": true
+    }
   },
   "builder_projection": {
     "default_on": true,

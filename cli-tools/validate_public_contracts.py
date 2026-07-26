@@ -15,11 +15,14 @@ CURRENT_REPOSITORY = "https://github.com/earendil-works/pi"
 REQUIRED_VERSION_KEYS = {
     "build_version",
     "nddev_builder_package_version",
+    "pi_package_bin",
     "pi_coding_agent_tested",
     "pi_command",
     "pi_node_requires",
     "pi_package_name",
     "pi_product_name",
+    "pi_registry_integrity",
+    "pi_registry_shasum",
     "python_requires",
     "runtime_baseline_ref",
     "schema_version",
@@ -84,6 +87,17 @@ def main() -> int:
             errors.append("build/version.json: pi_package_name mismatch")
         if version.get("pi_command") != "pi":
             errors.append("build/version.json: pi_command must be pi")
+        if version.get("pi_package_bin") != "dist/cli.js":
+            errors.append("build/version.json: pi_package_bin mismatch")
+        if version.get("pi_node_requires") != ">=22.19.0":
+            errors.append("build/version.json: pi_node_requires mismatch")
+        if version.get("pi_registry_integrity") != (
+            "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
+            "XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
+        ):
+            errors.append("build/version.json: pi_registry_integrity mismatch")
+        if version.get("pi_registry_shasum") != "39c00809ff5531b6552b9ecb2c41f4c3529ec988":
+            errors.append("build/version.json: pi_registry_shasum mismatch")
 
     if manifest is not None and version is not None:
         if manifest.get("build_version") != version.get("build_version"):
@@ -96,6 +110,29 @@ def main() -> int:
         runtime = manifest.get("runtime_launch")
         if not isinstance(runtime, dict) or runtime.get("provider_secret_inheritance") is not False:
             errors.append("build/manifest.json: launch must not inherit provider secrets")
+        software = manifest.get("software")
+        if not isinstance(software, dict):
+            errors.append("build/manifest.json: software contract is missing")
+        else:
+            if software.get("package") != CURRENT_PACKAGE or software.get("version") != "0.82.1":
+                errors.append("build/manifest.json: software package/version mismatch")
+            if (
+                software.get("bin") != "dist/cli.js"
+                or software.get("node_requirement") != ">=22.19.0"
+            ):
+                errors.append("build/manifest.json: software bin/node mismatch")
+            installer = software.get("installer")
+            if not isinstance(installer, dict):
+                errors.append("build/manifest.json: software installer missing")
+            elif installer.get("argv") != [
+                "add",
+                "--global",
+                "--exact",
+                "@earendil-works/pi-coding-agent@0.82.1",
+            ]:
+                errors.append("build/manifest.json: software installer argv mismatch")
+            elif installer.get("trust") is not False:
+                errors.append("build/manifest.json: software installer trust must be false")
 
     if contract is not None:
         if contract.get("contract_version") != 2:
@@ -108,6 +145,31 @@ def main() -> int:
             errors.append("config/nddev-contract.json: setup ids mismatch")
         if contract.get("software", {}).get("package") != CURRENT_PACKAGE:
             errors.append("config/nddev-contract.json: software package mismatch")
+        software = contract.get("software", {})
+        if software.get("bin") != "dist/cli.js":
+            errors.append("config/nddev-contract.json: software bin mismatch")
+        if software.get("node_requirement") != ">=22.19.0":
+            errors.append("config/nddev-contract.json: software node requirement mismatch")
+        if software.get("registry_shasum") != "39c00809ff5531b6552b9ecb2c41f4c3529ec988":
+            errors.append("config/nddev-contract.json: software shasum mismatch")
+        installer = software.get("installer")
+        if not isinstance(installer, dict) or installer.get("tool") != "bun":
+            errors.append("config/nddev-contract.json: software installer tool mismatch")
+        elif installer.get("argv") != [
+            "add",
+            "--global",
+            "--exact",
+            "@earendil-works/pi-coding-agent@0.82.1",
+        ]:
+            errors.append("config/nddev-contract.json: software installer argv mismatch")
+        elif installer.get("trust") is not False:
+            errors.append("config/nddev-contract.json: software installer trust must be false")
+        target_owned = software.get("target_owned")
+        if (
+            not isinstance(target_owned, dict)
+            or target_owned.get("status_executes_target_binary") is not False
+        ):
+            errors.append("config/nddev-contract.json: software status must be side-effect free")
         marketplace = contract.get("builder_projection", {}).get("marketplace", {})
         if marketplace.get("external_marketplace_published") is not None:
             errors.append("config/nddev-contract.json: external marketplace must remain null")
@@ -126,6 +188,31 @@ def main() -> int:
             errors.append("references/pi-baseline.json: package name mismatch")
         if baseline.get("cli_identity", {}).get("command") != "pi":
             errors.append("references/pi-baseline.json: CLI command must be pi")
+        package = baseline.get("package", {})
+        if package.get("integrity") != (
+            "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
+            "XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
+        ):
+            errors.append("references/pi-baseline.json: package integrity mismatch")
+        if package.get("shasum") != "39c00809ff5531b6552b9ecb2c41f4c3529ec988":
+            errors.append("references/pi-baseline.json: package shasum mismatch")
+        manager_installation = baseline.get("manager_installation", {})
+        if manager_installation.get("argv") != [
+            "add",
+            "--global",
+            "--exact",
+            "@earendil-works/pi-coding-agent@0.82.1",
+        ]:
+            errors.append("references/pi-baseline.json: manager installation argv mismatch")
+        if manager_installation.get("trust") is not False:
+            errors.append("references/pi-baseline.json: manager installation trust must be false")
+        lifecycle = manager_installation.get("consumer_lifecycle_scripts", {})
+        if (
+            lifecycle.get("preinstall") is not None
+            or lifecycle.get("install") is not None
+            or lifecycle.get("postinstall") is not None
+        ):
+            errors.append("references/pi-baseline.json: consumer lifecycle scripts must be null")
         permission_model = baseline.get("permission_model", {})
         if permission_model.get("permission_popups") is not False:
             errors.append("references/pi-baseline.json: permission popups must be false")

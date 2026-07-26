@@ -18,6 +18,7 @@
       "switch",
       "restore",
       "remove",
+      "software-plan",
       "software-status",
       "software-install",
       "software-update"
@@ -38,9 +39,15 @@
   },
   "runtime_launch": {
     "command": "pi",
-    "direct_command": "PI_CODING_AGENT_DIR=<absolute-target>/agent pi [managed args...]",
+    "direct_command": "<absolute-target>/bin/pi [managed args...]",
     "environment_overrides": [
       "HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+      "XDG_STATE_HOME",
+      "XDG_CACHE_HOME",
+      "TMPDIR",
+      "PATH",
       "PI_CODING_AGENT_DIR",
       "PI_CODING_AGENT_SESSION_DIR",
       "PI_PACKAGE_DIR",
@@ -57,6 +64,28 @@
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
     "target_environment_scope": "child-process-only"
+  },
+  "software": {
+    "package": "@earendil-works/pi-coding-agent",
+    "version": "0.82.1",
+    "command": "pi",
+    "bin": "dist/cli.js",
+    "node_requirement": ">=22.19.0",
+    "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+    "registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+    "installer": {
+      "tool": "bun",
+      "argv": ["add", "--global", "--exact", "@earendil-works/pi-coding-agent@0.82.1"],
+      "trust": false,
+      "consumer_lifecycle_scripts": false
+    },
+    "target_owned": {
+      "software_root": ".nddev-pi-software/current",
+      "entrypoint": "bin/pi",
+      "stamp_file": "NDDEV-PI-SOFTWARE.json",
+      "status_executes_target_binary": false,
+      "launch_uses_target_entrypoint": true
+    }
   },
   "builder_projection": {
     "status": "native-settings-skill-and-local-package-projection",
