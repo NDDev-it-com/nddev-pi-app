@@ -1,0 +1,9 @@
+{
+  "name": "nddev-builder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local nddev-builder skill package projected by nddev-pi-app into explicit Pi targets.",
+  "pi": {
+    "skills": ["skills/nddev-builder"]
+  }
+}

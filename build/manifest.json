@@ -1,0 +1,91 @@
+{
+  "schema_version": 2,
+  "name": "nddev-pi-app",
+  "build_version": "0.1.0",
+  "entrypoint": "python3 cli-tools/nddev_pi.py",
+  "source_root": "setups",
+  "setup_ids": ["balanced", "full-auto", "safe"],
+  "managed_files": [
+    "agent/settings.json",
+    "NDDEV-PI-SETUP.json"
+  ],
+  "command_policy": {
+    "json_supported": [
+      "list",
+      "status",
+      "plan",
+      "install",
+      "switch",
+      "restore",
+      "remove",
+      "software-status",
+      "software-install",
+      "software-update"
+    ],
+    "plan_mutates": false,
+    "restore_backup_option": "--backup <0..9>",
+    "target_required": ["status", "plan", "install", "switch", "restore", "remove", "launch"]
+  },
+  "backup_policy": {
+    "canonical_target_bound": true,
+    "envelope": "NDDEV-PI-BACKUP.json",
+    "location": "sibling .<target-name>.nddev-pi-backups",
+    "slots": 10
+  },
+  "runtime_compatibility": {
+    "baseline_ref": "references/pi-baseline.json",
+    "version_ref": "build/version.json"
+  },
+  "runtime_launch": {
+    "command": "pi",
+    "direct_command": "PI_CODING_AGENT_DIR=<absolute-target>/agent pi [managed args...]",
+    "environment_overrides": [
+      "HOME",
+      "PI_CODING_AGENT_DIR",
+      "PI_CODING_AGENT_SESSION_DIR",
+      "PI_PACKAGE_DIR",
+      "PI_OFFLINE",
+      "PI_SKIP_VERSION_CHECK",
+      "PI_TELEMETRY"
+    ],
+    "forwards_arguments": true,
+    "forwards_child_exit_code": true,
+    "json_manager_errors_supported": true,
+    "manager_command": "python3 cli-tools/nddev_pi.py launch --target <absolute-target> -- [args...]",
+    "provider_secret_inheritance": false,
+    "requires_clean_managed_target": true,
+    "streams_child_stdio": true,
+    "successful_child_output_wrapped": false,
+    "target_environment_scope": "child-process-only"
+  },
+  "builder_projection": {
+    "status": "native-settings-skill-and-local-package-projection",
+    "default_on": true,
+    "target_skill_path": "agent/skills/nddev-builder",
+    "target_package_path": "agent/packages/nddev-builder",
+    "surfaces": ["settings.skills", "package.skills"],
+    "official_documentation": {
+      "settings": "https://pi.dev/docs/latest/settings",
+      "packages": "https://pi.dev/docs/latest/packages",
+      "environment_variables": "https://pi.dev/docs/latest/environment-variables"
+    },
+    "marketplace": {
+      "catalog_url": "https://pi.dev/packages",
+      "module_installs_catalog_package": false,
+      "external_marketplace_published": null,
+      "status": "unsupported-by-this-manager"
+    }
+  },
+  "transaction_policy": {
+    "managed_file_mode": "0600",
+    "new_target_mode": "0700",
+    "preserve_existing_target_mode": true,
+    "preserve_unmanaged_files": true,
+    "preserve_unmanaged_config_keys": true,
+    "preserve_unmanaged_skill_and_package_entries": true,
+    "reject_symlink_managed_files": true,
+    "rollback_on_failure": true,
+    "staging": "same-parent temporary directory",
+    "lock": "exclusive sibling directory"
+  }
+}

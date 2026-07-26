@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "safe",
+  "description": "Most restrictive Pi launch profile: isolated runtime, offline startup, no project approval, and no saved session.",
+  "managed_files": ["agent/settings.json"],
+  "builder_projection": "default-on",
+  "permission_model": "no-native-permission-prompts",
+  "launch_args": ["--offline", "--no-session", "--no-approve"]
+}

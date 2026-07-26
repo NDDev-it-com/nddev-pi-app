@@ -1,10 +1,105 @@
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "product_name": "nddev-pi-app",
+  "display_name": "NDDev Pi Setup Manager",
+  "description": "Portable, explicit-target setup manager for Pi Coding Agent configuration with a default-on native nddev-builder skill projection.",
   "github_repository": "NDDev-it-com/nddev-pi-app",
   "license": "AGPL-3.0-or-later",
-  "skeleton": {
-    "status": "skeleton",
-    "harness_id": "pi"
+  "manifest_ref": "build/manifest.json",
+  "version_ref": "build/version.json",
+  "source_root": "setups",
+  "managed_state": {
+    "managed_files": ["agent/settings.json"],
+    "managed_file_mode": "0600",
+    "preserve_other_state": true,
+    "preserve_unmanaged_config_keys": true,
+    "preserve_unmanaged_skill_and_package_entries": true,
+    "stamp_file": "NDDEV-PI-SETUP.json",
+    "stamp_schema": 1
+  },
+  "setup_system": {
+    "catalog_root": "setups",
+    "identity_source": "<setup>/setup.json:id",
+    "list_command": "python3 cli-tools/nddev_pi.py list [--json]",
+    "selection_option": "--setup <id>",
+    "setup_ids": ["balanced", "full-auto", "safe"],
+    "status_command": "python3 cli-tools/nddev_pi.py status --target <absolute-dir> [--json]"
+  },
+  "runtime_compatibility": {
+    "baseline_ref": "references/pi-baseline.json",
+    "version_ref": "build/version.json"
+  },
+  "runtime_launch": {
+    "command": "pi",
+    "direct_command": "PI_CODING_AGENT_DIR=<absolute-target>/agent pi [managed args...]",
+    "environment_overrides": [
+      "HOME",
+      "PI_CODING_AGENT_DIR",
+      "PI_CODING_AGENT_SESSION_DIR",
+      "PI_PACKAGE_DIR",
+      "PI_OFFLINE",
+      "PI_SKIP_VERSION_CHECK",
+      "PI_TELEMETRY"
+    ],
+    "forwards_arguments": true,
+    "forwards_child_exit_code": true,
+    "json_manager_errors_supported": true,
+    "manager_command": "python3 cli-tools/nddev_pi.py launch --target <absolute-target> -- [args...]",
+    "provider_secret_inheritance": false,
+    "requires_clean_managed_target": true,
+    "streams_child_stdio": true,
+    "successful_child_output_wrapped": false,
+    "target_environment_scope": "child-process-only"
+  },
+  "software": {
+    "package": "@earendil-works/pi-coding-agent",
+    "current_version": "0.82.1",
+    "command": "pi",
+    "repository": "https://github.com/earendil-works/pi",
+    "status_command": "python3 cli-tools/nddev_pi.py software-status [--json]",
+    "install_command": "python3 cli-tools/nddev_pi.py software-install [--json]",
+    "update_command": "python3 cli-tools/nddev_pi.py software-update [--json]",
+    "install_execution": "dry-run-metadata-only",
+    "update_execution": "dry-run-metadata-only"
+  },
+  "builder_projection": {
+    "default_on": true,
+    "installation": {
+      "install_command": "python3 cli-tools/nddev_pi.py install --setup <id> --target <absolute-target> [--json]",
+      "native_settings_keys": ["skills", "packages", "enableSkillCommands"],
+      "native_package_path": "builder/nddev-builder/package.json",
+      "preserved_on_switch_restore": true,
+      "status_command": "python3 cli-tools/nddev_pi.py status --target <absolute-target> [--json]"
+    },
+    "official_documentation": {
+      "settings": "https://pi.dev/docs/latest/settings",
+      "packages": "https://pi.dev/docs/latest/packages",
+      "environment_variables": "https://pi.dev/docs/latest/environment-variables"
+    },
+    "marketplace": {
+      "catalog_url": "https://pi.dev/packages",
+      "module_installs_catalog_package": false,
+      "external_marketplace_published": null,
+      "status": "unsupported-by-this-manager"
+    },
+    "surfaces": ["settings.skills", "package.skills"],
+    "unsupported_surfaces": {
+      "agents": "not documented as a native Pi coding-agent surface",
+      "mcp": "available through third-party Pi extensions/packages, not projected by this manager",
+      "plugin_marketplace": null
+    }
+  },
+  "safety": {
+    "absolute_target_required": true,
+    "canonical_target_binding": true,
+    "default_target": null,
+    "explicit_target_required": ["status", "plan", "install", "switch", "restore", "remove", "launch"],
+    "max_backups": 10,
+    "missing_target_argument_rejected": true,
+    "new_target_mode": "0700",
+    "preserve_existing_target_mode": true,
+    "relative_target_rejected": true,
+    "rollback_on_failure": true,
+    "target_symlinks_rejected": true
   }
 }

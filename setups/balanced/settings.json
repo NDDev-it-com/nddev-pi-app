@@ -1,0 +1,16 @@
+{
+  "defaultProjectTrust": "never",
+  "enableInstallTelemetry": false,
+  "enableAnalytics": false,
+  "enableSkillCommands": true,
+  "sessionDir": "sessions",
+  "skills": [],
+  "packages": [],
+  "nddev": {
+    "schema_version": 1,
+    "setup_id": "balanced",
+    "permission_model": "no-native-permission-prompts",
+    "builder_projection": "skills+package",
+    "launch_args": ["--offline", "--no-approve"]
+  }
+}

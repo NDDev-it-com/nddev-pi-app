@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "verified_ref": "references/pi-baseline.json",
+  "verified_date": "2026-07-26",
+  "product": {
+    "name": "Pi Coding Agent",
+    "site": "https://pi.dev/",
+    "documentation": "https://pi.dev/docs/latest",
+    "repository": "https://github.com/earendil-works/pi"
+  },
+  "package": {
+    "name": "@earendil-works/pi-coding-agent",
+    "version": "0.82.1",
+    "registry": "https://registry.npmjs.org/@earendil-works%2fpi-coding-agent",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz",
+    "integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+    "shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+    "published": "2026-07-25T12:47:12.883Z",
+    "file_count": 880,
+    "unpacked_size": 13036707,
+    "node": ">=22.19.0",
+    "repository_directory": "packages/coding-agent"
+  },
+  "cli_identity": {
+    "command": "pi",
+    "bin": "dist/cli.js",
+    "install_docs": "https://pi.dev/docs/latest",
+    "install_script": "https://pi.dev/install.sh",
+    "official_install_command": "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+  },
+  "configuration": {
+    "global_settings": "~/.pi/agent/settings.json",
+    "project_settings": ".pi/settings.json",
+    "trust_file": "~/.pi/agent/trust.json",
+    "environment_override": "PI_CODING_AGENT_DIR",
+    "session_environment_override": "PI_CODING_AGENT_SESSION_DIR",
+    "package_environment_override": "PI_PACKAGE_DIR",
+    "offline_environment_override": "PI_OFFLINE",
+    "skip_version_check_environment_override": "PI_SKIP_VERSION_CHECK",
+    "telemetry_environment_override": "PI_TELEMETRY",
+    "documentation": "https://pi.dev/docs/latest/settings"
+  },
+  "native_capability_surfaces": {
+    "settings": "https://pi.dev/docs/latest/settings",
+    "skills": {
+      "settings_key": "skills",
+      "enable_commands_key": "enableSkillCommands",
+      "global_locations": ["~/.pi/agent/skills", "~/.agents/skills"],
+      "project_locations": [".pi/skills", ".agents/skills"],
+      "cli_flags": ["--skill", "--no-skills"]
+    },
+    "packages": {
+      "settings_key": "packages",
+      "resource_manifest_key": "pi.skills",
+      "commands": ["pi install", "pi remove", "pi list", "pi update"],
+      "documentation": "https://pi.dev/docs/latest/packages"
+    },
+    "extensions": {
+      "settings_key": "extensions",
+      "package_manifest_key": "pi.extensions",
+      "documentation": "https://pi.dev/docs/latest"
+    }
+  },
+  "permission_model": {
+    "built_in_filesystem_process_network_restrictions": false,
+    "permission_popups": false,
+    "plan_mode": false,
+    "project_trust_controls": ["defaultProjectTrust", "--approve", "--no-approve"],
+    "source": "https://github.com/earendil-works/pi"
+  },
+  "manager_projection": {
+    "builder_default_on": true,
+    "builder_surfaces": ["settings.skills", "package.skills"],
+    "external_marketplace_published": null,
+    "plugin_marketplace": null,
+    "mcp_projection": null
+  }
+}
