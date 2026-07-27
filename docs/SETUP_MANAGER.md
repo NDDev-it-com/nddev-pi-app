@@ -50,6 +50,12 @@ swaps `<target>/.nddev-pi-software/current`, `<target>/bin/pi`, and
 `NDDEV-PI-SOFTWARE.json`. Fresh failures remove transaction-created target
 state; updates roll back byte-for-byte including stamp modes.
 
+The Bun-created `bin/pi` symlink must resolve inside staging to the declared
+package entrypoint. The manager does not persist that symlink or detach its ESM
+file from neighboring imports; it replaces it with a private relative Node
+wrapper inside the sanitized software tree. The target-visible wrapper remains
+separate and points at the package entrypoint in the atomically swapped tree.
+
 Staged and persisted trees remain bounded by independently enforced path-count
 and logical-byte limits. The measured exact-package calibration is owned by
 `references/pi-baseline.json`, while `config/nddev-contract.json` declares the

@@ -174,6 +174,21 @@ def main() -> int:
             errors.append("config/nddev-contract.json: tree path limit mismatch")
         elif tree_policy.get("max_logical_bytes_per_tree") != 201326592:
             errors.append("config/nddev-contract.json: tree byte limit mismatch")
+        entrypoint_materialization = software.get("entrypoint_materialization")
+        if not isinstance(entrypoint_materialization, dict):
+            errors.append("config/nddev-contract.json: entrypoint materialization missing")
+        elif entrypoint_materialization != {
+            "bun_source": "<stage>/bin/pi",
+            "required_package_target": (
+                "<stage>/install/global/node_modules/"
+                "@earendil-works/pi-coding-agent/dist/cli.js"
+            ),
+            "persisted_kind": "private-relative-node-wrapper",
+            "persisted_path": ".nddev-pi-software/current/bin/pi",
+            "persisted_mode": "0700",
+            "persisted_symlink": False,
+        }:
+            errors.append("config/nddev-contract.json: entrypoint materialization mismatch")
         target_owned = software.get("target_owned")
         if (
             not isinstance(target_owned, dict)

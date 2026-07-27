@@ -1188,6 +1188,20 @@ def materialized_source(path: Path, allowed_roots: tuple[Path, ...], label: str)
     return resolved
 
 
+def staged_node_wrapper_content(node_path: str) -> bytes:
+    relative_main = f"../{PI_PACKAGE_RELATIVE}/{PI_PACKAGE_BIN}"
+    return (
+        "#!/bin/sh\n"
+        "script_path=$0\n"
+        'case "$script_path" in\n'
+        "  /*) ;;\n"
+        '  *) script_path="$PWD/$script_path" ;;\n'
+        "esac\n"
+        "script_dir=${script_path%/*}\n"
+        f'exec {shlex.quote(node_path)} "$script_dir/{relative_main}" "$@"\n'
+    ).encode("utf-8")
+
+
 def copy_tree_sanitized(source: Path, destination: Path, allowed_roots: tuple[Path, ...]) -> None:
     require_directory(source, "staged software tree")
     paths = sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix())
@@ -1226,7 +1240,53 @@ def copy_tree_sanitized(source: Path, destination: Path, allowed_roots: tuple[Pa
         copy_file_private(path, target_path, relative.as_posix())
 
 
-def materialize_persisted_install(stage_workspace: Path, stage_current: Path) -> None:
+def materialize_staged_entrypoint(
+    stage_workspace: Path,
+    stage_current: Path,
+    allowed_roots: tuple[Path, ...],
+    node_runtime: dict[str, str],
+) -> None:
+    source_root = stage_workspace / "bin"
+    require_directory(source_root, "staged bin tree")
+    paths = sorted(
+        source_root.rglob("*"),
+        key=lambda item: item.relative_to(source_root).as_posix(),
+    )
+    if len(paths) > SOFTWARE_TREE_MAX_PATHS:
+        fail(
+            f"staged bin tree has {len(paths)} paths, exceeding "
+            f"the {SOFTWARE_TREE_MAX_PATHS}-path limit"
+        )
+    relative_paths = [path.relative_to(source_root).as_posix() for path in paths]
+    if relative_paths != [PI_COMMAND]:
+        fail(f"staged bin tree has unexpected paths: {relative_paths}")
+    source_entrypoint = materialized_source(
+        source_root / PI_COMMAND,
+        allowed_roots,
+        PI_COMMAND,
+    )
+    expected_package_binary = (
+        stage_workspace / PI_PACKAGE_BINARY_RELATIVE
+    ).resolve(strict=True)
+    if source_entrypoint.resolve(strict=True) != expected_package_binary:
+        fail("staged Pi entrypoint does not resolve to the official package binary")
+    read_staged_file(source_entrypoint, "staged Pi package entrypoint")
+    destination_root = stage_current / "bin"
+    destination_root.mkdir(mode=OWNER_DIRECTORY_MODE)
+    destination = destination_root / PI_COMMAND
+    content = staged_node_wrapper_content(node_runtime["path"])
+    if len(content) > SOFTWARE_FILE_MAX_BYTES:
+        fail("staged Pi wrapper exceeds the bounded file size")
+    with destination.open("xb") as handle:
+        handle.write(content)
+    destination.chmod(0o700)
+
+
+def materialize_persisted_install(
+    stage_workspace: Path,
+    stage_current: Path,
+    node_runtime: dict[str, str],
+) -> None:
     allowed_roots = (
         (stage_workspace / "install" / "global").resolve(strict=False),
         (stage_workspace / "bin").resolve(strict=False),
@@ -1238,7 +1298,12 @@ def materialize_persisted_install(stage_workspace: Path, stage_current: Path) ->
         stage_current / "install" / "global",
         allowed_roots,
     )
-    copy_tree_sanitized(stage_workspace / "bin", stage_current / "bin", allowed_roots)
+    materialize_staged_entrypoint(
+        stage_workspace,
+        stage_current,
+        allowed_roots,
+        node_runtime,
+    )
 
 
 def safe_bun_env(stage_workspace: Path) -> dict[str, str]:
@@ -1903,7 +1968,11 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                 run_bun_install(stage_install)
                 manifest = load_package_manifest(stage_install)
                 prepublish_only = manifest.get("scripts", {}).get("prepublishOnly")
-                materialize_persisted_install(stage_install, stage_current)
+                materialize_persisted_install(
+                    stage_install,
+                    stage_current,
+                    node_runtime,
+                )
                 staged_entrypoint = stage_current / "bin" / PI_COMMAND
                 require_regular_file(
                     staged_entrypoint,
