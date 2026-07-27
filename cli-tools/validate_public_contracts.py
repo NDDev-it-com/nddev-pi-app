@@ -162,6 +162,18 @@ def main() -> int:
             errors.append("config/nddev-contract.json: software installer argv mismatch")
         elif installer.get("trust") is not False:
             errors.append("config/nddev-contract.json: software installer trust must be false")
+        tree_policy = software.get("staged_tree_policy")
+        if not isinstance(tree_policy, dict):
+            errors.append("config/nddev-contract.json: staged tree policy missing")
+        elif tree_policy.get("verified_calibration") != (
+            "references/pi-baseline.json:"
+            "manager_installation.verified_tree_calibration"
+        ):
+            errors.append("config/nddev-contract.json: tree calibration owner mismatch")
+        elif tree_policy.get("max_paths_per_tree") != 25000:
+            errors.append("config/nddev-contract.json: tree path limit mismatch")
+        elif tree_policy.get("max_logical_bytes_per_tree") != 201326592:
+            errors.append("config/nddev-contract.json: tree byte limit mismatch")
         target_owned = software.get("target_owned")
         if (
             not isinstance(target_owned, dict)
@@ -204,6 +216,24 @@ def main() -> int:
             errors.append("references/pi-baseline.json: manager installation argv mismatch")
         if manager_installation.get("trust") is not False:
             errors.append("references/pi-baseline.json: manager installation trust must be false")
+        calibration = manager_installation.get("verified_tree_calibration")
+        if calibration != {
+            "verified_at": "2026-07-27",
+            "bun_version": "1.3.14",
+            "staged_global_tree": {
+                "path_count": 20873,
+                "logical_file_bytes": 118702032,
+            },
+            "staged_bin_tree": {
+                "path_count": 1,
+                "logical_file_bytes": 681,
+            },
+            "protective_limits": {
+                "max_paths_per_tree": 25000,
+                "max_logical_bytes_per_tree": 201326592,
+            },
+        }:
+            errors.append("references/pi-baseline.json: tree calibration mismatch")
         lifecycle = manager_installation.get("consumer_lifecycle_scripts", {})
         if (
             lifecycle.get("preinstall") is not None

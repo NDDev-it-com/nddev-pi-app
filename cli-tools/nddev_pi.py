@@ -115,8 +115,9 @@ SOFTWARE_STAMP_NAME = "NDDEV-PI-SOFTWARE.json"
 SOFTWARE_DIR_NAME = ".nddev-pi-software"
 SOFTWARE_CURRENT_NAME = "current"
 SOFTWARE_STAGE_FRAGMENT = ".nddev-pi-software-stage"
-SOFTWARE_MAX_BYTES = 512 * 1024 * 1024
-SOFTWARE_MAX_PATHS = 20000
+SOFTWARE_FILE_MAX_BYTES = 192 * 1024 * 1024
+SOFTWARE_TREE_MAX_BYTES = 192 * 1024 * 1024
+SOFTWARE_TREE_MAX_PATHS = 25000
 PROCESS_OUTPUT_MAX_BYTES = 64 * 1024
 PROCESS_TIMEOUT_SECONDS = 120
 PI_PACKAGE_RELATIVE = "install/global/node_modules/@earendil-works/pi-coding-agent"
@@ -138,6 +139,9 @@ SOFTWARE_STAMP_KEYS = {
     "entrypoint_sha256",
     "package_binary_sha256",
     "installed_tree_sha256",
+    "installed_tree_path_count",
+    "installed_tree_bytes",
+    "tree_limits",
     "registry",
     "node_runtime",
     "version_probe",
@@ -145,6 +149,7 @@ SOFTWARE_STAMP_KEYS = {
     "installer",
 }
 SOFTWARE_STAMP_REGISTRY_KEYS = {"integrity", "shasum"}
+SOFTWARE_STAMP_TREE_LIMIT_KEYS = {"max_paths", "max_bytes"}
 SOFTWARE_STAMP_NODE_KEYS = {"path", "version", "sha256", "requirement"}
 SOFTWARE_STAMP_PROBE_KEYS = {"argv", "environment", "stdout_stderr_sha256"}
 SOFTWARE_STAMP_SCRIPT_KEYS = {"preinstall", "install", "postinstall", "prepublishOnly"}
@@ -374,21 +379,26 @@ def read_regular_file(
     return b"".join(blocks)
 
 
-def file_sha256(path: Path, *, label: str, max_bytes: int = SOFTWARE_MAX_BYTES) -> str:
+def file_sha256(
+    path: Path, *, label: str, max_bytes: int = SOFTWARE_FILE_MAX_BYTES
+) -> str:
     content = read_regular_file(path, label, max_bytes=max_bytes)
     info = require_regular_file(path, label, max_bytes=max_bytes)
     require_current_user_owner(info, label)
     return sha256_bytes(content)
 
 
-def tree_sha256(root: Path) -> str:
+def software_tree_identity(root: Path) -> tuple[str, int, int]:
     root_info = require_directory(root, "software tree")
     require_current_user_owner(root_info, "software tree")
     if stat.S_IMODE(root_info.st_mode) != OWNER_DIRECTORY_MODE:
         fail("software tree root must be private")
     paths = sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())
-    if len(paths) > SOFTWARE_MAX_PATHS:
-        fail("software tree has too many paths")
+    if len(paths) > SOFTWARE_TREE_MAX_PATHS:
+        fail(
+            f"software tree has {len(paths)} paths, exceeding "
+            f"the {SOFTWARE_TREE_MAX_PATHS}-path limit"
+        )
     digest = hashlib.sha256()
     total = 0
     for path in paths:
@@ -409,12 +419,14 @@ def tree_sha256(root: Path) -> str:
         require_current_user_owner(info, relative)
         if info.st_nlink != 1:
             fail(f"software tree entry must not be a hardlink: {relative}")
-        content = read_regular_file(path, relative, max_bytes=SOFTWARE_MAX_BYTES)
+        content = read_regular_file(path, relative, max_bytes=SOFTWARE_FILE_MAX_BYTES)
         total += len(content)
-        if total > SOFTWARE_MAX_BYTES:
-            fail("software tree is too large")
+        if total > SOFTWARE_TREE_MAX_BYTES:
+            fail(
+                f"software tree exceeds the {SOFTWARE_TREE_MAX_BYTES}-byte limit"
+            )
         digest.update(b"file\0" + sha256_bytes(content).encode("ascii") + b"\0")
-    return digest.hexdigest()
+    return digest.hexdigest(), len(paths), total
 
 
 def parse_json_object(content: bytes, label: str) -> dict[str, Any]:
@@ -1077,7 +1089,7 @@ def validate_pre_network_software_target(target: Path) -> None:
     require_safe_partial_directory(software_root(target), "software root")
     require_safe_partial_directory(software_current(target), "current software tree")
     require_safe_partial_file(
-        software_entrypoint(target), "Pi entrypoint", max_bytes=SOFTWARE_MAX_BYTES
+        software_entrypoint(target), "Pi entrypoint", max_bytes=SOFTWARE_FILE_MAX_BYTES
     )
     require_safe_partial_file(
         software_stamp_path(target), SOFTWARE_STAMP_NAME, max_bytes=METADATA_MAX_BYTES
@@ -1122,7 +1134,7 @@ def read_staged_file(source: Path, label: str) -> tuple[bytes, os.stat_result]:
     info = source.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         fail(f"staged software entry must be a regular file: {label}")
-    if info.st_size > SOFTWARE_MAX_BYTES:
+    if info.st_size > SOFTWARE_FILE_MAX_BYTES:
         fail(f"staged software entry is too large: {label}")
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -1141,7 +1153,7 @@ def read_staged_file(source: Path, label: str) -> tuple[bytes, os.stat_result]:
             if not chunk:
                 break
             total += len(chunk)
-            if total > SOFTWARE_MAX_BYTES:
+            if total > SOFTWARE_FILE_MAX_BYTES:
                 fail(f"staged software entry is too large: {label}")
             chunks.append(chunk)
     finally:
@@ -1179,8 +1191,11 @@ def materialized_source(path: Path, allowed_roots: tuple[Path, ...], label: str)
 def copy_tree_sanitized(source: Path, destination: Path, allowed_roots: tuple[Path, ...]) -> None:
     require_directory(source, "staged software tree")
     paths = sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix())
-    if len(paths) > SOFTWARE_MAX_PATHS:
-        fail("staged software tree has too many paths")
+    if len(paths) > SOFTWARE_TREE_MAX_PATHS:
+        fail(
+            f"staged software tree has {len(paths)} paths, exceeding "
+            f"the {SOFTWARE_TREE_MAX_PATHS}-path limit"
+        )
     destination.mkdir(mode=OWNER_DIRECTORY_MODE)
     total = 0
     for path in paths:
@@ -1194,15 +1209,20 @@ def copy_tree_sanitized(source: Path, destination: Path, allowed_roots: tuple[Pa
             source_file = materialized_source(path, allowed_roots, relative.as_posix())
             source_info = source_file.lstat()
             total += source_info.st_size
-            if total > SOFTWARE_MAX_BYTES:
-                fail("staged software tree is too large")
+            if total > SOFTWARE_TREE_MAX_BYTES:
+                fail(
+                    "staged software tree exceeds "
+                    f"the {SOFTWARE_TREE_MAX_BYTES}-byte limit"
+                )
             copy_file_private(source_file, target_path, relative.as_posix())
             continue
         if not stat.S_ISREG(info.st_mode):
             fail(f"staged software entry must be a regular file: {relative.as_posix()}")
         total += info.st_size
-        if total > SOFTWARE_MAX_BYTES:
-            fail("staged software tree is too large")
+        if total > SOFTWARE_TREE_MAX_BYTES:
+            fail(
+                f"staged software tree exceeds the {SOFTWARE_TREE_MAX_BYTES}-byte limit"
+            )
         copy_file_private(path, target_path, relative.as_posix())
 
 
@@ -1427,7 +1447,9 @@ def atomic_write_private(path: Path, content: bytes, mode: int = OWNER_FILE_MODE
 def write_target_entrypoint(target: Path, node_runtime: dict[str, str]) -> str:
     destination = software_entrypoint(target)
     ensure_software_parent(destination, target)
-    require_safe_partial_file(destination, "Pi entrypoint", max_bytes=SOFTWARE_MAX_BYTES)
+    require_safe_partial_file(
+        destination, "Pi entrypoint", max_bytes=SOFTWARE_FILE_MAX_BYTES
+    )
     content = node_wrapper_content(
         node_runtime["path"], package_binary_path(software_current(target))
     )
@@ -1440,6 +1462,8 @@ def software_stamp(
     *,
     entrypoint_digest: str,
     installed_tree_digest: str,
+    installed_tree_path_count: int,
+    installed_tree_bytes: int,
     package_binary_digest: str,
     version_probe_digest: str,
     node_runtime: dict[str, str],
@@ -1462,6 +1486,12 @@ def software_stamp(
         "entrypoint_sha256": entrypoint_digest,
         "package_binary_sha256": package_binary_digest,
         "installed_tree_sha256": installed_tree_digest,
+        "installed_tree_path_count": installed_tree_path_count,
+        "installed_tree_bytes": installed_tree_bytes,
+        "tree_limits": {
+            "max_paths": SOFTWARE_TREE_MAX_PATHS,
+            "max_bytes": SOFTWARE_TREE_MAX_BYTES,
+        },
         "registry": {
             "integrity": PI_REGISTRY_INTEGRITY,
             "shasum": PI_REGISTRY_SHASUM,
@@ -1519,6 +1549,11 @@ def read_software_stamp(target: Path) -> dict[str, Any] | None:
     stamp = load_json_object(path, SOFTWARE_STAMP_NAME)
     require_exact_keys(stamp, SOFTWARE_STAMP_KEYS, SOFTWARE_STAMP_NAME)
     require_exact_keys(stamp["registry"], SOFTWARE_STAMP_REGISTRY_KEYS, "software stamp registry")
+    require_exact_keys(
+        stamp["tree_limits"],
+        SOFTWARE_STAMP_TREE_LIMIT_KEYS,
+        "software stamp tree_limits",
+    )
     require_exact_keys(
         stamp["node_runtime"], SOFTWARE_STAMP_NODE_KEYS, "software stamp node_runtime"
     )
@@ -1611,7 +1646,9 @@ def software_status_payload(target: Path) -> dict[str, Any]:
         elif stat.S_IMODE(current_info.st_mode) != OWNER_DIRECTORY_MODE:
             drift.append("software_current_mode")
         entrypoint_info = require_regular_file(
-            software_entrypoint(target), "Pi entrypoint", max_bytes=SOFTWARE_MAX_BYTES
+            software_entrypoint(target),
+            "Pi entrypoint",
+            max_bytes=SOFTWARE_FILE_MAX_BYTES,
         )
         require_current_user_owner(entrypoint_info, "Pi entrypoint")
         if stat.S_IMODE(entrypoint_info.st_mode) != 0o700:
@@ -1623,7 +1660,13 @@ def software_status_payload(target: Path) -> dict[str, Any]:
         package_binary_digest = file_sha256(
             package_binary_path(software_current(target)), label="Pi package binary"
         )
-        installed_tree_digest = tree_sha256(software_current(target))
+        (
+            installed_tree_digest,
+            installed_tree_path_count,
+            installed_tree_bytes,
+        ) = software_tree_identity(software_current(target))
+        payload["installed_tree_path_count"] = installed_tree_path_count
+        payload["installed_tree_bytes"] = installed_tree_bytes
         node_runtime = stamp.get("node_runtime")
         if isinstance(node_runtime, dict):
             node_path = Path(str(node_runtime.get("path", "")))
@@ -1631,7 +1674,7 @@ def software_status_payload(target: Path) -> dict[str, Any]:
                 drift.append("node_runtime")
             else:
                 node_info = require_regular_file(
-                    node_path, "node runtime", max_bytes=SOFTWARE_MAX_BYTES
+                    node_path, "node runtime", max_bytes=SOFTWARE_FILE_MAX_BYTES
                 )
                 if stat.S_ISLNK(node_info.st_mode):
                     drift.append("node_runtime")
@@ -1660,8 +1703,19 @@ def software_status_payload(target: Path) -> dict[str, Any]:
             "entrypoint_sha256": stamp.get("entrypoint_sha256") == entrypoint_digest,
             "package_binary_sha256": stamp.get("package_binary_sha256") == package_binary_digest,
             "installed_tree_sha256": stamp.get("installed_tree_sha256") == installed_tree_digest,
+            "installed_tree_path_count": stamp.get("installed_tree_path_count")
+            == installed_tree_path_count,
+            "installed_tree_bytes": stamp.get("installed_tree_bytes")
+            == installed_tree_bytes,
+            "tree_limits": stamp.get("tree_limits")
+            == {
+                "max_paths": SOFTWARE_TREE_MAX_PATHS,
+                "max_bytes": SOFTWARE_TREE_MAX_BYTES,
+            },
             "entrypoint_content": read_regular_file(
-                software_entrypoint(target), "Pi entrypoint", max_bytes=SOFTWARE_MAX_BYTES
+                software_entrypoint(target),
+                "Pi entrypoint",
+                max_bytes=SOFTWARE_FILE_MAX_BYTES,
             )
             == expected_wrapper,
         }
@@ -1852,11 +1906,15 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                 materialize_persisted_install(stage_install, stage_current)
                 staged_entrypoint = stage_current / "bin" / PI_COMMAND
                 require_regular_file(
-                    staged_entrypoint, "staged Pi entrypoint", max_bytes=SOFTWARE_MAX_BYTES
+                    staged_entrypoint,
+                    "staged Pi entrypoint",
+                    max_bytes=SOFTWARE_FILE_MAX_BYTES,
                 )
                 package_binary = package_binary_path(stage_current)
                 require_regular_file(
-                    package_binary, "staged Pi package binary", max_bytes=SOFTWARE_MAX_BYTES
+                    package_binary,
+                    "staged Pi package binary",
+                    max_bytes=SOFTWARE_FILE_MAX_BYTES,
                 )
                 version_probe_digest = run_stage_version_probe(
                     stage_current, stage_root, node_runtime
@@ -1864,7 +1922,11 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                 package_binary_digest = file_sha256(
                     package_binary, label="staged Pi package binary"
                 )
-                installed_tree_digest = tree_sha256(stage_current)
+                (
+                    installed_tree_digest,
+                    installed_tree_path_count,
+                    installed_tree_bytes,
+                ) = software_tree_identity(stage_current)
 
                 if created_target:
                     target.mkdir(mode=OWNER_DIRECTORY_MODE)
@@ -1882,7 +1944,9 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                 current = software_current(target)
                 rollback_current = rollback_root / SOFTWARE_CURRENT_NAME
                 previous_entrypoint, previous_entrypoint_mode = snapshot_software_file(
-                    software_entrypoint(target), "Pi entrypoint", SOFTWARE_MAX_BYTES
+                    software_entrypoint(target),
+                    "Pi entrypoint",
+                    SOFTWARE_FILE_MAX_BYTES,
                 )
                 previous_stamp, previous_stamp_mode = snapshot_software_file(
                     software_stamp_path(target), SOFTWARE_STAMP_NAME, METADATA_MAX_BYTES
@@ -1905,6 +1969,8 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                         target,
                         entrypoint_digest=entrypoint_digest,
                         installed_tree_digest=installed_tree_digest,
+                        installed_tree_path_count=installed_tree_path_count,
+                        installed_tree_bytes=installed_tree_bytes,
                         package_binary_digest=package_binary_digest,
                         version_probe_digest=version_probe_digest,
                         node_runtime=node_runtime,
@@ -2066,7 +2132,9 @@ def prepare_launch_invocation(
             fail("target-owned Pi software stamp is missing")
         executable = software_entrypoint(target)
         executable_info = require_regular_file(
-            executable, "target-owned Pi executable", max_bytes=SOFTWARE_MAX_BYTES
+            executable,
+            "target-owned Pi executable",
+            max_bytes=SOFTWARE_FILE_MAX_BYTES,
         )
         require_current_user_owner(executable_info, "target-owned Pi executable")
         if stat.S_IMODE(executable_info.st_mode) != 0o700:

@@ -50,6 +50,13 @@ swaps `<target>/.nddev-pi-software/current`, `<target>/bin/pi`, and
 `NDDEV-PI-SOFTWARE.json`. Fresh failures remove transaction-created target
 state; updates roll back byte-for-byte including stamp modes.
 
+Staged and persisted trees remain bounded by independently enforced path-count
+and logical-byte limits. The measured exact-package calibration is owned by
+`references/pi-baseline.json`, while `config/nddev-contract.json` declares the
+protective limits and preserved path, symlink, mode, and digest checks. The
+software stamp records the installed tree metrics and limits for status
+revalidation.
+
 The pinned package has no consumer `preinstall`, `install`, or `postinstall`
 script, so Bun `--trust` is not used. The published `prepublishOnly` script is
 recorded as package evidence but is not run by consumers.

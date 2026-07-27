@@ -44,6 +44,22 @@
       "HOME": "<stage>/home",
       "XDG_CONFIG_HOME": "<stage>/xdg-config",
       "TMPDIR": "<stage>/tmp"
+    },
+    "verified_tree_calibration": {
+      "verified_at": "2026-07-27",
+      "bun_version": "1.3.14",
+      "staged_global_tree": {
+        "path_count": 20873,
+        "logical_file_bytes": 118702032
+      },
+      "staged_bin_tree": {
+        "path_count": 1,
+        "logical_file_bytes": 681
+      },
+      "protective_limits": {
+        "max_paths_per_tree": 25000,
+        "max_logical_bytes_per_tree": 201326592
+      }
     }
   },
   "configuration": {
