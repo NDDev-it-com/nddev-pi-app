@@ -99,6 +99,7 @@ SENSITIVE_ENVIRONMENT_EXACT = {
 PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent"
 PI_PACKAGE_VERSION = "0.82.1"
 PI_PACKAGE_BIN = "dist/cli.js"
+PI_CLI_VERSION_OUTPUT = "0.0.0"
 PI_NODE_REQUIREMENT = ">=22.19.0"
 PI_REGISTRY_INTEGRITY = (
     "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
@@ -151,7 +152,13 @@ SOFTWARE_STAMP_KEYS = {
 SOFTWARE_STAMP_REGISTRY_KEYS = {"integrity", "shasum"}
 SOFTWARE_STAMP_TREE_LIMIT_KEYS = {"max_paths", "max_bytes"}
 SOFTWARE_STAMP_NODE_KEYS = {"path", "version", "sha256", "requirement"}
-SOFTWARE_STAMP_PROBE_KEYS = {"argv", "environment", "stdout_stderr_sha256"}
+SOFTWARE_STAMP_PROBE_KEYS = {
+    "argv",
+    "environment",
+    "expected_output",
+    "package_version",
+    "stdout_stderr_sha256",
+}
 SOFTWARE_STAMP_SCRIPT_KEYS = {"preinstall", "install", "postinstall", "prepublishOnly"}
 SOFTWARE_STAMP_INSTALLER_KEYS = {"tool", "argv", "trust_reason", "env"}
 SOFTWARE_STAMP_INSTALLER_ENV_KEYS = {
@@ -1467,8 +1474,11 @@ def run_stage_version_probe(
         ).strip()
         if completed.returncode != 0:
             fail(f"staged pi version probe failed with exit code {completed.returncode}: {output}")
-        if PI_PACKAGE_VERSION not in output:
-            fail("staged pi version probe did not report the pinned release")
+        if output != PI_CLI_VERSION_OUTPUT:
+            fail(
+                "staged pi version probe output mismatch: "
+                f"expected {PI_CLI_VERSION_OUTPUT!r}, got {output!r}"
+            )
         return sha256_bytes(output.encode("utf-8"))
 
 
@@ -1564,6 +1574,8 @@ def software_stamp(
         "node_runtime": node_runtime,
         "version_probe": {
             "argv": ["bin/pi", "--version"],
+            "package_version": PI_PACKAGE_VERSION,
+            "expected_output": PI_CLI_VERSION_OUTPUT,
             "environment": {
                 "HOME": "<stage>/smoke-home",
                 "PI_CODING_AGENT_DIR": "<stage>/smoke-agent",
@@ -1816,6 +1828,8 @@ def software_status_payload(target: Path) -> dict[str, Any]:
         if (
             not isinstance(probe, dict)
             or probe.get("argv") != ["bin/pi", "--version"]
+            or probe.get("package_version") != PI_PACKAGE_VERSION
+            or probe.get("expected_output") != PI_CLI_VERSION_OUTPUT
             or probe.get("environment") != expected_probe_env()
             or not isinstance(probe.get("stdout_stderr_sha256"), str)
         ):

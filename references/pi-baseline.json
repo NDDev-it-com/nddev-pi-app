@@ -24,6 +24,12 @@
   "cli_identity": {
     "command": "pi",
     "bin": "dist/cli.js",
+    "version_probe": {
+      "argv": ["pi", "--version"],
+      "expected_stdout": "0.0.0",
+      "package_version_source": "package.version",
+      "independent_package_identity_required": true
+    },
     "install_docs": "https://pi.dev/docs/latest",
     "install_script": "https://pi.dev/install.sh"
   },

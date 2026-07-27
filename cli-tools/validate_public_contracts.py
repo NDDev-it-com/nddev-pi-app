@@ -189,6 +189,18 @@ def main() -> int:
             "persisted_symlink": False,
         }:
             errors.append("config/nddev-contract.json: entrypoint materialization mismatch")
+        version_identity = software.get("version_identity")
+        if version_identity != {
+            "required_package_version": "0.82.1",
+            "package_version_source": (
+                ".nddev-pi-software/current/install/global/node_modules/"
+                "@earendil-works/pi-coding-agent/package.json"
+            ),
+            "probe_argv": ["bin/pi", "--version"],
+            "expected_probe_output": "0.0.0",
+            "package_and_probe_must_both_match": True,
+        }:
+            errors.append("config/nddev-contract.json: version identity mismatch")
         target_owned = software.get("target_owned")
         if (
             not isinstance(target_owned, dict)
@@ -213,6 +225,13 @@ def main() -> int:
             errors.append("references/pi-baseline.json: package name mismatch")
         if baseline.get("cli_identity", {}).get("command") != "pi":
             errors.append("references/pi-baseline.json: CLI command must be pi")
+        if baseline.get("cli_identity", {}).get("version_probe") != {
+            "argv": ["pi", "--version"],
+            "expected_stdout": "0.0.0",
+            "package_version_source": "package.version",
+            "independent_package_identity_required": True,
+        }:
+            errors.append("references/pi-baseline.json: CLI version probe mismatch")
         package = baseline.get("package", {})
         if package.get("integrity") != (
             "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"

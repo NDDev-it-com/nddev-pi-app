@@ -110,6 +110,13 @@
       "persisted_mode": "0700",
       "persisted_symlink": false
     },
+    "version_identity": {
+      "required_package_version": "0.82.1",
+      "package_version_source": ".nddev-pi-software/current/install/global/node_modules/@earendil-works/pi-coding-agent/package.json",
+      "probe_argv": ["bin/pi", "--version"],
+      "expected_probe_output": "0.0.0",
+      "package_and_probe_must_both_match": true
+    },
     "target_owned": {
       "software_root": ".nddev-pi-software/current",
       "entrypoint": "bin/pi",

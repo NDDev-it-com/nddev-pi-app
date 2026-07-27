@@ -56,6 +56,12 @@ file from neighboring imports; it replaces it with a private relative Node
 wrapper inside the sanitized software tree. The target-visible wrapper remains
 separate and points at the package entrypoint in the atomically swapped tree.
 
+The published package identity is `0.82.1`, while its current `pi --version`
+stdout is `0.0.0`. These are independent fail-closed checks: the manager
+requires the exact package name/version/bin from package metadata and the exact
+CLI probe output recorded by `references/pi-baseline.json`. Probe stdout never
+substitutes for package identity.
+
 Staged and persisted trees remain bounded by independently enforced path-count
 and logical-byte limits. The measured exact-package calibration is owned by
 `references/pi-baseline.json`, while `config/nddev-contract.json` declares the
