@@ -166,8 +166,7 @@ def main() -> int:
         if not isinstance(tree_policy, dict):
             errors.append("config/nddev-contract.json: staged tree policy missing")
         elif tree_policy.get("verified_calibration") != (
-            "references/pi-baseline.json:"
-            "manager_installation.verified_tree_calibration"
+            "references/pi-baseline.json:manager_installation.verified_tree_calibration"
         ):
             errors.append("config/nddev-contract.json: tree calibration owner mismatch")
         elif tree_policy.get("max_paths_per_tree") != 25000:
@@ -180,8 +179,7 @@ def main() -> int:
         elif entrypoint_materialization != {
             "bun_source": "<stage>/bin/pi",
             "required_package_target": (
-                "<stage>/install/global/node_modules/"
-                "@earendil-works/pi-coding-agent/dist/cli.js"
+                "<stage>/install/global/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
             ),
             "persisted_kind": "private-relative-node-wrapper",
             "persisted_path": ".nddev-pi-software/current/bin/pi",

@@ -386,9 +386,7 @@ def read_regular_file(
     return b"".join(blocks)
 
 
-def file_sha256(
-    path: Path, *, label: str, max_bytes: int = SOFTWARE_FILE_MAX_BYTES
-) -> str:
+def file_sha256(path: Path, *, label: str, max_bytes: int = SOFTWARE_FILE_MAX_BYTES) -> str:
     content = read_regular_file(path, label, max_bytes=max_bytes)
     info = require_regular_file(path, label, max_bytes=max_bytes)
     require_current_user_owner(info, label)
@@ -429,9 +427,7 @@ def software_tree_identity(root: Path) -> tuple[str, int, int]:
         content = read_regular_file(path, relative, max_bytes=SOFTWARE_FILE_MAX_BYTES)
         total += len(content)
         if total > SOFTWARE_TREE_MAX_BYTES:
-            fail(
-                f"software tree exceeds the {SOFTWARE_TREE_MAX_BYTES}-byte limit"
-            )
+            fail(f"software tree exceeds the {SOFTWARE_TREE_MAX_BYTES}-byte limit")
         digest.update(b"file\0" + sha256_bytes(content).encode("ascii") + b"\0")
     return digest.hexdigest(), len(paths), total
 
@@ -1231,19 +1227,14 @@ def copy_tree_sanitized(source: Path, destination: Path, allowed_roots: tuple[Pa
             source_info = source_file.lstat()
             total += source_info.st_size
             if total > SOFTWARE_TREE_MAX_BYTES:
-                fail(
-                    "staged software tree exceeds "
-                    f"the {SOFTWARE_TREE_MAX_BYTES}-byte limit"
-                )
+                fail(f"staged software tree exceeds the {SOFTWARE_TREE_MAX_BYTES}-byte limit")
             copy_file_private(source_file, target_path, relative.as_posix())
             continue
         if not stat.S_ISREG(info.st_mode):
             fail(f"staged software entry must be a regular file: {relative.as_posix()}")
         total += info.st_size
         if total > SOFTWARE_TREE_MAX_BYTES:
-            fail(
-                f"staged software tree exceeds the {SOFTWARE_TREE_MAX_BYTES}-byte limit"
-            )
+            fail(f"staged software tree exceeds the {SOFTWARE_TREE_MAX_BYTES}-byte limit")
         copy_file_private(path, target_path, relative.as_posix())
 
 
@@ -1272,9 +1263,7 @@ def materialize_staged_entrypoint(
         allowed_roots,
         PI_COMMAND,
     )
-    expected_package_binary = (
-        stage_workspace / PI_PACKAGE_BINARY_RELATIVE
-    ).resolve(strict=True)
+    expected_package_binary = (stage_workspace / PI_PACKAGE_BINARY_RELATIVE).resolve(strict=True)
     if source_entrypoint.resolve(strict=True) != expected_package_binary:
         fail("staged Pi entrypoint does not resolve to the official package binary")
     read_staged_file(source_entrypoint, "staged Pi package entrypoint")
@@ -1522,9 +1511,7 @@ def atomic_write_private(path: Path, content: bytes, mode: int = OWNER_FILE_MODE
 def write_target_entrypoint(target: Path, node_runtime: dict[str, str]) -> str:
     destination = software_entrypoint(target)
     ensure_software_parent(destination, target)
-    require_safe_partial_file(
-        destination, "Pi entrypoint", max_bytes=SOFTWARE_FILE_MAX_BYTES
-    )
+    require_safe_partial_file(destination, "Pi entrypoint", max_bytes=SOFTWARE_FILE_MAX_BYTES)
     content = node_wrapper_content(
         node_runtime["path"], package_binary_path(software_current(target))
     )
@@ -1782,8 +1769,7 @@ def software_status_payload(target: Path) -> dict[str, Any]:
             "installed_tree_sha256": stamp.get("installed_tree_sha256") == installed_tree_digest,
             "installed_tree_path_count": stamp.get("installed_tree_path_count")
             == installed_tree_path_count,
-            "installed_tree_bytes": stamp.get("installed_tree_bytes")
-            == installed_tree_bytes,
+            "installed_tree_bytes": stamp.get("installed_tree_bytes") == installed_tree_bytes,
             "tree_limits": stamp.get("tree_limits")
             == {
                 "max_paths": SOFTWARE_TREE_MAX_PATHS,
