@@ -51,6 +51,7 @@ PI_REGISTRY_INTEGRITY = (
     "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
     "XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
 )
+SUPPORTED_HOSTS = ["macos-arm64", "macos-x64", "ubuntu-glibc-arm64", "ubuntu-glibc-x64"]
 PACKAGE_ID_PATTERN = re.compile(r"@[A-Za-z0-9._-]+/pi-coding-agent")
 REPOSITORY_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9._-]+/pi\b")
 NDDEV_MODULE_PATTERN = re.compile(r"nddev-[a-z0-9-]+-app")
@@ -163,6 +164,20 @@ def main() -> int:
                 errors.append("build/manifest.json: software installer argv mismatch")
             elif installer.get("trust") is not False:
                 errors.append("build/manifest.json: software installer trust must be false")
+        compatibility = manifest.get("runtime_compatibility")
+        if (
+            not isinstance(compatibility, dict)
+            or compatibility.get("supported_hosts") != SUPPORTED_HOSTS
+        ):
+            errors.append("build/manifest.json: supported_hosts mismatch")
+        transaction = manifest.get("transaction_policy")
+        if not isinstance(transaction, dict):
+            errors.append("build/manifest.json: transaction_policy missing")
+        elif (
+            transaction.get("lock") != "monotonic product and canonical target anchors"
+            or transaction.get("read_only_lock_creation") is not False
+        ):
+            errors.append("build/manifest.json: external lock policy mismatch")
 
     if contract is not None:
         if contract.get("contract_version") != 2:
@@ -179,6 +194,13 @@ def main() -> int:
             errors.append("config/nddev-contract.json: default profile mismatch")
         if contract.get("managed_state", {}).get("managed_files") != MANAGED_FILES:
             errors.append("config/nddev-contract.json: managed files mismatch")
+        compatibility = contract.get("runtime_compatibility")
+        if (
+            not isinstance(compatibility, dict)
+            or compatibility.get("supported_hosts") != SUPPORTED_HOSTS
+            or compatibility.get("ubuntu_version_floor") is not None
+        ):
+            errors.append("config/nddev-contract.json: supported host contract mismatch")
         if contract.get("software", {}).get("package") != CURRENT_PACKAGE:
             errors.append("config/nddev-contract.json: software package mismatch")
         software = contract.get("software", {})
@@ -238,6 +260,15 @@ def main() -> int:
             or target_owned.get("status_executes_target_binary") is not False
         ):
             errors.append("config/nddev-contract.json: software status must be side-effect free")
+        coordination = contract.get("safety", {}).get("external_lifecycle_coordination")
+        if not isinstance(coordination, dict):
+            errors.append("config/nddev-contract.json: external coordination contract missing")
+        elif (
+            coordination.get("read_only_creates_anchors") is not False
+            or coordination.get("mutation_publishes_missing_target_anchor") is not True
+            or coordination.get("published_anchors_unlinked_by_lifecycle") is not False
+        ):
+            errors.append("config/nddev-contract.json: external coordination policy mismatch")
         marketplace = contract.get("builder_projection", {}).get("marketplace", {})
         if marketplace.get("external_marketplace_published") is not None:
             errors.append("config/nddev-contract.json: external marketplace must remain null")

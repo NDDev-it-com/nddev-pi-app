@@ -6,18 +6,23 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
+import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -39,6 +44,11 @@ OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 METADATA_MAX_BYTES = 256 * 1024
 MANAGED_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
+LOCK_BINDING_MAX_BYTES = 16 * 1024
+LOCK_NAMESPACE_NAME = "nddev-pi-app-locks"
+LOCK_PRODUCT_ANCHOR_NAME = "global.lock"
+LOCK_TARGET_SUFFIX = ".target.lock"
+LOCK_TEMP_PREFIX = ".nddev-pi-publish."
 IDENTIFIER_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 SETUP_ID_PATTERN = IDENTIFIER_PATTERN
 PROFILE_ID_PATTERN = IDENTIFIER_PATTERN
@@ -280,8 +290,33 @@ class PiSetupError(Exception):
     """A safe, user-facing lifecycle failure."""
 
 
+class JsonArgumentParser(argparse.ArgumentParser):
+    """argparse variant that honors --json for parse-time errors."""
+
+    current_argv: list[str] = []
+
+    def parse_args(
+        self, args: list[str] | None = None, namespace: argparse.Namespace | None = None
+    ) -> argparse.Namespace:
+        JsonArgumentParser.current_argv = list(sys.argv[1:] if args is None else args)
+        return super().parse_args(args, namespace)
+
+    def error(self, message: str) -> NoReturn:
+        if "--json" in JsonArgumentParser.current_argv:
+            sys.stdout.write(canonical_json({"error": message}).decode("utf-8"))
+            raise SystemExit(2)
+        super().error(message)
+
+
 def fail(message: str) -> NoReturn:
     raise PiSetupError(message)
+
+
+def lifecycle_hook(label: str) -> None:
+    if os.environ.get("NDDEV_PI_KILLPOINT") == label:
+        os.kill(os.getpid(), signal.SIGKILL)
+    if os.environ.get("NDDEV_PI_FAULTPOINT") == label:
+        fail(f"injected lifecycle fault at {label}")
 
 
 def canonical_json(value: Any) -> bytes:
@@ -305,6 +340,64 @@ def is_current_user_owner(info: os.stat_result) -> bool:
 def require_current_user_owner(info: os.stat_result, label: str) -> None:
     if not is_current_user_owner(info):
         fail(f"{label} must be owned by the current user")
+
+
+def normalize_machine(machine: str) -> str:
+    normalized = machine.lower()
+    if normalized in {"x86_64", "amd64"}:
+        return "x64"
+    if normalized in {"arm64", "aarch64"}:
+        return "arm64"
+    return normalized
+
+
+def parse_libc_version(version: str) -> tuple[int, ...]:
+    if not re.fullmatch(r"\d+(?:\.\d+)*", version):
+        fail(f"unsupported glibc version: {version!r}")
+    return tuple(int(part) for part in version.split("."))
+
+
+def detect_supported_host() -> dict[str, Any]:
+    arch = normalize_machine(platform.machine())
+    if arch not in {"x64", "arm64"}:
+        fail(f"unsupported architecture: {platform.machine()!r}")
+    if sys.platform == "darwin":
+        return {
+            "host_id": f"macos-{arch}",
+            "os": "macos",
+            "arch": arch,
+            "distro_id": None,
+            "glibc": None,
+        }
+    if sys.platform.startswith("linux"):
+        try:
+            os_release = platform.freedesktop_os_release()
+        except OSError as exc:
+            fail(f"cannot detect Linux distribution: {exc}")
+        distro_id = str(os_release.get("ID", "")).lower()
+        id_like = {
+            item.lower()
+            for item in str(os_release.get("ID_LIKE", "")).replace(",", " ").split()
+            if item
+        }
+        if distro_id != "ubuntu" and "ubuntu" not in id_like:
+            fail(f"unsupported Linux distribution: {distro_id or 'unknown'}")
+        libc_name, libc_version = platform.libc_ver()
+        if libc_name != "glibc" or not libc_version:
+            fail("Ubuntu hosts must use glibc")
+        parse_libc_version(libc_version)
+        return {
+            "host_id": f"ubuntu-glibc-{arch}",
+            "os": "ubuntu",
+            "arch": arch,
+            "distro_id": distro_id,
+            "glibc": libc_version,
+        }
+    fail(f"unsupported operating system: {sys.platform}")
+
+
+def require_supported_host() -> dict[str, Any]:
+    return detect_supported_host()
 
 
 def is_sensitive_environment_name(name: str) -> bool:
@@ -678,43 +771,458 @@ def list_setups() -> list[dict[str, Any]]:
     return entries
 
 
-def resolve_target(raw_target: str | None) -> Path:
+def lexical_target(raw_target: str | None) -> Path:
     if not raw_target:
         fail("--target is required")
     expanded = Path(raw_target).expanduser()
     if not expanded.is_absolute():
         fail("--target must be an absolute path")
+    return expanded
+
+
+def canonical_target_under_lock(target: Path) -> Path:
     try:
-        raw_info = expanded.lstat()
+        raw_info = target.lstat()
     except FileNotFoundError:
         raw_info = None
     if raw_info is not None and stat.S_ISLNK(raw_info.st_mode):
         fail("--target must not be a symlink")
     if raw_info is not None and not stat.S_ISDIR(raw_info.st_mode):
         fail("--target must be a directory")
-    return expanded.resolve(strict=False)
+    return target.resolve(strict=False)
+
+
+@dataclass(frozen=True)
+class ExternalLock:
+    descriptor: int
+    path: Path
+    exclusive: bool
+
+
+def write_complete_fd(descriptor: int, content: bytes, label: str) -> None:
+    view = memoryview(content)
+    total = 0
+    while total < len(view):
+        written = os.write(descriptor, view[total:])
+        if written <= 0:
+            fail(f"cannot write complete {label}")
+        total += written
+
+
+def open_directory_for_sync(path: Path, label: str) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open {label} for sync: {exc}")
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} must be a directory")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def fsync_directory(path: Path, label: str) -> None:
+    descriptor = open_directory_for_sync(path, label)
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        fail(f"cannot sync {label}: {exc}")
+    finally:
+        os.close(descriptor)
+
+
+def bootstrap_system_temp_root() -> Path:
+    if sys.platform == "darwin":
+        return Path("/private/tmp")
+    return Path("/tmp")
+
+
+def product_lock_root_path() -> Path:
+    uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    return bootstrap_system_temp_root() / f"{LOCK_NAMESPACE_NAME}-{uid}"
+
+
+def require_product_lock_root(*, create: bool) -> Path | None:
+    system_root = bootstrap_system_temp_root()
+    system_info = require_directory(system_root, "system temp root")
+    if not stat.S_IMODE(system_info.st_mode) & stat.S_ISVTX:
+        fail("system temp root must be sticky")
+    root = product_lock_root_path()
+    info = stat_optional(root, "product lock root")
+    if info is None:
+        if not create:
+            return None
+        try:
+            root.mkdir(mode=OWNER_DIRECTORY_MODE)
+            lifecycle_hook("lock.product.root.mkdir")
+            os.chmod(root, OWNER_DIRECTORY_MODE)
+            fsync_directory(system_root, "system temp root")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                root.rmdir()
+                fsync_directory(system_root, "system temp root")
+            raise
+        info = require_directory(root, "product lock root")
+    if not stat.S_ISDIR(info.st_mode):
+        fail("product lock root must be a directory")
+    require_current_user_owner(info, "product lock root")
+    if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail("product lock root must be private")
+    return root
+
+
+def product_anchor_path(root: Path) -> Path:
+    return root / LOCK_PRODUCT_ANCHOR_NAME
+
+
+def target_anchor_digest(canonical_target: Path) -> str:
+    return sha256_bytes(f"{PRODUCT_NAME}\0{canonical_target}".encode("utf-8"))
+
+
+def target_anchor_path(root: Path, canonical_target: Path) -> Path:
+    return root / f"{target_anchor_digest(canonical_target)}{LOCK_TARGET_SUFFIX}"
+
+
+def anchor_binding(kind: str, canonical_target: Path | None = None) -> dict[str, Any]:
+    binding: dict[str, Any] = {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "kind": kind,
+        "namespace": LOCK_NAMESPACE_NAME,
+    }
+    if kind == "product":
+        return binding
+    if kind == "target" and canonical_target is not None:
+        binding["canonical_target"] = str(canonical_target)
+        binding["target_digest"] = target_anchor_digest(canonical_target)
+        return binding
+    fail("invalid external lock binding request")
+
+
+def read_fd_bounded(descriptor: int, label: str, *, max_bytes: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            fail(f"{label} is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def validate_anchor_descriptor(
+    path: Path,
+    descriptor: int,
+    expected_binding: dict[str, Any],
+    *,
+    allow_publication_alias: bool,
+) -> os.stat_result:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        fail("external lock anchor must be a regular file")
+    require_current_user_owner(opened, "external lock anchor")
+    if stat.S_IMODE(opened.st_mode) != OWNER_FILE_MODE:
+        fail("external lock anchor must have mode 0600")
+    if opened.st_nlink != 1 and not (allow_publication_alias and opened.st_nlink == 2):
+        fail("external lock anchor has unsafe link count")
+    try:
+        final = path.lstat()
+    except FileNotFoundError:
+        fail("external lock anchor is missing")
+    if stat.S_ISLNK(final.st_mode) or not stat.S_ISREG(final.st_mode):
+        fail("external lock anchor must be a regular file")
+    require_current_user_owner(final, "external lock anchor")
+    if stat.S_IMODE(final.st_mode) != OWNER_FILE_MODE:
+        fail("external lock anchor must have mode 0600")
+    if final.st_size > LOCK_BINDING_MAX_BYTES:
+        fail("external lock anchor binding is too large")
+    if identity_of(opened) != identity_of(final):
+        fail("external lock anchor changed while opening")
+    if final.st_nlink != opened.st_nlink:
+        fail("external lock anchor link count changed while opening")
+    content = read_fd_bounded(descriptor, "external lock binding", max_bytes=LOCK_BINDING_MAX_BYTES)
+    if not content:
+        fail("external lock binding is empty")
+    binding = parse_json_object(content, "external lock binding")
+    if binding != expected_binding:
+        fail("external lock binding mismatch")
+    return opened
+
+
+def publication_aliases(parent: Path, final: Path, final_info: os.stat_result) -> list[Path]:
+    aliases: list[Path] = []
+    try:
+        entries = list(parent.iterdir())
+    except OSError as exc:
+        fail(f"cannot inspect external lock parent: {exc}")
+    pattern = re.compile(re.escape(LOCK_TEMP_PREFIX) + r"[0-9]+\.[0-9a-f]+\.tmp\Z")
+    for entry in entries:
+        if entry.name == final.name:
+            continue
+        if not pattern.fullmatch(entry.name):
+            continue
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if identity_of(info) == identity_of(final_info):
+            aliases.append(entry)
+    return aliases
+
+
+def recover_anchor_publication_alias(path: Path, descriptor: int, expected: dict[str, Any]) -> None:
+    opened = validate_anchor_descriptor(
+        path, descriptor, expected, allow_publication_alias=True
+    )
+    if opened.st_nlink == 1:
+        return
+    aliases = publication_aliases(path.parent, path, opened)
+    if len(aliases) != 1:
+        fail("external lock publication alias state is ambiguous")
+    try:
+        aliases[0].unlink()
+        lifecycle_hook(f"lock.{expected['kind']}.alias.unlink")
+        fsync_directory(path.parent, "external lock parent")
+    except OSError as exc:
+        fail(f"cannot recover external lock publication alias: {exc}")
+    validate_anchor_descriptor(path, descriptor, expected, allow_publication_alias=False)
+
+
+def open_anchor_no_create(
+    path: Path,
+    expected: dict[str, Any],
+    *,
+    exclusive: bool,
+    recover_alias: bool,
+) -> ExternalLock:
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        fail(f"cannot open external lock anchor: {exc}")
+    locked = False
+    try:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(descriptor, operation)
+        locked = True
+        if recover_alias:
+            recover_anchor_publication_alias(path, descriptor, expected)
+        else:
+            validate_anchor_descriptor(
+                path, descriptor, expected, allow_publication_alias=False
+            )
+        return ExternalLock(descriptor=descriptor, path=path, exclusive=exclusive)
+    except OSError as exc:
+        fail(f"cannot lock external anchor: {exc}")
+    except BaseException:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        raise
+
+
+def close_external_lock(lock: ExternalLock | None) -> None:
+    if lock is None:
+        return
+    with contextlib.suppress(OSError):
+        fcntl.flock(lock.descriptor, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(lock.descriptor)
+
+
+def publish_anchor_no_replace(parent: Path, final: Path, binding: dict[str, Any]) -> None:
+    content = canonical_json(binding)
+    if len(content) > LOCK_BINDING_MAX_BYTES:
+        fail("external lock binding is too large")
+    temp = parent / f"{LOCK_TEMP_PREFIX}{os.getpid()}.{time.monotonic_ns():x}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(temp, flags, OWNER_FILE_MODE)
+    final_visible = False
+    try:
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        lifecycle_hook(f"lock.{binding['kind']}.temp.chmod")
+        write_complete_fd(descriptor, content, "external lock binding")
+        lifecycle_hook(f"lock.{binding['kind']}.temp.write")
+        os.fsync(descriptor)
+        lifecycle_hook(f"lock.{binding['kind']}.temp.fsync")
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.link(temp, final)
+            final_visible = True
+            lifecycle_hook(f"lock.{binding['kind']}.final.visible")
+        except FileExistsError:
+            return
+        fsync_directory(parent, "external lock parent")
+        lifecycle_hook(f"lock.{binding['kind']}.parent.fsync")
+    finally:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+            lifecycle_hook(f"lock.{binding['kind']}.alias.cleanup")
+            fsync_directory(parent, "external lock parent")
+        if not final_visible:
+            with contextlib.suppress(FileNotFoundError):
+                temp.unlink()
+
+
+def ensure_anchor(
+    path: Path,
+    expected: dict[str, Any],
+    *,
+    exclusive: bool,
+    create: bool,
+    recover_alias: bool,
+) -> ExternalLock | None:
+    try:
+        return open_anchor_no_create(
+            path, expected, exclusive=exclusive, recover_alias=recover_alias
+        )
+    except FileNotFoundError:
+        if not create:
+            return None
+    publish_anchor_no_replace(path.parent, path, expected)
+    return open_anchor_no_create(path, expected, exclusive=exclusive, recover_alias=recover_alias)
+
+
+def acquire_product_coordination(
+    *, exclusive: bool, create: bool, recover_alias: bool
+) -> tuple[Path | None, ExternalLock | None]:
+    root = require_product_lock_root(create=create)
+    if root is None:
+        return None, None
+    lock = ensure_anchor(
+        product_anchor_path(root),
+        anchor_binding("product"),
+        exclusive=exclusive,
+        create=create,
+        recover_alias=recover_alias,
+    )
+    return root, lock
+
+
+@contextlib.contextmanager
+def product_coordination(
+    *, exclusive: bool, create: bool, recover_alias: bool
+) -> Iterator[tuple[Path | None, ExternalLock | None]]:
+    root, lock = acquire_product_coordination(
+        exclusive=exclusive,
+        create=create,
+        recover_alias=recover_alias,
+    )
+    try:
+        yield root, lock
+    finally:
+        close_external_lock(lock)
+
+
+@contextlib.contextmanager
+def external_target_coordination(
+    target: Path, *, mutation: bool
+) -> Iterator[tuple[Path, bool]]:
+    if mutation:
+        root, product_lock = acquire_product_coordination(
+            exclusive=True, create=True, recover_alias=True
+        )
+        target_lock_obj: ExternalLock | None = None
+        try:
+            canonical = canonical_target_under_lock(target)
+            if root is None:
+                fail("product lock root disappeared during mutation")
+            target_lock_obj = ensure_anchor(
+                target_anchor_path(root, canonical),
+                anchor_binding("target", canonical),
+                exclusive=True,
+                create=True,
+                recover_alias=True,
+            )
+            if target_lock_obj is None:
+                fail("target lock anchor was not created")
+            lifecycle_hook("lock.target.handoff")
+        finally:
+            close_external_lock(product_lock)
+        try:
+            yield canonical, True
+        finally:
+            close_external_lock(target_lock_obj)
+        return
+
+    root = require_product_lock_root(create=False)
+    if root is None or not product_anchor_path(root).exists():
+        canonical = canonical_target_under_lock(target)
+        yield canonical, False
+        root_after = require_product_lock_root(create=False)
+        if root_after is not None and product_anchor_path(root_after).exists():
+            fail("concurrent mutation published product coordination during read")
+        return
+    product_root, product_lock = acquire_product_coordination(
+        exclusive=False, create=False, recover_alias=False
+    )
+    target_lock_obj: ExternalLock | None = None
+    hold_product_during_read = True
+    try:
+        canonical = canonical_target_under_lock(target)
+        if product_root is None:
+            fail("product lock root disappeared during read")
+        target_anchor = target_anchor_path(product_root, canonical)
+        target_lock_obj = ensure_anchor(
+            target_anchor,
+            anchor_binding("target", canonical),
+            exclusive=False,
+            create=False,
+            recover_alias=False,
+        )
+        if target_lock_obj is not None:
+            hold_product_during_read = False
+            close_external_lock(product_lock)
+            product_lock = None
+    except BaseException:
+        close_external_lock(target_lock_obj)
+        close_external_lock(product_lock)
+        raise
+    try:
+        yield canonical, target_lock_obj is not None
+    finally:
+        close_external_lock(target_lock_obj)
+        if hold_product_during_read:
+            close_external_lock(product_lock)
 
 
 def backup_pool(target: Path) -> Path:
     return target.parent / f".{target.name}.nddev-pi-backups"
 
 
-def lock_dir(target: Path) -> Path:
-    return target.parent / f".{target.name}.nddev-pi.lock"
-
-
 @contextlib.contextmanager
-def target_lock(target: Path) -> Iterator[None]:
-    lock = lock_dir(target)
-    try:
-        os.mkdir(lock, OWNER_DIRECTORY_MODE)
-    except FileExistsError:
-        fail("target is already locked by another nddev-pi operation")
-    try:
-        yield
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            lock.rmdir()
+def target_lock(target: Path, *, mutation: bool = True) -> Iterator[Path]:
+    with external_target_coordination(target, mutation=mutation) as (canonical, _):
+        yield canonical
+
+
+def read_only_target(target: Path, callback: Any) -> Any:
+    with target_lock(target, mutation=False) as canonical:
+        return callback(canonical)
 
 
 def ensure_directory(path: Path) -> None:
@@ -1120,7 +1628,8 @@ def write_rendered_files(
 
 
 def command_plan(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
-    status = status_for_target(target)
+    with target_lock(target, mutation=False) as target:
+        status = status_for_target(target)
     operation = "install"
     backup_required = False
     if status["state"] == "managed":
@@ -1144,7 +1653,7 @@ def command_plan(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]
 
 
 def command_install(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
-    with target_lock(target):
+    with target_lock(target) as target:
         ensure_target_directory(target)
         status = status_for_target(target)
         if status["state"] == "managed" and status["drift"]:
@@ -1169,7 +1678,7 @@ def command_install(target: Path, setup_id: str, profile_id: str) -> dict[str, A
 
 
 def command_switch(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
-    with target_lock(target):
+    with target_lock(target) as target:
         ensure_target_directory(target)
         status = require_clean_managed(target)
         backup_slot = create_backup(target, status["setup_id"], status["profile_id"])
@@ -1188,7 +1697,7 @@ def command_switch(target: Path, setup_id: str, profile_id: str) -> dict[str, An
 
 
 def command_restore(target: Path, slot: int) -> dict[str, Any]:
-    with target_lock(target):
+    with target_lock(target) as target:
         ensure_target_directory(target)
         status = require_clean_managed(target)
         create_backup(target, status["setup_id"], status["profile_id"])
@@ -1222,7 +1731,7 @@ def command_restore(target: Path, slot: int) -> dict[str, Any]:
 
 
 def command_remove(target: Path) -> dict[str, Any]:
-    with target_lock(target):
+    with target_lock(target) as target:
         ensure_target_directory(target)
         status = require_clean_managed(target)
         create_backup(target, status["setup_id"], status["profile_id"])
@@ -2126,25 +2635,7 @@ def remove_created_target_if_empty(target: Path) -> None:
 
 
 def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
-    preflight = software_precondition_state(target)
-    if preflight["current"]:
-        return {
-            "changed": False,
-            "package": PI_PACKAGE_NAME,
-            "version": PI_PACKAGE_VERSION,
-            "command": PI_COMMAND,
-            "executable": str(software_entrypoint(target)),
-            "installed_tree": str(software_current(target)),
-            "target": canonical_target_readonly(target),
-        }
-    if update and not preflight["present"]:
-        fail("software-update requires existing target-owned Pi software presence")
-    if not update and preflight["present"]:
-        fail(
-            "software-install found partial or non-current target-owned Pi software; use software-update"
-        )
-
-    with target_lock(target):
+    with target_lock(target) as target:
         created_target = stat_optional(target, "target") is None
         try:
             status = software_precondition_state(target)
@@ -2308,7 +2799,8 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
 
 
 def software_plan(target: Path) -> dict[str, Any]:
-    status = software_precondition_state(target)
+    with target_lock(target, mutation=False) as target:
+        status = software_precondition_state(target)
     operation = "none"
     if not status["present"]:
         operation = "install"
@@ -2408,7 +2900,7 @@ def prepare_launch_invocation(
     user_args = list(forwarded)
     if user_args and user_args[0] == "--":
         user_args = user_args[1:]
-    with target_lock(target):
+    with target_lock(target) as target:
         require_clean_managed(target)
         software = software_status_payload(target)
         if not software["current"]:
@@ -2458,7 +2950,7 @@ def emit(payload: dict[str, Any], json_enabled: bool) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = JsonArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser("list")
@@ -2472,7 +2964,7 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument("--setup")
             command_parser.add_argument("--profile")
         if command == "restore":
-            command_parser.add_argument("--backup", type=int)
+            command_parser.add_argument("--backup")
 
     launch_parser = subparsers.add_parser("launch")
     launch_parser.add_argument("--target")
@@ -2503,21 +2995,36 @@ def require_profile_argument(profile_id: str | None) -> str:
     return profile_id
 
 
+def require_backup_slot(raw_slot: str | None) -> int:
+    if raw_slot is None:
+        fail("--backup is required")
+    if not re.fullmatch(r"\d+", raw_slot):
+        fail("--backup must be a decimal integer in the 0..9 range")
+    slot = int(raw_slot)
+    if slot < 0 or slot > 9:
+        fail("--backup must be in the 0..9 range")
+    return slot
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     json_enabled = bool(getattr(args, "json", False))
     try:
+        host = require_supported_host()
         if args.command == "list":
-            emit({"setups": list_setups(), "profiles": list_profiles()}, json_enabled)
+            emit({"setups": list_setups(), "profiles": list_profiles(), "host": host}, json_enabled)
             return 0
         if args.command == "status":
-            emit(status_for_target(resolve_target(args.target)), json_enabled)
+            emit(
+                read_only_target(lexical_target(args.target), status_for_target),
+                json_enabled,
+            )
             return 0
         if args.command == "plan":
             emit(
                 command_plan(
-                    resolve_target(args.target),
+                    lexical_target(args.target),
                     require_setup_argument(args.setup),
                     require_profile_argument(args.profile),
                 ),
@@ -2527,7 +3034,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "install":
             emit(
                 command_install(
-                    resolve_target(args.target),
+                    lexical_target(args.target),
                     require_setup_argument(args.setup),
                     require_profile_argument(args.profile),
                 ),
@@ -2537,7 +3044,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "switch":
             emit(
                 command_switch(
-                    resolve_target(args.target),
+                    lexical_target(args.target),
                     require_setup_argument(args.setup),
                     require_profile_argument(args.profile),
                 ),
@@ -2545,28 +3052,32 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "restore":
-            if args.backup is None:
-                fail("--backup is required")
-            emit(command_restore(resolve_target(args.target), args.backup), json_enabled)
+            emit(
+                command_restore(lexical_target(args.target), require_backup_slot(args.backup)),
+                json_enabled,
+            )
             return 0
         if args.command == "remove":
-            emit(command_remove(resolve_target(args.target)), json_enabled)
+            emit(command_remove(lexical_target(args.target)), json_enabled)
             return 0
         if args.command == "launch":
-            return command_launch(resolve_target(args.target), args.forwarded)
+            return command_launch(lexical_target(args.target), args.forwarded)
         if args.command == "software-plan":
-            emit(software_plan(resolve_target(args.target)), json_enabled)
+            emit(software_plan(lexical_target(args.target)), json_enabled)
             return 0
         if args.command == "software-status":
-            emit(software_status_payload(resolve_target(args.target)), json_enabled)
+            emit(
+                read_only_target(lexical_target(args.target), software_status_payload),
+                json_enabled,
+            )
             return 0
         if args.command == "software-install":
             emit(
-                install_or_update_software(resolve_target(args.target), update=False), json_enabled
+                install_or_update_software(lexical_target(args.target), update=False), json_enabled
             )
             return 0
         if args.command == "software-update":
-            emit(install_or_update_software(resolve_target(args.target), update=True), json_enabled)
+            emit(install_or_update_software(lexical_target(args.target), update=True), json_enabled)
             return 0
     except PiSetupError as exc:
         if json_enabled:

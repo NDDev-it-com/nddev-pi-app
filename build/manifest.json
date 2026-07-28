@@ -42,7 +42,13 @@
   },
   "runtime_compatibility": {
     "baseline_ref": "references/pi-baseline.json",
-    "version_ref": "build/version.json"
+    "version_ref": "build/version.json",
+    "supported_hosts": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ]
   },
   "runtime_launch": {
     "command": "pi",
@@ -132,7 +138,10 @@
     "reject_symlink_managed_files": true,
     "rollback_on_failure": true,
     "staging": "same-parent temporary directory",
-    "lock": "exclusive sibling directory"
+    "lock": "monotonic product and canonical target anchors",
+    "read_only_lock_creation": false,
+    "anchor_publication": "complete fsynced temp plus atomic no-replace hardlink",
+    "external_coordination_root": "private sticky-temp namespace declared by cli-tools/nddev_pi.py"
   },
   "profiles": {
     "default": "full-auto",

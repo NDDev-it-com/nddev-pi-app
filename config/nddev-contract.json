@@ -38,7 +38,14 @@
   },
   "runtime_compatibility": {
     "baseline_ref": "references/pi-baseline.json",
-    "version_ref": "build/version.json"
+    "version_ref": "build/version.json",
+    "supported_hosts": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ],
+    "ubuntu_version_floor": null
   },
   "runtime_launch": {
     "command": "pi",
@@ -183,6 +190,14 @@
     "preserve_existing_target_mode": true,
     "relative_target_rejected": true,
     "rollback_on_failure": true,
-    "target_symlinks_rejected": true
+    "target_symlinks_rejected": true,
+    "external_lifecycle_coordination": {
+      "product_anchor": "global.lock",
+      "canonical_target_anchor": "<sha256>.target.lock",
+      "read_only_creates_anchors": false,
+      "mutation_publishes_missing_target_anchor": true,
+      "publication": "atomic no-replace hardlink of complete fsynced binding",
+      "published_anchors_unlinked_by_lifecycle": false
+    }
   }
 }
