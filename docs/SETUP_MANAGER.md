@@ -29,38 +29,22 @@ state. Unknown files and user-owned settings keys are preserved. Co-owned
 Official Pi documentation confirms settings, skills, packages, extensions, and
 project trust controls. It does not document native permission popups, sub-agent
 configuration, or a built-in plugin marketplace for this manager. The
-`full-auto` setup therefore uses Pi project trust approval and isolated process
-environment only; it is not represented as a sandbox.
+`full-auto` profile therefore uses Pi project trust approval and isolated
+process environment only; it is not represented as a sandbox.
 
 ## Software Commands
 
 `software-plan` and `software-status` are side-effect free and never execute the
-target-owned Pi binary. `software-install` and `software-update` install
-`@earendil-works/pi-coding-agent@0.82.1` with:
+target-owned Pi binary. `software-install` and `software-update` install the
+pinned Pi npm package in isolated stage-owned install/cache/home/tmp paths. The
+exact npm argv, package identity, layout checks, Node runtime recording, and
+version-probe contract are owned by `references/pi-baseline.json`,
+`build/version.json`, and `config/nddev-contract.json`.
 
-```bash
-bun add --global --exact @earendil-works/pi-coding-agent@0.82.1
-```
-
-The Bun process receives only stage-owned install/cache/home/tmp paths. The
-manager persists the staged `install/global` and `bin` trees, verifies the
-official package layout, checks the staged binary with isolated Pi runtime
-environment, records the external Node path/version/digest, then atomically
-swaps `<target>/.nddev-pi-software/current`, `<target>/bin/pi`, and
-`NDDEV-PI-SOFTWARE.json`. Fresh failures remove transaction-created target
-state; updates roll back byte-for-byte including stamp modes.
-
-The Bun-created `bin/pi` symlink must resolve inside staging to the declared
-package entrypoint. The manager does not persist that symlink or detach its ESM
-file from neighboring imports; it replaces it with a private relative Node
-wrapper inside the sanitized software tree. The target-visible wrapper remains
-separate and points at the package entrypoint in the atomically swapped tree.
-
-The published package identity is `0.82.1`, while its current `pi --version`
-stdout is `0.0.0`. These are independent fail-closed checks: the manager
-requires the exact package name/version/bin from package metadata and the exact
-CLI probe output recorded by `references/pi-baseline.json`. Probe stdout never
-substitutes for package identity.
+The manager does not persist npm-created symlinks or detach Pi's ESM entrypoint
+from neighboring imports. It materializes a private Node wrapper inside the
+sanitized software tree and a target-visible wrapper that points at that
+package entrypoint.
 
 Staged and persisted trees remain bounded by independently enforced path-count
 and logical-byte limits. The measured exact-package calibration is owned by
@@ -70,5 +54,4 @@ software stamp records the installed tree metrics and limits for status
 revalidation.
 
 The pinned package has no consumer `preinstall`, `install`, or `postinstall`
-script, so Bun `--trust` is not used. The published `prepublishOnly` script is
-recorded as package evidence but is not run by consumers.
+script in the recorded baseline. npm is invoked with consumer scripts disabled.

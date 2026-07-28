@@ -27,7 +27,30 @@ REQUIRED_VERSION_KEYS = {
     "runtime_baseline_ref",
     "schema_version",
 }
-SETUP_IDS = ["balanced", "full-auto", "safe"]
+SETUP_IDS = ["nddev-builder"]
+PROFILE_IDS = ["full-auto", "safe"]
+MANAGED_FILES = [
+    "agent/settings.json",
+    "agent/AGENTS.md",
+    "agent/skills/nddev-builder/SKILL.md",
+    "agent/packages/nddev-builder/package.json",
+    "agent/packages/nddev-builder/skills/nddev-builder/SKILL.md",
+]
+NPM_INSTALL_ARGV = [
+    "install",
+    "--global-style",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--package-lock=false",
+    "--prefix",
+    "<stage>/install",
+    "@earendil-works/pi-coding-agent@0.82.1",
+]
+PI_REGISTRY_INTEGRITY = (
+    "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
+    "XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
+)
 PACKAGE_ID_PATTERN = re.compile(r"@[A-Za-z0-9._-]+/pi-coding-agent")
 REPOSITORY_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9._-]+/pi\b")
 NDDEV_MODULE_PATTERN = re.compile(r"nddev-[a-z0-9-]+-app")
@@ -91,10 +114,9 @@ def main() -> int:
             errors.append("build/version.json: pi_package_bin mismatch")
         if version.get("pi_node_requires") != ">=22.19.0":
             errors.append("build/version.json: pi_node_requires mismatch")
-        if version.get("pi_registry_integrity") != (
-            "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
-            "XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
-        ):
+        if version.get("python_requires") != ">=3.9":
+            errors.append("build/version.json: python_requires must include Python 3.9")
+        if version.get("pi_registry_integrity") != PI_REGISTRY_INTEGRITY:
             errors.append("build/version.json: pi_registry_integrity mismatch")
         if version.get("pi_registry_shasum") != "39c00809ff5531b6552b9ecb2c41f4c3529ec988":
             errors.append("build/version.json: pi_registry_shasum mismatch")
@@ -104,12 +126,23 @@ def main() -> int:
             errors.append("build/manifest.json:build_version disagrees with build/version.json")
         if manifest.get("setup_ids") != SETUP_IDS:
             errors.append("build/manifest.json: unexpected setup_ids")
+        if manifest.get("profile_ids") != PROFILE_IDS:
+            errors.append("build/manifest.json: unexpected profile_ids")
+        if manifest.get("default_setup_id") != "nddev-builder":
+            errors.append("build/manifest.json: default_setup_id mismatch")
+        if manifest.get("default_profile_id") != "full-auto":
+            errors.append("build/manifest.json: default_profile_id mismatch")
+        if manifest.get("managed_files") != [*MANAGED_FILES, "NDDEV-PI-SETUP.json"]:
+            errors.append("build/manifest.json: managed_files mismatch")
         projection = manifest.get("builder_projection")
         if not isinstance(projection, dict) or projection.get("default_on") is not True:
             errors.append("build/manifest.json: builder_projection.default_on must be true")
         runtime = manifest.get("runtime_launch")
-        if not isinstance(runtime, dict) or runtime.get("provider_secret_inheritance") is not False:
-            errors.append("build/manifest.json: launch must not inherit provider secrets")
+        if (
+            not isinstance(runtime, dict)
+            or runtime.get("provider_secret_inheritance") != "child-process-allowlist-only"
+        ):
+            errors.append("build/manifest.json: launch provider inheritance mismatch")
         software = manifest.get("software")
         if not isinstance(software, dict):
             errors.append("build/manifest.json: software contract is missing")
@@ -124,12 +157,9 @@ def main() -> int:
             installer = software.get("installer")
             if not isinstance(installer, dict):
                 errors.append("build/manifest.json: software installer missing")
-            elif installer.get("argv") != [
-                "add",
-                "--global",
-                "--exact",
-                "@earendil-works/pi-coding-agent@0.82.1",
-            ]:
+            elif installer.get("tool") != "npm":
+                errors.append("build/manifest.json: software installer tool mismatch")
+            elif installer.get("argv") != NPM_INSTALL_ARGV:
                 errors.append("build/manifest.json: software installer argv mismatch")
             elif installer.get("trust") is not False:
                 errors.append("build/manifest.json: software installer trust must be false")
@@ -141,6 +171,14 @@ def main() -> int:
             errors.append("config/nddev-contract.json: unexpected github_repository")
         if contract.get("setup_system", {}).get("setup_ids") != SETUP_IDS:
             errors.append("config/nddev-contract.json: setup ids mismatch")
+        if contract.get("setup_system", {}).get("profile_ids") != PROFILE_IDS:
+            errors.append("config/nddev-contract.json: profile ids mismatch")
+        if contract.get("setup_system", {}).get("default_setup_id") != "nddev-builder":
+            errors.append("config/nddev-contract.json: default setup mismatch")
+        if contract.get("setup_system", {}).get("default_profile_id") != "full-auto":
+            errors.append("config/nddev-contract.json: default profile mismatch")
+        if contract.get("managed_state", {}).get("managed_files") != MANAGED_FILES:
+            errors.append("config/nddev-contract.json: managed files mismatch")
         if contract.get("software", {}).get("package") != CURRENT_PACKAGE:
             errors.append("config/nddev-contract.json: software package mismatch")
         software = contract.get("software", {})
@@ -151,14 +189,9 @@ def main() -> int:
         if software.get("registry_shasum") != "39c00809ff5531b6552b9ecb2c41f4c3529ec988":
             errors.append("config/nddev-contract.json: software shasum mismatch")
         installer = software.get("installer")
-        if not isinstance(installer, dict) or installer.get("tool") != "bun":
+        if not isinstance(installer, dict) or installer.get("tool") != "npm":
             errors.append("config/nddev-contract.json: software installer tool mismatch")
-        elif installer.get("argv") != [
-            "add",
-            "--global",
-            "--exact",
-            "@earendil-works/pi-coding-agent@0.82.1",
-        ]:
+        elif installer.get("argv") != NPM_INSTALL_ARGV:
             errors.append("config/nddev-contract.json: software installer argv mismatch")
         elif installer.get("trust") is not False:
             errors.append("config/nddev-contract.json: software installer trust must be false")
@@ -177,9 +210,9 @@ def main() -> int:
         if not isinstance(entrypoint_materialization, dict):
             errors.append("config/nddev-contract.json: entrypoint materialization missing")
         elif entrypoint_materialization != {
-            "bun_source": "<stage>/bin/pi",
+            "npm_source": "<stage>/install/bin/pi",
             "required_package_target": (
-                "<stage>/install/global/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+                "<stage>/install/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
             ),
             "persisted_kind": "private-relative-node-wrapper",
             "persisted_path": ".nddev-pi-software/current/bin/pi",
@@ -191,7 +224,7 @@ def main() -> int:
         if version_identity != {
             "required_package_version": "0.82.1",
             "package_version_source": (
-                ".nddev-pi-software/current/install/global/node_modules/"
+                ".nddev-pi-software/current/install/lib/node_modules/"
                 "@earendil-works/pi-coding-agent/package.json"
             ),
             "probe_argv": ["bin/pi", "--version"],
@@ -210,7 +243,9 @@ def main() -> int:
             errors.append("config/nddev-contract.json: external marketplace must remain null")
         if contract.get("builder_projection", {}).get("surfaces") != [
             "settings.skills",
-            "package.skills",
+            "settings.packages",
+            "package.pi.skills",
+            "agent.AGENTS.md",
         ]:
             errors.append("config/nddev-contract.json: builder surfaces mismatch")
 
@@ -231,27 +266,21 @@ def main() -> int:
         }:
             errors.append("references/pi-baseline.json: CLI version probe mismatch")
         package = baseline.get("package", {})
-        if package.get("integrity") != (
-            "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
-            "XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
-        ):
+        if package.get("integrity") != PI_REGISTRY_INTEGRITY:
             errors.append("references/pi-baseline.json: package integrity mismatch")
         if package.get("shasum") != "39c00809ff5531b6552b9ecb2c41f4c3529ec988":
             errors.append("references/pi-baseline.json: package shasum mismatch")
         manager_installation = baseline.get("manager_installation", {})
-        if manager_installation.get("argv") != [
-            "add",
-            "--global",
-            "--exact",
-            "@earendil-works/pi-coding-agent@0.82.1",
-        ]:
+        if manager_installation.get("tool") != "npm":
+            errors.append("references/pi-baseline.json: manager installation tool mismatch")
+        if manager_installation.get("argv") != NPM_INSTALL_ARGV:
             errors.append("references/pi-baseline.json: manager installation argv mismatch")
         if manager_installation.get("trust") is not False:
             errors.append("references/pi-baseline.json: manager installation trust must be false")
         calibration = manager_installation.get("verified_tree_calibration")
         if calibration != {
             "verified_at": "2026-07-27",
-            "bun_version": "1.3.14",
+            "npm_version": None,
             "staged_global_tree": {
                 "path_count": 20873,
                 "logical_file_bytes": 118702032,
@@ -286,7 +315,7 @@ def main() -> int:
         if setup is not None:
             if setup.get("id") != setup_dir.name:
                 errors.append(f"setups/{setup_dir.name}/setup.json: id mismatch")
-            if setup.get("managed_files") != ["agent/settings.json"]:
+            if setup.get("managed_files") != MANAGED_FILES:
                 errors.append(f"setups/{setup_dir.name}/setup.json: managed_files mismatch")
             if setup.get("builder_projection") != "default-on":
                 errors.append(f"setups/{setup_dir.name}/setup.json: builder must be default-on")
@@ -306,6 +335,28 @@ def main() -> int:
     if setup_ids != SETUP_IDS:
         errors.append(f"setups/: unexpected setup directories {setup_ids}")
 
+    profile_ids: list[str] = []
+    profile_defaults: list[str] = []
+    for profile_dir in sorted((ROOT / "profiles").iterdir()):
+        if not profile_dir.is_dir():
+            continue
+        profile = load_json(f"profiles/{profile_dir.name}/profile.json", errors)
+        if profile is None:
+            continue
+        if profile.get("id") != profile_dir.name:
+            errors.append(f"profiles/{profile_dir.name}/profile.json: id mismatch")
+        if profile.get("os_security_boundary") is not False:
+            errors.append(f"profiles/{profile_dir.name}/profile.json: false OS boundary required")
+        if not isinstance(profile.get("launch_args"), list):
+            errors.append(f"profiles/{profile_dir.name}/profile.json: launch_args missing")
+        if profile.get("default") is True:
+            profile_defaults.append(profile_dir.name)
+        profile_ids.append(profile_dir.name)
+    if profile_ids != PROFILE_IDS:
+        errors.append(f"profiles/: unexpected profile directories {profile_ids}")
+    if profile_defaults != ["full-auto"]:
+        errors.append("profiles/: full-auto must be the only default profile")
+
     if builder_package is not None and version is not None:
         if builder_package.get("name") != "nddev-builder":
             errors.append("builder package: name must be nddev-builder")
@@ -315,6 +366,8 @@ def main() -> int:
             errors.append("builder package: missing pi.skills projection")
     if not (ROOT / "builder/nddev-builder/skills/nddev-builder/SKILL.md").is_file():
         errors.append("missing builder skill source")
+    if not (ROOT / "builder/nddev-builder/AGENTS.md").is_file():
+        errors.append("missing builder AGENTS source")
 
     validate_current_identity_only(errors)
 

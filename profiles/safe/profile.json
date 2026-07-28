@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "safe",
+  "description": "Reduced-tool future Pi runtime profile: no project trust, no saved session, and read-only built-in tool allowlist.",
+  "default": false,
+  "settings": {
+    "defaultProjectTrust": "never"
+  },
+  "launch_args": [
+    "--offline",
+    "--no-session",
+    "--no-approve",
+    "--tools",
+    "read,grep,find,ls"
+  ],
+  "tool_boundary": "pi-read-only-builtins",
+  "os_security_boundary": false
+}

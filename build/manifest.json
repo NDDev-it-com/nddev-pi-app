@@ -4,9 +4,16 @@
   "build_version": "0.1.0",
   "entrypoint": "python3 cli-tools/nddev_pi.py",
   "source_root": "setups",
-  "setup_ids": ["balanced", "full-auto", "safe"],
+  "setup_ids": ["nddev-builder"],
+  "profile_ids": ["full-auto", "safe"],
+  "default_setup_id": "nddev-builder",
+  "default_profile_id": "full-auto",
   "managed_files": [
     "agent/settings.json",
+    "agent/AGENTS.md",
+    "agent/skills/nddev-builder/SKILL.md",
+    "agent/packages/nddev-builder/package.json",
+    "agent/packages/nddev-builder/skills/nddev-builder/SKILL.md",
     "NDDEV-PI-SETUP.json"
   ],
   "command_policy": {
@@ -59,7 +66,7 @@
     "forwards_child_exit_code": true,
     "json_manager_errors_supported": true,
     "manager_command": "python3 cli-tools/nddev_pi.py launch --target <absolute-target> -- [args...]",
-    "provider_secret_inheritance": false,
+    "provider_secret_inheritance": "child-process-allowlist-only",
     "requires_clean_managed_target": true,
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
@@ -71,11 +78,21 @@
     "command": "pi",
     "bin": "dist/cli.js",
     "node_requirement": ">=22.19.0",
-    "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+    "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
     "registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
     "installer": {
-      "tool": "bun",
-      "argv": ["add", "--global", "--exact", "@earendil-works/pi-coding-agent@0.82.1"],
+      "tool": "npm",
+      "argv": [
+        "install",
+        "--global-style",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--package-lock=false",
+        "--prefix",
+        "<stage>/install",
+        "@earendil-works/pi-coding-agent@0.82.1"
+      ],
       "trust": false,
       "consumer_lifecycle_scripts": false
     },
@@ -92,7 +109,7 @@
     "default_on": true,
     "target_skill_path": "agent/skills/nddev-builder",
     "target_package_path": "agent/packages/nddev-builder",
-    "surfaces": ["settings.skills", "package.skills"],
+    "surfaces": ["settings.skills", "settings.packages", "package.pi.skills", "agent.AGENTS.md"],
     "official_documentation": {
       "settings": "https://pi.dev/docs/latest/settings",
       "packages": "https://pi.dev/docs/latest/packages",
@@ -116,5 +133,22 @@
     "rollback_on_failure": true,
     "staging": "same-parent temporary directory",
     "lock": "exclusive sibling directory"
+  },
+  "profiles": {
+    "default": "full-auto",
+    "available": ["full-auto", "safe"],
+    "full-auto": {
+      "project_trust": "always",
+      "managed_launch_args": ["--offline", "--approve"],
+      "tool_boundary": "normal-pi-tools",
+      "os_security_boundary": false
+    },
+    "safe": {
+      "project_trust": "never",
+      "managed_launch_args": ["--offline", "--no-session", "--no-approve", "--tools", "read,grep,find,ls"],
+      "tool_boundary": "pi-read-only-builtins",
+      "os_security_boundary": false,
+      "status": "future-switch-profile"
+    }
   }
 }

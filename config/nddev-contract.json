@@ -9,7 +9,13 @@
   "version_ref": "build/version.json",
   "source_root": "setups",
   "managed_state": {
-    "managed_files": ["agent/settings.json"],
+    "managed_files": [
+      "agent/settings.json",
+      "agent/AGENTS.md",
+      "agent/skills/nddev-builder/SKILL.md",
+      "agent/packages/nddev-builder/package.json",
+      "agent/packages/nddev-builder/skills/nddev-builder/SKILL.md"
+    ],
     "managed_file_mode": "0600",
     "preserve_other_state": true,
     "preserve_unmanaged_config_keys": true,
@@ -22,7 +28,12 @@
     "identity_source": "<setup>/setup.json:id",
     "list_command": "python3 cli-tools/nddev_pi.py list [--json]",
     "selection_option": "--setup <id>",
-    "setup_ids": ["balanced", "full-auto", "safe"],
+    "setup_ids": ["nddev-builder"],
+    "default_setup_id": "nddev-builder",
+    "profiles_root": "profiles",
+    "profile_selection_option": "--profile <id>",
+    "profile_ids": ["full-auto", "safe"],
+    "default_profile_id": "full-auto",
     "status_command": "python3 cli-tools/nddev_pi.py status --target <absolute-dir> [--json]"
   },
   "runtime_compatibility": {
@@ -45,7 +56,7 @@
     "forwards_child_exit_code": true,
     "json_manager_errors_supported": true,
     "manager_command": "python3 cli-tools/nddev_pi.py launch --target <absolute-target> -- [args...]",
-    "provider_secret_inheritance": false,
+    "provider_secret_inheritance": "child-process-allowlist-only",
     "requires_clean_managed_target": true,
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
@@ -57,24 +68,34 @@
     "command": "pi",
     "bin": "dist/cli.js",
     "node_requirement": ">=22.19.0",
-    "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+    "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
     "registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
     "repository": "https://github.com/earendil-works/pi",
     "plan_command": "python3 cli-tools/nddev_pi.py software-plan --target <absolute-dir> [--json]",
     "status_command": "python3 cli-tools/nddev_pi.py software-status --target <absolute-dir> [--json]",
     "install_command": "python3 cli-tools/nddev_pi.py software-install --target <absolute-dir> [--json]",
     "update_command": "python3 cli-tools/nddev_pi.py software-update --target <absolute-dir> [--json]",
-    "install_execution": "bun add --global --exact in isolated target-owned staging, then atomic swap",
+    "install_execution": "npm install --global --ignore-scripts in isolated target-owned staging, then atomic swap",
     "update_execution": "safe partial repair/update through isolated staging and rollback",
     "installer": {
-      "tool": "bun",
-      "argv": ["add", "--global", "--exact", "@earendil-works/pi-coding-agent@0.82.1"],
+      "tool": "npm",
+      "argv": [
+        "install",
+        "--global-style",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--package-lock=false",
+        "--prefix",
+        "<stage>/install",
+        "@earendil-works/pi-coding-agent@0.82.1"
+      ],
       "trust": false,
       "env": {
-        "BUN_INSTALL_GLOBAL_DIR": "<stage>/install/global",
-        "BUN_INSTALL_BIN": "<stage>/bin",
-        "BUN_INSTALL_CACHE_DIR": "<stage>/cache",
         "HOME": "<stage>/home",
+        "npm_config_cache": "<stage>/cache",
+        "npm_config_prefix": "<stage>/install",
+        "npm_config_userconfig": "<stage>/npmrc",
         "XDG_CONFIG_HOME": "<stage>/xdg-config",
         "TMPDIR": "<stage>/tmp"
       }
@@ -103,8 +124,8 @@
       ]
     },
     "entrypoint_materialization": {
-      "bun_source": "<stage>/bin/pi",
-      "required_package_target": "<stage>/install/global/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+      "npm_source": "<stage>/install/bin/pi",
+      "required_package_target": "<stage>/install/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
       "persisted_kind": "private-relative-node-wrapper",
       "persisted_path": ".nddev-pi-software/current/bin/pi",
       "persisted_mode": "0700",
@@ -112,7 +133,7 @@
     },
     "version_identity": {
       "required_package_version": "0.82.1",
-      "package_version_source": ".nddev-pi-software/current/install/global/node_modules/@earendil-works/pi-coding-agent/package.json",
+      "package_version_source": ".nddev-pi-software/current/install/lib/node_modules/@earendil-works/pi-coding-agent/package.json",
       "probe_argv": ["bin/pi", "--version"],
       "expected_probe_output": "0.0.0",
       "package_and_probe_must_both_match": true
@@ -128,7 +149,7 @@
   "builder_projection": {
     "default_on": true,
     "installation": {
-      "install_command": "python3 cli-tools/nddev_pi.py install --setup <id> --target <absolute-target> [--json]",
+      "install_command": "python3 cli-tools/nddev_pi.py install --setup nddev-builder --profile <id> --target <absolute-target> [--json]",
       "native_settings_keys": ["skills", "packages", "enableSkillCommands"],
       "native_package_path": "builder/nddev-builder/package.json",
       "preserved_on_switch_restore": true,
@@ -145,9 +166,8 @@
       "external_marketplace_published": null,
       "status": "unsupported-by-this-manager"
     },
-    "surfaces": ["settings.skills", "package.skills"],
+    "surfaces": ["settings.skills", "settings.packages", "package.pi.skills", "agent.AGENTS.md"],
     "unsupported_surfaces": {
-      "agents": "not documented as a native Pi coding-agent surface",
       "mcp": "available through third-party Pi extensions/packages, not projected by this manager",
       "plugin_marketplace": null
     }

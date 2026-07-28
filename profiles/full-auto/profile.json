@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "full-auto",
+  "description": "Default Pi runtime profile: target-local state, project trust enabled for managed launches, and normal Pi tool availability.",
+  "default": true,
+  "settings": {
+    "defaultProjectTrust": "always",
+    "sessionDir": "sessions"
+  },
+  "launch_args": [
+    "--offline",
+    "--approve"
+  ],
+  "tool_boundary": "normal-pi-tools",
+  "os_security_boundary": false
+}

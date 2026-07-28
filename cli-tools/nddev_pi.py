@@ -23,22 +23,30 @@ from typing import Any, NoReturn
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_ROOT = ROOT / "setups"
+PROFILES_ROOT = ROOT / "profiles"
 VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
 PRODUCT_NAME = "nddev-pi-app"
 PI_COMMAND = "pi"
+DEFAULT_SETUP_ID = "nddev-builder"
+DEFAULT_PROFILE_ID = "full-auto"
 SETTINGS_REL = Path("agent") / "settings.json"
 SETTINGS_NAME = SETTINGS_REL.as_posix()
+AGENTS_REL = Path("agent") / "AGENTS.md"
+AGENTS_NAME = AGENTS_REL.as_posix()
 STAMP_NAME = "NDDEV-PI-SETUP.json"
 BACKUP_NAME = "NDDEV-PI-BACKUP.json"
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 METADATA_MAX_BYTES = 256 * 1024
 MANAGED_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
-SETUP_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+IDENTIFIER_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+SETUP_ID_PATTERN = IDENTIFIER_PATTERN
+PROFILE_ID_PATTERN = IDENTIFIER_PATTERN
 BUILDER_SOURCE_ROOT = ROOT / "builder" / "nddev-builder"
 BUILDER_SKILL_DIR = Path("agent") / "skills" / "nddev-builder"
 BUILDER_PACKAGE_DIR = Path("agent") / "packages" / "nddev-builder"
 BUILDER_FILES = (
+    (BUILDER_SOURCE_ROOT / "AGENTS.md", AGENTS_REL),
     (
         BUILDER_SOURCE_ROOT / "skills" / "nddev-builder" / "SKILL.md",
         BUILDER_SKILL_DIR / "SKILL.md",
@@ -62,6 +70,7 @@ STAMP_KEYS = {
     "product_name",
     "build_version",
     "setup_id",
+    "profile_id",
     "canonical_target",
     "managed_files",
     "builder_projection",
@@ -73,6 +82,7 @@ BACKUP_KEYS = {
     "slot",
     "canonical_target",
     "source_setup_id",
+    "source_profile_id",
     "managed_files",
     "created_at",
     "files",
@@ -83,6 +93,54 @@ CHILD_ENV_ALLOWLIST = {
     "TERM",
     "COLORTERM",
     "SYSTEMROOT",
+}
+PROVIDER_ENV_ALLOWLIST = {
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_OAUTH_TOKEN",
+    "ANT_LING_API_KEY",
+    "AI_GATEWAY_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_API_VERSION",
+    "AZURE_OPENAI_BASE_URL",
+    "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_RESOURCE_NAME",
+    "CEREBRAS_API_KEY",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_API_KEY",
+    "CLOUDFLARE_GATEWAY_ID",
+    "DEEPSEEK_API_KEY",
+    "FIREWORKS_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GROQ_API_KEY",
+    "KIMI_API_KEY",
+    "MINIMAX_API_KEY",
+    "MISTRAL_API_KEY",
+    "MOONSHOT_API_KEY",
+    "NVIDIA_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENROUTER_API_KEY",
+    "QWEN_TOKEN_PLAN_API_KEY",
+    "QWEN_TOKEN_PLAN_CN_API_KEY",
+    "TOGETHER_API_KEY",
+    "XIAOMI_API_KEY",
+    "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+    "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+    "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+    "XAI_API_KEY",
+    "ZAI_API_KEY",
+    "ZAI_CODING_CN_API_KEY",
 }
 SENSITIVE_ENVIRONMENT_SUFFIXES = (
     "_API_KEY",
@@ -103,13 +161,18 @@ PI_CLI_VERSION_OUTPUT = "0.0.0"
 PI_NODE_REQUIREMENT = ">=22.19.0"
 PI_REGISTRY_INTEGRITY = (
     "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
-    "XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
+    "XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
 )
 PI_REGISTRY_SHASUM = "39c00809ff5531b6552b9ecb2c41f4c3529ec988"
-BUN_INSTALL_ARGV = [
-    "add",
-    "--global",
-    "--exact",
+NPM_INSTALL_ARGV = [
+    "install",
+    "--global-style",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--package-lock=false",
+    "--prefix",
+    "<stage>/install",
     f"{PI_PACKAGE_NAME}@{PI_PACKAGE_VERSION}",
 ]
 SOFTWARE_STAMP_NAME = "NDDEV-PI-SOFTWARE.json"
@@ -121,7 +184,7 @@ SOFTWARE_TREE_MAX_BYTES = 192 * 1024 * 1024
 SOFTWARE_TREE_MAX_PATHS = 25000
 PROCESS_OUTPUT_MAX_BYTES = 64 * 1024
 PROCESS_TIMEOUT_SECONDS = 120
-PI_PACKAGE_RELATIVE = "install/global/node_modules/@earendil-works/pi-coding-agent"
+PI_PACKAGE_RELATIVE = "install/lib/node_modules/@earendil-works/pi-coding-agent"
 PI_PACKAGE_BINARY_RELATIVE = f"{PI_PACKAGE_RELATIVE}/{PI_PACKAGE_BIN}"
 SOFTWARE_STAMP_KEYS = {
     "schema_version",
@@ -162,10 +225,10 @@ SOFTWARE_STAMP_PROBE_KEYS = {
 SOFTWARE_STAMP_SCRIPT_KEYS = {"preinstall", "install", "postinstall", "prepublishOnly"}
 SOFTWARE_STAMP_INSTALLER_KEYS = {"tool", "argv", "trust_reason", "env"}
 SOFTWARE_STAMP_INSTALLER_ENV_KEYS = {
-    "BUN_INSTALL_GLOBAL_DIR",
-    "BUN_INSTALL_BIN",
-    "BUN_INSTALL_CACHE_DIR",
     "HOME",
+    "npm_config_cache",
+    "npm_config_prefix",
+    "npm_config_userconfig",
     "XDG_CONFIG_HOME",
     "TMPDIR",
 }
@@ -181,6 +244,7 @@ LAUNCH_BLOCKED_BOOLEAN_FLAGS = {
     "-a": "project trust override",
     "--no-approve": "project trust override",
     "-na": "project trust override",
+    "--no-session": "session persistence override",
     "--no-tools": "tool selection override",
     "-nt": "tool selection override",
     "--no-builtin-tools": "tool selection override",
@@ -196,23 +260,14 @@ LAUNCH_BLOCKED_BOOLEAN_FLAGS = {
     "-nc": "work context override",
 }
 LAUNCH_BLOCKED_VALUE_FLAGS = {
-    "--provider": "model provider override",
-    "--model": "model override",
-    "--api-key": "provider credential override",
-    "--system-prompt": "prompt override",
-    "--append-system-prompt": "prompt override",
-    "--name": "session metadata override",
-    "-n": "session metadata override",
     "--session": "session file override",
     "--session-id": "session identity override",
     "--fork": "session fork override",
     "--session-dir": "session directory override",
-    "--models": "model cycling override",
     "--tools": "tool selection override",
     "-t": "tool selection override",
     "--exclude-tools": "tool selection override",
     "-xt": "tool selection override",
-    "--thinking": "model thinking override",
     "--extension": "extension resource override",
     "-e": "extension resource override",
     "--skill": "skill resource override",
@@ -264,8 +319,13 @@ def is_sensitive_environment_name(name: str) -> bool:
     return upper.endswith(SENSITIVE_ENVIRONMENT_SUFFIXES)
 
 
-def assert_no_sensitive_environment(env: dict[str, str], label: str) -> None:
-    leaked = sorted(name for name in env if is_sensitive_environment_name(name))
+def assert_no_sensitive_environment(
+    env: dict[str, str], label: str, *, allowed_exact: set[str] | None = None
+) -> None:
+    allowed = allowed_exact or set()
+    leaked = sorted(
+        name for name in env if name not in allowed and is_sensitive_environment_name(name)
+    )
     if leaked:
         fail(f"{label} contains sensitive environment variables: {', '.join(leaked)}")
 
@@ -274,7 +334,11 @@ def child_base_environment() -> dict[str, str]:
     return {
         name: value
         for name, value in os.environ.items()
-        if name in CHILD_ENV_ALLOWLIST and not is_sensitive_environment_name(name)
+        if (
+            name in CHILD_ENV_ALLOWLIST
+            and not is_sensitive_environment_name(name)
+        )
+        or name in PROVIDER_ENV_ALLOWLIST
     }
 
 
@@ -459,6 +523,11 @@ def validate_setup_id(setup_id: str) -> None:
         fail(f"invalid setup id: {setup_id!r}")
 
 
+def validate_profile_id(profile_id: str) -> None:
+    if not PROFILE_ID_PATTERN.fullmatch(profile_id):
+        fail(f"invalid profile id: {profile_id!r}")
+
+
 def validate_string_array(value: Any, label: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         fail(f"{label} must be a string array")
@@ -479,20 +548,25 @@ def load_setup(setup_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
             "description",
             "managed_files",
             "builder_projection",
-            "permission_model",
-            "launch_args",
+            "native_surfaces",
         },
         f"setup {setup_id} metadata",
     )
-    if metadata["schema_version"] != 1:
+    if metadata["schema_version"] != 2:
         fail(f"setup {setup_id} metadata has unsupported schema")
     if metadata["id"] != setup_id:
         fail(f"setup {setup_id} metadata identity mismatch")
-    if metadata["managed_files"] != [SETTINGS_NAME]:
+    if metadata["managed_files"] != managed_file_relatives(include_stamp=False):
         fail(f"setup {setup_id} managed file declaration is invalid")
     if metadata["builder_projection"] != "default-on":
         fail(f"setup {setup_id} must enable the builder projection")
-    validate_string_array(metadata["launch_args"], f"setup {setup_id} launch_args")
+    if validate_string_array(metadata["native_surfaces"], f"setup {setup_id} native_surfaces") != [
+        "settings.skills",
+        "settings.packages",
+        "package.pi.skills",
+        "agent.AGENTS.md",
+    ]:
+        fail(f"setup {setup_id} native surface declaration is invalid")
 
     settings = load_json_object(setup_root / "settings.json", f"setup {setup_id}/settings.json")
     if settings.get("nddev", {}).get("setup_id") != setup_id:
@@ -504,6 +578,82 @@ def load_setup(setup_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     if settings.get("enableAnalytics") is not False:
         fail(f"setup {setup_id} must disable analytics")
     return metadata, settings
+
+
+def load_profile(profile_id: str) -> dict[str, Any]:
+    validate_profile_id(profile_id)
+    profile_root = PROFILES_ROOT / profile_id
+    if not profile_root.is_dir() or profile_root.is_symlink():
+        fail(f"unknown profile: {profile_id}")
+    metadata = load_json_object(profile_root / "profile.json", f"profile {profile_id} metadata")
+    require_exact_keys(
+        metadata,
+        {
+            "schema_version",
+            "id",
+            "description",
+            "default",
+            "settings",
+            "launch_args",
+            "tool_boundary",
+            "os_security_boundary",
+        },
+        f"profile {profile_id} metadata",
+    )
+    if metadata["schema_version"] != 1:
+        fail(f"profile {profile_id} metadata has unsupported schema")
+    if metadata["id"] != profile_id:
+        fail(f"profile {profile_id} metadata identity mismatch")
+    if not isinstance(metadata["default"], bool):
+        fail(f"profile {profile_id} default must be boolean")
+    settings = metadata["settings"]
+    if not isinstance(settings, dict):
+        fail(f"profile {profile_id} settings must be an object")
+    allowed_settings = {"defaultProjectTrust", "sessionDir"}
+    unknown = sorted(set(settings) - allowed_settings)
+    if unknown:
+        fail(f"profile {profile_id} has unsupported managed settings: {', '.join(unknown)}")
+    if "defaultProjectTrust" in settings and settings["defaultProjectTrust"] not in {
+        "always",
+        "ask",
+        "never",
+    }:
+        fail(f"profile {profile_id} defaultProjectTrust is invalid")
+    if "sessionDir" in settings and (
+        not isinstance(settings["sessionDir"], str) or settings["sessionDir"].startswith("/")
+    ):
+        fail(f"profile {profile_id} sessionDir must be a relative string")
+    validate_string_array(metadata["launch_args"], f"profile {profile_id} launch_args")
+    if not isinstance(metadata["tool_boundary"], str):
+        fail(f"profile {profile_id} tool_boundary must be a string")
+    if metadata["os_security_boundary"] is not False:
+        fail(f"profile {profile_id} must not claim an OS security boundary")
+    return metadata
+
+
+def list_profiles() -> list[dict[str, Any]]:
+    if not PROFILES_ROOT.is_dir() or PROFILES_ROOT.is_symlink():
+        fail("profile catalog is missing or unsafe")
+    entries: list[dict[str, Any]] = []
+    for candidate in sorted(PROFILES_ROOT.iterdir(), key=lambda path: path.name):
+        if not candidate.is_dir() or candidate.is_symlink():
+            fail(f"profile entry must be a real directory: {candidate.name}")
+        metadata = load_profile(candidate.name)
+        entries.append(
+            {
+                "id": metadata["id"],
+                "description": metadata["description"],
+                "default": metadata["default"],
+                "launch_args": metadata["launch_args"],
+                "tool_boundary": metadata["tool_boundary"],
+            }
+        )
+    if not entries:
+        fail("profile catalog is empty")
+    default_profiles = [entry["id"] for entry in entries if entry["default"]]
+    if default_profiles != [DEFAULT_PROFILE_ID]:
+        fail("profile catalog must declare exactly the full-auto default")
+    return entries
 
 
 def list_setups() -> list[dict[str, Any]]:
@@ -520,7 +670,7 @@ def list_setups() -> list[dict[str, Any]]:
                 "description": metadata["description"],
                 "managed_files": metadata["managed_files"],
                 "builder_default_on": metadata["builder_projection"] == "default-on",
-                "launch_args": metadata["launch_args"],
+                "native_surfaces": metadata["native_surfaces"],
             }
         )
     if not entries:
@@ -648,8 +798,8 @@ def builder_skill_path(target: Path) -> str:
     return str((target / BUILDER_SKILL_DIR).resolve())
 
 
-def builder_package_entry(target: Path) -> dict[str, str]:
-    return {"source": str((target / BUILDER_PACKAGE_DIR).resolve()), "name": "nddev-builder"}
+def builder_package_entry(target: Path) -> str:
+    return str((target / BUILDER_PACKAGE_DIR).resolve())
 
 
 def dedupe_json_list(values: list[Any]) -> list[Any]:
@@ -664,7 +814,10 @@ def dedupe_json_list(values: list[Any]) -> list[Any]:
 
 
 def merge_settings(
-    existing: dict[str, Any] | None, setup_settings: dict[str, Any], target: Path
+    existing: dict[str, Any] | None,
+    setup_settings: dict[str, Any],
+    profile: dict[str, Any],
+    target: Path,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     if existing is not None:
@@ -673,7 +826,22 @@ def merge_settings(
                 result[key] = value
 
     for key in MANAGED_SETTING_KEYS:
-        result[key] = setup_settings[key]
+        if key in setup_settings:
+            result[key] = setup_settings[key]
+    profile_settings = profile["settings"]
+    if not isinstance(profile_settings, dict):
+        fail("profile settings must be an object")
+    for key, value in profile_settings.items():
+        result[key] = value
+    result["nddev"] = {
+        "schema_version": 2,
+        "setup_id": setup_settings["nddev"]["setup_id"],
+        "profile_id": profile["id"],
+        "builder_projection": "skills+package",
+        "launch_args": profile["launch_args"],
+        "tool_boundary": profile["tool_boundary"],
+        "os_security_boundary": False,
+    }
 
     existing_skills = []
     if existing is not None and "skills" in existing:
@@ -731,10 +899,11 @@ def builder_projection_files() -> dict[str, bytes]:
 
 
 def render_setup(
-    setup_id: str, target: Path, existing: dict[str, Any] | None
+    setup_id: str, profile_id: str, target: Path, existing: dict[str, Any] | None
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
     metadata, settings = load_setup(setup_id)
-    merged_settings = merge_settings(existing, settings, target)
+    profile = load_profile(profile_id)
+    merged_settings = merge_settings(existing, settings, profile, target)
     files: dict[str, bytes] = {SETTINGS_NAME: canonical_json(merged_settings)}
     files.update(builder_projection_files())
     return metadata, files
@@ -755,6 +924,7 @@ def compute_managed_digests(target: Path, settings: dict[str, Any] | None) -> di
             canonical_json(managed_settings_view(settings, target))
         )
     for relative in (
+        AGENTS_REL,
         BUILDER_SKILL_DIR / "SKILL.md",
         BUILDER_PACKAGE_DIR / "package.json",
         BUILDER_PACKAGE_DIR / "skills" / "nddev-builder" / "SKILL.md",
@@ -765,13 +935,16 @@ def compute_managed_digests(target: Path, settings: dict[str, Any] | None) -> di
     return digests
 
 
-def make_stamp(target: Path, setup_id: str, final_settings: dict[str, Any]) -> dict[str, Any]:
+def make_stamp(
+    target: Path, setup_id: str, profile_id: str, final_settings: dict[str, Any]
+) -> dict[str, Any]:
     managed_files = compute_managed_digests(target, final_settings)
     return {
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "canonical_target": str(target),
         "managed_files": managed_files,
         "builder_projection": "skills+package",
@@ -780,14 +953,29 @@ def make_stamp(target: Path, setup_id: str, final_settings: dict[str, Any]) -> d
 
 def status_for_target(target: Path) -> dict[str, Any]:
     if not target.exists():
-        return {"state": "missing", "setup_id": None, "drift": [], "target": str(target)}
+        return {
+            "state": "missing",
+            "setup_id": None,
+            "profile_id": None,
+            "drift": [],
+            "target": str(target),
+        }
     stamp = load_stamp(target)
     if stamp is None:
-        return {"state": "unmanaged", "setup_id": None, "drift": [], "target": str(target)}
+        return {
+            "state": "unmanaged",
+            "setup_id": None,
+            "profile_id": None,
+            "drift": [],
+            "target": str(target),
+        }
     require_exact_keys(stamp, STAMP_KEYS, STAMP_NAME)
     setup_id = stamp.get("setup_id")
     if not isinstance(setup_id, str):
         fail("stamp setup_id must be a string")
+    profile_id = stamp.get("profile_id")
+    if not isinstance(profile_id, str):
+        fail("stamp profile_id must be a string")
     drift: list[str] = []
     if stamp.get("canonical_target") != str(target):
         drift.append(STAMP_NAME)
@@ -802,6 +990,7 @@ def status_for_target(target: Path) -> dict[str, Any]:
     return {
         "state": "managed",
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "drift": sorted(set(drift)),
         "target": str(target),
         "builder_projection": stamp.get("builder_projection"),
@@ -835,14 +1024,17 @@ def restore_snapshot(target: Path, snapshot: dict[str, str | None]) -> None:
             safe_write_file(path, base64.b64decode(encoded.encode("ascii")))
 
 
-def managed_file_relatives() -> list[str]:
-    return [
+def managed_file_relatives(*, include_stamp: bool = True) -> list[str]:
+    relatives = [
         SETTINGS_NAME,
-        STAMP_NAME,
+        AGENTS_NAME,
         (BUILDER_SKILL_DIR / "SKILL.md").as_posix(),
         (BUILDER_PACKAGE_DIR / "package.json").as_posix(),
         (BUILDER_PACKAGE_DIR / "skills" / "nddev-builder" / "SKILL.md").as_posix(),
     ]
+    if include_stamp:
+        return [*relatives, STAMP_NAME]
+    return relatives
 
 
 def next_backup_slot(pool: Path) -> int:
@@ -861,7 +1053,7 @@ def next_backup_slot(pool: Path) -> int:
     )
 
 
-def create_backup(target: Path, source_setup_id: str | None) -> int:
+def create_backup(target: Path, source_setup_id: str | None, source_profile_id: str | None) -> int:
     pool = backup_pool(target)
     slot = next_backup_slot(pool)
     slot_dir = pool / str(slot)
@@ -876,6 +1068,7 @@ def create_backup(target: Path, source_setup_id: str | None) -> int:
         "slot": slot,
         "canonical_target": str(target),
         "source_setup_id": source_setup_id,
+        "source_profile_id": source_profile_id,
         "managed_files": [relative for relative, encoded in files.items() if encoded is not None],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "files": files,
@@ -900,7 +1093,9 @@ def load_backup(target: Path, slot: int) -> dict[str, Any]:
     return envelope
 
 
-def write_rendered_files(target: Path, setup_id: str, files: dict[str, bytes]) -> list[str]:
+def write_rendered_files(
+    target: Path, setup_id: str, profile_id: str, files: dict[str, bytes]
+) -> list[str]:
     previous = snapshot_files(target, managed_file_relatives())
     changed: list[str] = []
     try:
@@ -911,7 +1106,7 @@ def write_rendered_files(target: Path, setup_id: str, files: dict[str, bytes]) -
                 changed.append(relative)
             safe_write_file(target / relative, content)
         final_settings = parse_json_object(files[SETTINGS_NAME], SETTINGS_NAME)
-        stamp = make_stamp(target, setup_id, final_settings)
+        stamp = make_stamp(target, setup_id, profile_id, final_settings)
         stamp_content = canonical_json(stamp)
         before_stamp = previous.get(STAMP_NAME)
         after_stamp = base64.b64encode(stamp_content).decode("ascii")
@@ -924,14 +1119,14 @@ def write_rendered_files(target: Path, setup_id: str, files: dict[str, bytes]) -
     return changed
 
 
-def command_plan(target: Path, setup_id: str) -> dict[str, Any]:
+def command_plan(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     status = status_for_target(target)
     operation = "install"
     backup_required = False
     if status["state"] == "managed":
         if status["drift"]:
             operation = "blocked"
-        elif status["setup_id"] == setup_id:
+        elif status["setup_id"] == setup_id and status["profile_id"] == profile_id:
             operation = "update"
         else:
             operation = "switch"
@@ -939,6 +1134,7 @@ def command_plan(target: Path, setup_id: str) -> dict[str, Any]:
     return {
         "operation": operation,
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "target": str(target),
         "mutates": False,
         "backup_required": backup_required,
@@ -947,21 +1143,24 @@ def command_plan(target: Path, setup_id: str) -> dict[str, Any]:
     }
 
 
-def command_install(target: Path, setup_id: str) -> dict[str, Any]:
+def command_install(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     with target_lock(target):
         ensure_target_directory(target)
         status = status_for_target(target)
         if status["state"] == "managed" and status["drift"]:
             fail(f"target has drift: {', '.join(status['drift'])}")
         backup_slot = None
-        if status["state"] == "managed" and status["setup_id"] != setup_id:
-            backup_slot = create_backup(target, status["setup_id"])
+        if status["state"] == "managed" and (
+            status["setup_id"] != setup_id or status["profile_id"] != profile_id
+        ):
+            backup_slot = create_backup(target, status["setup_id"], status["profile_id"])
         existing = read_current_settings(target)
-        _, files = render_setup(setup_id, target, existing)
-        changed = write_rendered_files(target, setup_id, files)
+        _, files = render_setup(setup_id, profile_id, target, existing)
+        changed = write_rendered_files(target, setup_id, profile_id, files)
     return {
         "operation": "install",
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "target": str(target),
         "changed": changed,
         "backup_slot": backup_slot,
@@ -969,17 +1168,18 @@ def command_install(target: Path, setup_id: str) -> dict[str, Any]:
     }
 
 
-def command_switch(target: Path, setup_id: str) -> dict[str, Any]:
+def command_switch(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     with target_lock(target):
         ensure_target_directory(target)
         status = require_clean_managed(target)
-        backup_slot = create_backup(target, status["setup_id"])
+        backup_slot = create_backup(target, status["setup_id"], status["profile_id"])
         existing = read_current_settings(target)
-        _, files = render_setup(setup_id, target, existing)
-        changed = write_rendered_files(target, setup_id, files)
+        _, files = render_setup(setup_id, profile_id, target, existing)
+        changed = write_rendered_files(target, setup_id, profile_id, files)
     return {
         "operation": "switch",
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "target": str(target),
         "changed": changed,
         "backup_slot": backup_slot,
@@ -991,7 +1191,7 @@ def command_restore(target: Path, slot: int) -> dict[str, Any]:
     with target_lock(target):
         ensure_target_directory(target)
         status = require_clean_managed(target)
-        create_backup(target, status["setup_id"])
+        create_backup(target, status["setup_id"], status["profile_id"])
         envelope = load_backup(target, slot)
         previous = snapshot_files(target, managed_file_relatives())
         try:
@@ -1008,9 +1208,13 @@ def command_restore(target: Path, slot: int) -> dict[str, Any]:
         restored_setup_id = envelope.get("source_setup_id")
         if not isinstance(restored_setup_id, str):
             fail("backup source setup id is missing")
+        restored_profile_id = envelope.get("source_profile_id")
+        if not isinstance(restored_profile_id, str):
+            fail("backup source profile id is missing")
     return {
         "operation": "restore",
         "setup_id": restored_setup_id,
+        "profile_id": restored_profile_id,
         "target": str(target),
         "backup_slot": slot,
         "builder_projection": "skills+package",
@@ -1021,7 +1225,7 @@ def command_remove(target: Path) -> dict[str, Any]:
     with target_lock(target):
         ensure_target_directory(target)
         status = require_clean_managed(target)
-        create_backup(target, status["setup_id"])
+        create_backup(target, status["setup_id"], status["profile_id"])
         settings = read_current_settings(target)
         previous = snapshot_files(target, managed_file_relatives())
         try:
@@ -1032,6 +1236,7 @@ def command_remove(target: Path) -> dict[str, Any]:
                 else:
                     delete_file(target / SETTINGS_REL)
             delete_file(target / STAMP_NAME)
+            delete_file(target / AGENTS_REL)
             delete_tree(target / BUILDER_SKILL_DIR)
             delete_tree(target / BUILDER_PACKAGE_DIR)
         except BaseException:
@@ -1040,6 +1245,7 @@ def command_remove(target: Path) -> dict[str, Any]:
     return {
         "operation": "remove",
         "removed_setup_id": status["setup_id"],
+        "removed_profile_id": status["profile_id"],
         "target": str(target),
         "builder_projection": "removed",
     }
@@ -1244,7 +1450,7 @@ def materialize_staged_entrypoint(
     allowed_roots: tuple[Path, ...],
     node_runtime: dict[str, str],
 ) -> None:
-    source_root = stage_workspace / "bin"
+    source_root = stage_workspace / "install" / "bin"
     require_directory(source_root, "staged bin tree")
     paths = sorted(
         source_root.rglob("*"),
@@ -1284,14 +1490,12 @@ def materialize_persisted_install(
     node_runtime: dict[str, str],
 ) -> None:
     allowed_roots = (
-        (stage_workspace / "install" / "global").resolve(strict=False),
-        (stage_workspace / "bin").resolve(strict=False),
+        (stage_workspace / "install").resolve(strict=False),
     )
     stage_current.mkdir(mode=OWNER_DIRECTORY_MODE)
-    (stage_current / "install").mkdir(mode=OWNER_DIRECTORY_MODE)
     copy_tree_sanitized(
-        stage_workspace / "install" / "global",
-        stage_current / "install" / "global",
+        stage_workspace / "install",
+        stage_current / "install",
         allowed_roots,
     )
     materialize_staged_entrypoint(
@@ -1302,30 +1506,35 @@ def materialize_persisted_install(
     )
 
 
-def safe_bun_env(stage_workspace: Path) -> dict[str, str]:
+def safe_npm_env(stage_workspace: Path) -> dict[str, str]:
     home = stage_workspace / "home"
     xdg_config = stage_workspace / "xdg-config"
     cache = stage_workspace / "cache"
     tmp = stage_workspace / "tmp"
+    userconfig = stage_workspace / "npmrc"
     for directory in (
         home,
         xdg_config,
         cache,
         tmp,
-        stage_workspace / "install" / "global",
-        stage_workspace / "bin",
+        stage_workspace / "install",
     ):
         directory.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
+    safe_write_file(userconfig, b"audit=false\nfund=false\nignore-scripts=true\n")
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(xdg_config),
         "TMPDIR": str(tmp),
-        "BUN_INSTALL_GLOBAL_DIR": str(stage_workspace / "install" / "global"),
-        "BUN_INSTALL_BIN": str(stage_workspace / "bin"),
-        "BUN_INSTALL_CACHE_DIR": str(cache),
+        "npm_config_cache": str(cache),
+        "npm_config_prefix": str(stage_workspace / "install"),
+        "npm_config_userconfig": str(userconfig),
     }
-    assert_no_sensitive_environment(env, "bun installer environment")
+    assert_no_sensitive_environment(
+        env,
+        "npm installer environment",
+        allowed_exact={"npm_config_cache", "npm_config_prefix", "npm_config_userconfig"},
+    )
     return env
 
 
@@ -1340,9 +1549,16 @@ def read_process_output(handle: Any, label: str) -> str:
     return text
 
 
-def run_bun_install(stage_workspace: Path) -> None:
-    command = ["bun", *BUN_INSTALL_ARGV]
-    env = safe_bun_env(stage_workspace)
+def npm_install_argv(stage_workspace: Path) -> list[str]:
+    return [
+        value.replace("<stage>/install", str(stage_workspace / "install"))
+        for value in NPM_INSTALL_ARGV
+    ]
+
+
+def run_npm_install(stage_workspace: Path) -> None:
+    command = ["npm", *npm_install_argv(stage_workspace)]
+    env = safe_npm_env(stage_workspace)
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
             completed = subprocess.run(
@@ -1355,14 +1571,14 @@ def run_bun_install(stage_workspace: Path) -> None:
                 timeout=PROCESS_TIMEOUT_SECONDS,
             )
         except FileNotFoundError:
-            fail("bun command was not found on PATH")
+            fail("npm command was not found on PATH")
         except subprocess.TimeoutExpired:
-            fail("bun install timed out")
+            fail("npm install timed out")
         if completed.returncode != 0:
             detail = (
                 read_process_output(stderr, "stderr") or read_process_output(stdout, "stdout")
             ).strip()
-            fail(f"bun install failed with exit code {completed.returncode}: {detail}")
+            fail(f"npm install failed with exit code {completed.returncode}: {detail}")
 
 
 def parse_node_version(raw: str) -> tuple[int, int, int]:
@@ -1583,14 +1799,14 @@ def software_stamp(
             "prepublishOnly": prepublish_only,
         },
         "installer": {
-            "tool": "bun",
-            "argv": BUN_INSTALL_ARGV,
+            "tool": "npm",
+            "argv": NPM_INSTALL_ARGV,
             "trust_reason": None,
             "env": {
-                "BUN_INSTALL_GLOBAL_DIR": "<stage>/install/global",
-                "BUN_INSTALL_BIN": "<stage>/bin",
-                "BUN_INSTALL_CACHE_DIR": "<stage>/cache",
                 "HOME": "<stage>/home",
+                "npm_config_cache": "<stage>/cache",
+                "npm_config_prefix": "<stage>/install",
+                "npm_config_userconfig": "<stage>/npmrc",
                 "XDG_CONFIG_HOME": "<stage>/xdg-config",
                 "TMPDIR": "<stage>/tmp",
             },
@@ -1643,10 +1859,10 @@ def read_software_stamp(target: Path) -> dict[str, Any] | None:
 
 def expected_installer_env() -> dict[str, str]:
     return {
-        "BUN_INSTALL_GLOBAL_DIR": "<stage>/install/global",
-        "BUN_INSTALL_BIN": "<stage>/bin",
-        "BUN_INSTALL_CACHE_DIR": "<stage>/cache",
         "HOME": "<stage>/home",
+        "npm_config_cache": "<stage>/cache",
+        "npm_config_prefix": "<stage>/install",
+        "npm_config_userconfig": "<stage>/npmrc",
         "XDG_CONFIG_HOME": "<stage>/xdg-config",
         "TMPDIR": "<stage>/tmp",
     }
@@ -1795,8 +2011,8 @@ def software_status_payload(target: Path) -> dict[str, Any]:
         installer = stamp.get("installer")
         if (
             not isinstance(installer, dict)
-            or installer.get("tool") != "bun"
-            or installer.get("argv") != BUN_INSTALL_ARGV
+            or installer.get("tool") != "npm"
+            or installer.get("argv") != NPM_INSTALL_ARGV
             or installer.get("env") != expected_installer_env()
             or installer.get("trust_reason") is not None
         ):
@@ -1965,7 +2181,7 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                 node_runtime = resolve_node_runtime(stage_root)
                 stage_install = stage_root / "install-output"
                 stage_current = stage_root / SOFTWARE_CURRENT_NAME
-                run_bun_install(stage_install)
+                run_npm_install(stage_install)
                 manifest = load_package_manifest(stage_install)
                 prepublish_only = manifest.get("scripts", {}).get("prepublishOnly")
                 materialize_persisted_install(
@@ -2156,7 +2372,9 @@ def build_child_env(target: Path, node_runtime: dict[str, str]) -> dict[str, str
             "PI_TELEMETRY": "0",
         }
     )
-    assert_no_sensitive_environment(child_env, "Pi child environment")
+    assert_no_sensitive_environment(
+        child_env, "Pi child environment", allowed_exact=PROVIDER_ENV_ALLOWLIST
+    )
     return child_env
 
 
@@ -2252,6 +2470,7 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--json", action="store_true")
         if command in {"plan", "install", "switch"}:
             command_parser.add_argument("--setup")
+            command_parser.add_argument("--profile")
         if command == "restore":
             command_parser.add_argument("--backup", type=int)
 
@@ -2270,10 +2489,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def require_setup_argument(setup_id: str | None) -> str:
     if not setup_id:
-        fail("--setup is required")
+        setup_id = DEFAULT_SETUP_ID
     validate_setup_id(setup_id)
     load_setup(setup_id)
     return setup_id
+
+
+def require_profile_argument(profile_id: str | None) -> str:
+    if not profile_id:
+        profile_id = DEFAULT_PROFILE_ID
+    validate_profile_id(profile_id)
+    load_profile(profile_id)
+    return profile_id
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2282,26 +2509,38 @@ def main(argv: list[str] | None = None) -> int:
     json_enabled = bool(getattr(args, "json", False))
     try:
         if args.command == "list":
-            emit({"setups": list_setups()}, json_enabled)
+            emit({"setups": list_setups(), "profiles": list_profiles()}, json_enabled)
             return 0
         if args.command == "status":
             emit(status_for_target(resolve_target(args.target)), json_enabled)
             return 0
         if args.command == "plan":
             emit(
-                command_plan(resolve_target(args.target), require_setup_argument(args.setup)),
+                command_plan(
+                    resolve_target(args.target),
+                    require_setup_argument(args.setup),
+                    require_profile_argument(args.profile),
+                ),
                 json_enabled,
             )
             return 0
         if args.command == "install":
             emit(
-                command_install(resolve_target(args.target), require_setup_argument(args.setup)),
+                command_install(
+                    resolve_target(args.target),
+                    require_setup_argument(args.setup),
+                    require_profile_argument(args.profile),
+                ),
                 json_enabled,
             )
             return 0
         if args.command == "switch":
             emit(
-                command_switch(resolve_target(args.target), require_setup_argument(args.setup)),
+                command_switch(
+                    resolve_target(args.target),
+                    require_setup_argument(args.setup),
+                    require_profile_argument(args.profile),
+                ),
                 json_enabled,
             )
             return 0

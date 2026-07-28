@@ -1,9 +1,0 @@
-{
-  "schema_version": 1,
-  "id": "full-auto",
-  "description": "Full-auto Pi profile: isolated runtime, offline startup, and per-run project approval without inheriting provider credentials.",
-  "managed_files": ["agent/settings.json"],
-  "builder_projection": "default-on",
-  "permission_model": "project-trust-override-only",
-  "launch_args": ["--offline", "--approve"]
-}
