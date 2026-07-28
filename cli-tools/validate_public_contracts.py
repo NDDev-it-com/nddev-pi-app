@@ -382,6 +382,93 @@ def validate_external_anchor_behavior(errors: list[str]) -> None:
         sys.modules.pop(name, None)
 
 
+def validate_cleanup_metadata_behavior(errors: list[str]) -> None:
+    manager = ROOT / "cli-tools" / "nddev_pi.py"
+    name = "nddev_pi_public_validator_cleanup_metadata"
+    try:
+        spec = importlib.util.spec_from_file_location(name, manager)
+        if spec is None or spec.loader is None:
+            errors.append("cli-tools/nddev_pi.py: cannot load manager module spec")
+            return
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-cleanup-metadata.") as tmp:
+            root = Path(tmp) / "tree"
+            child_dir = root / "child"
+            child_file = child_dir / "payload.txt"
+            child_dir.mkdir(parents=True, mode=module.OWNER_DIRECTORY_MODE)
+            child_file.write_text("payload", encoding="utf-8")
+            child_file.chmod(module.OWNER_FILE_MODE)
+            snapshot = module.snapshot_cleanup_tree(root, "metadata smoke tree")
+            os.utime(child_dir, ns=(1660000000000000000, 1660000000000000000))
+            tampered = (
+                child_dir.lstat().st_ino,
+                child_dir.lstat().st_mtime_ns,
+                child_file.read_text(encoding="utf-8"),
+            )
+            try:
+                module.validate_cleanup_tree(root, snapshot, "metadata smoke tree")
+            except module.PiSetupError as exc:
+                if "identity mismatch" not in str(exc):
+                    errors.append(f"cli-tools/nddev_pi.py: unexpected metadata tamper error: {exc}")
+                    return
+            else:
+                errors.append("cli-tools/nddev_pi.py: directory metadata tamper was accepted")
+                return
+            after_tamper = (
+                child_dir.lstat().st_ino,
+                child_dir.lstat().st_mtime_ns,
+                child_file.read_text(encoding="utf-8"),
+            )
+            if after_tamper != tampered:
+                errors.append("cli-tools/nddev_pi.py: metadata tamper validation mutated state")
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-cleanup-parent.") as tmp:
+            parent = Path(tmp) / "parent"
+            parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            os.utime(parent, ns=(1550000000000000000, 1550000000000000000))
+            before = module.directory_metadata(parent, "metadata smoke parent")
+            parent.chmod(0o755)
+            os.utime(parent, ns=(1560000000000000000, 1560000000000000000))
+            module.restore_directory_metadata(parent, before, "metadata smoke parent")
+            after = module.directory_metadata(parent, "metadata smoke parent")
+            if after != before:
+                errors.append("cli-tools/nddev_pi.py: parent metadata restore did not restore exact state")
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-cleanup-failure.") as tmp:
+            parent = Path(tmp) / "cleanup"
+            parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            os.utime(parent, ns=(1440000000000000000, 1440000000000000000))
+            before = module.directory_metadata(parent, "metadata smoke cleanup parent")
+
+            def fail_after_temp_fsync(label: str) -> None:
+                if label == "cleanup.journal.temp.fsync":
+                    raise module.PiSetupError("injected cleanup publication failure")
+
+            module.lifecycle_hook = fail_after_temp_fsync
+            try:
+                module.publish_json_no_replace(
+                    parent / "pending.json",
+                    {"schema_version": 1, "kind": "metadata-smoke"},
+                    "journal",
+                )
+            except module.PiSetupError as exc:
+                if "injected cleanup publication failure" not in str(exc):
+                    errors.append(f"cli-tools/nddev_pi.py: unexpected cleanup failure error: {exc}")
+                    return
+            else:
+                errors.append("cli-tools/nddev_pi.py: injected cleanup publication failure succeeded")
+                return
+            if list(parent.iterdir()):
+                errors.append("cli-tools/nddev_pi.py: cleanup publication failure left residue")
+            after = module.directory_metadata(parent, "metadata smoke cleanup parent")
+            if after != before:
+                errors.append("cli-tools/nddev_pi.py: cleanup publication failure changed parent metadata")
+    except Exception as exc:  # pragma: no cover - validator reports instead of crashing
+        errors.append(f"cli-tools/nddev_pi.py: cleanup metadata behavior check failed: {exc}")
+    finally:
+        sys.modules.pop(name, None)
+
+
 def main() -> int:
     errors: list[str] = []
     version = load_json("build/version.json", errors)
@@ -394,6 +481,7 @@ def main() -> int:
     validate_software_rollback_identity(errors)
     validate_external_anchor_recovery(errors)
     validate_external_anchor_behavior(errors)
+    validate_cleanup_metadata_behavior(errors)
 
     version_text = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if version is not None:

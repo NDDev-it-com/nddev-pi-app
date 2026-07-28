@@ -846,6 +846,10 @@ def open_directory_for_sync(path: Path, label: str) -> int:
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -915,7 +919,12 @@ def require_product_lock_root(*, create: bool) -> Path | None:
             except OSError:
                 pass
             if removed_root:
-                restore_directory_metadata(system_root, system_root_metadata, "system temp root")
+                restore_directory_metadata(
+                    system_root,
+                    system_root_metadata,
+                    "system temp root",
+                    require_nlink=False,
+                )
                 fsync_directory(system_root, "system temp root")
             raise
         info = require_directory(root, "product lock root")
@@ -1232,7 +1241,12 @@ def recover_anchor_publication_alias(path: Path, descriptor: int, expected: dict
                 stage.unlink()
                 lifecycle_hook(f"lock.{expected['kind']}.stage.unlink")
         fsync_directory(path.parent, "external lock parent")
-        restore_directory_metadata(path.parent, parent_metadata, "external lock parent")
+        restore_directory_metadata(
+            path.parent,
+            parent_metadata,
+            "external lock parent",
+            require_nlink=False,
+        )
         fsync_directory(path.parent, "external lock parent")
     except OSError as exc:
         fail(f"cannot recover external lock publication stage: {exc}")
@@ -1336,6 +1350,7 @@ def publish_anchor_no_replace(parent: Path, final: Path, binding: dict[str, Any]
                 if final_visible or parent_metadata_after_final is not None
                 else parent_metadata_before_temp,
                 "external lock parent",
+                require_nlink=False,
             )
             fsync_directory(parent, "external lock parent")
 
@@ -1421,7 +1436,10 @@ def acquire_product_coordination(
                     fsync_directory(bootstrap_system_temp_root(), "system temp root")
                 if removed_root and system_root_metadata is not None:
                     restore_directory_metadata(
-                        bootstrap_system_temp_root(), system_root_metadata, "system temp root"
+                        bootstrap_system_temp_root(),
+                        system_root_metadata,
+                        "system temp root",
+                        require_nlink=False,
                     )
                     fsync_directory(bootstrap_system_temp_root(), "system temp root")
         raise
@@ -1664,24 +1682,48 @@ def directory_metadata(path: Path, label: str) -> dict[str, Any] | None:
     return {
         "mode": stat.S_IMODE(info.st_mode),
         "uid": info.st_uid,
+        "gid": info.st_gid,
         "dev": info.st_dev,
         "ino": info.st_ino,
+        "nlink": info.st_nlink,
         "atime_ns": info.st_atime_ns,
         "mtime_ns": info.st_mtime_ns,
     }
 
 
-def restore_directory_metadata(path: Path, expected: dict[str, Any] | None, label: str) -> None:
+def restore_directory_metadata(
+    path: Path,
+    expected: dict[str, Any] | None,
+    label: str,
+    *,
+    require_nlink: bool = True,
+) -> None:
     if expected is None:
         with contextlib.suppress(OSError):
             path.rmdir()
         return
-    info = require_directory(path, label)
-    if info.st_dev != expected["dev"] or info.st_ino != expected["ino"]:
-        fail(f"{label} identity changed")
-    if stat.S_IMODE(info.st_mode) != expected["mode"]:
-        os.chmod(path, expected["mode"])
-    os.utime(path, ns=(expected["atime_ns"], expected["mtime_ns"]), follow_symlinks=False)
+    descriptor = open_directory_for_sync(path, label)
+    try:
+        info = os.fstat(descriptor)
+        checks = {
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+        }
+        if require_nlink:
+            checks["nlink"] = info.st_nlink
+        for key, value in checks.items():
+            if expected.get(key) != value:
+                fail(f"{label} identity changed")
+        if stat.S_IMODE(info.st_mode) != expected["mode"]:
+            os.fchmod(descriptor, expected["mode"])
+        if os.utime in os.supports_fd:
+            os.utime(descriptor, ns=(expected["atime_ns"], expected["mtime_ns"]))
+        else:
+            os.utime(path, ns=(expected["atime_ns"], expected["mtime_ns"]), follow_symlinks=False)
+    finally:
+        os.close(descriptor)
 
 
 def managed_parent_relatives(relatives: list[str]) -> list[Path]:
@@ -1894,6 +1936,7 @@ def snapshot_cleanup_tree(path: Path, label: str) -> dict[str, Any]:
         record: dict[str, Any] = {
             "relative": relative,
             "uid": info.st_uid,
+            "gid": info.st_gid,
             "mode": mode,
             "nlink": info.st_nlink,
             "dev": info.st_dev,
@@ -1942,6 +1985,38 @@ def cleanup_snapshot_records(expected: dict[str, Any], label: str) -> dict[str, 
             bounded_relative(relative, f"{label} snapshot relative path")
         if relative in records:
             fail(f"{label} snapshot contains duplicate object")
+        kind = item.get("kind")
+        if kind == "directory":
+            expected_keys = {
+                "relative",
+                "uid",
+                "gid",
+                "mode",
+                "nlink",
+                "dev",
+                "ino",
+                "size",
+                "mtime_ns",
+                "kind",
+            }
+        elif kind == "file":
+            expected_keys = {
+                "relative",
+                "uid",
+                "gid",
+                "mode",
+                "nlink",
+                "dev",
+                "ino",
+                "size",
+                "mtime_ns",
+                "kind",
+                "sha256",
+            }
+        else:
+            fail(f"{label} snapshot object kind is invalid")
+        if set(item) != expected_keys:
+            fail(f"{label} snapshot object schema is invalid")
         records[relative] = item
     if expected.get("object_count") != len(records):
         fail(f"{label} snapshot object count mismatch")
@@ -1950,7 +2025,13 @@ def cleanup_snapshot_records(expected: dict[str, Any], label: str) -> dict[str, 
     return records
 
 
-def validate_cleanup_object(path: Path, expected: dict[str, Any], label: str) -> None:
+def validate_cleanup_object(
+    path: Path,
+    expected: dict[str, Any],
+    label: str,
+    *,
+    exact_directory_metadata: bool = True,
+) -> None:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode):
         fail(f"{label} must not be a symlink")
@@ -1959,10 +2040,19 @@ def validate_cleanup_object(path: Path, expected: dict[str, Any], label: str) ->
             fail(f"{label} kind mismatch")
         checks = {
             "uid": info.st_uid,
+            "gid": info.st_gid,
             "mode": stat.S_IMODE(info.st_mode),
             "dev": info.st_dev,
             "ino": info.st_ino,
         }
+        if exact_directory_metadata:
+            checks.update(
+                {
+                    "nlink": info.st_nlink,
+                    "size": info.st_size,
+                    "mtime_ns": info.st_mtime_ns,
+                }
+            )
         for key, value in checks.items():
             if expected.get(key) != value:
                 fail(f"{label} identity mismatch")
@@ -1973,6 +2063,7 @@ def validate_cleanup_object(path: Path, expected: dict[str, Any], label: str) ->
         content = read_regular_file(path, label, max_bytes=SOFTWARE_FILE_MAX_BYTES)
         checks = {
             "uid": info.st_uid,
+            "gid": info.st_gid,
             "mode": stat.S_IMODE(info.st_mode),
             "nlink": info.st_nlink,
             "dev": info.st_dev,
@@ -1990,7 +2081,7 @@ def validate_cleanup_object(path: Path, expected: dict[str, Any], label: str) ->
 
 def validate_cleanup_tree_partial(path: Path, expected: dict[str, Any], label: str) -> None:
     records = cleanup_snapshot_records(expected, label)
-    if not path.exists():
+    if stat_optional(path, label) is None:
         return
     root_info = path.lstat()
     if stat.S_ISDIR(root_info.st_mode):
@@ -2000,11 +2091,67 @@ def validate_cleanup_tree_partial(path: Path, expected: dict[str, Any], label: s
         ]
     else:
         actual_paths = [path]
+    actual_relatives = {"." if item == path else item.relative_to(path).as_posix() for item in actual_paths}
     for item in actual_paths:
         relative = "." if item == path else item.relative_to(path).as_posix()
         if relative not in records:
             fail(f"{label} contains an unknown object: {relative}")
-        validate_cleanup_object(item, records[relative], f"{label}:{relative}")
+        record = records[relative]
+        if record.get("kind") == "directory":
+            expected_descendants = cleanup_descendant_relatives(records, relative)
+            actual_descendants = cleanup_descendant_relatives(
+                {candidate: records[candidate] for candidate in actual_relatives if candidate in records},
+                relative,
+            )
+            exact_directory = expected_descendants == actual_descendants
+            validate_cleanup_object(
+                item,
+                record,
+                f"{label}:{relative}",
+                exact_directory_metadata=exact_directory,
+            )
+            if not exact_directory:
+                actual_children = cleanup_actual_child_names(item, f"{label}:{relative}")
+                expected_children = cleanup_direct_child_names(records, relative) & {
+                    Path(candidate).name
+                    for candidate in actual_relatives
+                    if cleanup_parent_relative(candidate) == relative
+                }
+                if actual_children != expected_children:
+                    fail(f"{label}:{relative} child set mismatch")
+            continue
+        validate_cleanup_object(item, record, f"{label}:{relative}")
+
+
+def cleanup_parent_relative(relative: str) -> str:
+    if relative == ".":
+        return ""
+    parent = Path(relative).parent.as_posix()
+    return "." if parent == "." else parent
+
+
+def cleanup_direct_child_names(records: dict[str, dict[str, Any]], relative: str) -> set[str]:
+    return {
+        Path(candidate).name
+        for candidate in records
+        if cleanup_parent_relative(candidate) == relative
+    }
+
+
+def cleanup_descendant_relatives(
+    records: dict[str, dict[str, Any]], relative: str
+) -> set[str]:
+    if relative == ".":
+        return set(records)
+    prefix = f"{relative}/"
+    return {candidate for candidate in records if candidate == relative or candidate.startswith(prefix)}
+
+
+def cleanup_actual_child_names(path: Path, label: str) -> set[str]:
+    try:
+        return {child.name for child in path.iterdir()}
+    except OSError as exc:
+        fail(f"cannot inspect {label} children: {exc}")
 
 
 def cleanup_parent_identity(path: Path, label: str) -> dict[str, Any]:
@@ -2013,15 +2160,28 @@ def cleanup_parent_identity(path: Path, label: str) -> dict[str, Any]:
     return {
         "kind": "directory",
         "uid": info.st_uid,
+        "gid": info.st_gid,
         "mode": stat.S_IMODE(info.st_mode),
+        "nlink": info.st_nlink,
         "dev": info.st_dev,
         "ino": info.st_ino,
+        "atime_ns": info.st_atime_ns,
+        "mtime_ns": info.st_mtime_ns,
     }
 
 
 def validate_cleanup_parent_identity(path: Path, expected: dict[str, Any], label: str) -> None:
     if cleanup_parent_identity(path, label) != expected:
         fail(f"{label} parent identity mismatch")
+
+
+def validate_cleanup_parent_stable_identity(
+    path: Path, expected: dict[str, Any], label: str
+) -> None:
+    current = cleanup_parent_identity(path, label)
+    for key in ("kind", "uid", "gid", "mode", "dev", "ino"):
+        if current.get(key) != expected.get(key):
+            fail(f"{label} parent identity mismatch")
 
 
 def validate_cleanup_source_policy(entry: dict[str, Any], label: str) -> None:
@@ -2245,9 +2405,13 @@ def validate_cleanup_document(
             if not isinstance(parent, dict) or set(parent) != {
                 "kind",
                 "uid",
+                "gid",
                 "mode",
+                "nlink",
                 "dev",
                 "ino",
+                "atime_ns",
+                "mtime_ns",
             }:
                 fail(f"{label} {key} schema is invalid")
             if parent["kind"] != "directory":
@@ -2290,9 +2454,13 @@ def validate_cleanup_document(
         if not isinstance(source_parent, dict) or set(source_parent) != {
             "kind",
             "uid",
+            "gid",
             "mode",
+            "nlink",
             "dev",
             "ino",
+            "atime_ns",
+            "mtime_ns",
         }:
             fail(f"{label} replacement source_parent schema is invalid")
         replacement_snapshot = replacement["snapshot"]
@@ -2322,8 +2490,10 @@ def validate_cleanup_document(
         if not isinstance(metadata, dict) or set(metadata) != {
             "mode",
             "uid",
+            "gid",
             "dev",
             "ino",
+            "nlink",
             "atime_ns",
             "mtime_ns",
         }:
@@ -2336,6 +2506,8 @@ def publish_json_no_replace(path: Path, payload: dict[str, Any], label: str) -> 
     if len(content) > METADATA_MAX_BYTES:
         fail(f"{label} is too large")
     ensure_directory(path.parent)
+    parent_metadata_before_temp = directory_metadata(path.parent, f"{label} parent")
+    parent_metadata_after_final: dict[str, Any] | None = None
     temp = path.parent / f"{LOCK_TEMP_PREFIX}{os.getpid()}.{time.monotonic_ns():x}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_CLOEXEC"):
@@ -2356,18 +2528,28 @@ def publish_json_no_replace(path: Path, payload: dict[str, Any], label: str) -> 
             lifecycle_hook(f"cleanup.{label}.final.visible")
         except FileExistsError:
             fail(f"{label} already exists")
+        parent_metadata_after_final = directory_metadata(path.parent, f"{label} parent")
         fsync_directory(path.parent, f"{label} parent")
         lifecycle_hook(f"cleanup.{label}.parent.fsync")
     finally:
         if fd >= 0:
             with contextlib.suppress(OSError):
                 os.close(fd)
-        with contextlib.suppress(FileNotFoundError):
+        temp_removed = False
+        try:
             temp.unlink()
+            temp_removed = True
+        except FileNotFoundError:
+            pass
+        if temp_removed:
             fsync_directory(path.parent, f"{label} parent")
-        if not final_visible:
-            with contextlib.suppress(FileNotFoundError):
-                temp.unlink()
+            restore_directory_metadata(
+                path.parent,
+                parent_metadata_after_final if final_visible else parent_metadata_before_temp,
+                f"{label} parent",
+                require_nlink=False,
+            )
+            fsync_directory(path.parent, f"{label} parent")
 
 
 def cleanup_publication_aliases(path: Path, final_info: os.stat_result) -> list[Path]:
@@ -2454,9 +2636,17 @@ def recover_cleanup_publication_alias(path: Path, target: Path, label: str) -> N
     )
     if identity_of(alias_info) != identity_of(info) or alias_document != document:
         fail(f"{label} publication alias mismatch")
+    parent_metadata = directory_metadata(path.parent, f"{label} parent")
     try:
         alias.unlink()
         lifecycle_hook(f"cleanup.{label}.alias.unlink")
+        fsync_directory(path.parent, f"{label} parent")
+        restore_directory_metadata(
+            path.parent,
+            parent_metadata,
+            f"{label} parent",
+            require_nlink=False,
+        )
         fsync_directory(path.parent, f"{label} parent")
         lifecycle_hook(f"cleanup.{label}.alias.parent.fsync")
     except OSError as exc:
@@ -2508,7 +2698,7 @@ def validate_cleanup_pending_readonly(target: Path, entries: list[dict[str, Any]
         tombstone = anchored_path(target, entry["tombstone_anchor"], entry["tombstone_relative"])
         if stat_optional(tombstone, "cleanup tombstone") is None:
             continue
-        validate_cleanup_parent_identity(
+        validate_cleanup_parent_stable_identity(
             tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
         )
         validate_cleanup_tree_partial(tombstone, entry["snapshot"], entry["purpose"])
@@ -2634,7 +2824,7 @@ def cleanup_replacements_present(
         )
         if stat_optional(source, f"cleanup replacement {replacement['purpose']}") is None:
             return False
-        validate_cleanup_parent_identity(
+        validate_cleanup_parent_stable_identity(
             source.parent, replacement["source_parent"], "cleanup replacement"
         )
         validate_cleanup_tree(
@@ -2662,7 +2852,7 @@ def delete_cleanup_replacements(target: Path, replacements: list[dict[str, Any]]
         )
         if stat_optional(source, f"cleanup replacement {replacement['purpose']}") is None:
             continue
-        validate_cleanup_parent_identity(
+        validate_cleanup_parent_stable_identity(
             source.parent, replacement["source_parent"], "cleanup replacement"
         )
         delete_cleanup_tree(
@@ -2681,12 +2871,12 @@ def restore_cleanup_entries_from_tombstones(target: Path, entries: list[dict[str
         if tombstone_info is None:
             if source_info is None:
                 fail("cleanup intent is incoherent")
-            validate_cleanup_parent_identity(
+            validate_cleanup_parent_stable_identity(
                 source.parent, entry["source_parent"], "cleanup source"
             )
             validate_cleanup_tree(source, entry["snapshot"], "cleanup restored source")
             continue
-        validate_cleanup_parent_identity(
+        validate_cleanup_parent_stable_identity(
             tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
         )
         validate_cleanup_tree(tombstone, entry["snapshot"], "cleanup intent tombstone")
@@ -2694,7 +2884,9 @@ def restore_cleanup_entries_from_tombstones(target: Path, entries: list[dict[str
             if cleanup_path_matches(source, entry["snapshot"], "cleanup restored source"):
                 fail("cleanup intent contains duplicate restored source and tombstone")
             fail("cleanup intent source is occupied by an unknown object")
-        validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
+        validate_cleanup_parent_stable_identity(
+            source.parent, entry["source_parent"], "cleanup source"
+        )
         tombstone.rename(source)
         fsync_directory(source.parent, "cleanup source parent")
         fsync_directory(tombstone.parent, "cleanup tombstone parent")
@@ -2754,12 +2946,20 @@ def delete_cleanup_tree(path: Path, expected: dict[str, Any], label: str) -> Non
         info = stat_optional(item, f"{label}:{relative}")
         if info is None:
             continue
-        validate_cleanup_object(item, record, f"{label}:{relative}")
         if stat.S_ISDIR(info.st_mode):
+            validate_cleanup_object(
+                item,
+                record,
+                f"{label}:{relative}",
+                exact_directory_metadata=False,
+            )
+            if cleanup_actual_child_names(item, f"{label}:{relative}"):
+                fail(f"{label}:{relative} child set mismatch")
             lifecycle_hook(f"cleanup.{label}.object.rmdir.before")
             item.rmdir()
             lifecycle_hook(f"cleanup.{label}.object.rmdir.after")
         else:
+            validate_cleanup_object(item, record, f"{label}:{relative}")
             lifecycle_hook(f"cleanup.{label}.object.unlink.before")
             delete_file(item)
             lifecycle_hook(f"cleanup.{label}.object.unlink.after")
@@ -2784,7 +2984,7 @@ def drain_cleanup(target: Path) -> bool:
             info = stat_optional(tombstone, "cleanup tombstone")
             if info is None:
                 continue
-            validate_cleanup_parent_identity(
+            validate_cleanup_parent_stable_identity(
                 tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
             )
             delete_cleanup_tree(tombstone, entry["snapshot"], entry["purpose"])
