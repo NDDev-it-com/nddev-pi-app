@@ -898,14 +898,24 @@ def require_product_lock_root(*, create: bool) -> Path | None:
     if info is None:
         if not create:
             return None
+        system_root_metadata = directory_metadata(system_root, "system temp root")
         try:
             root.mkdir(mode=OWNER_DIRECTORY_MODE)
             lifecycle_hook("lock.product.root.mkdir")
             os.chmod(root, OWNER_DIRECTORY_MODE)
             fsync_directory(system_root, "system temp root")
         except BaseException:
-            with contextlib.suppress(OSError):
+            removed_root = False
+            try:
                 root.rmdir()
+                removed_root = True
+                fsync_directory(system_root, "system temp root")
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            if removed_root:
+                restore_directory_metadata(system_root, system_root_metadata, "system temp root")
                 fsync_directory(system_root, "system temp root")
             raise
         info = require_directory(root, "product lock root")
@@ -1090,19 +1100,142 @@ def publication_aliases(parent: Path, final: Path, final_info: os.stat_result) -
     return aliases
 
 
+def anchor_stage_paths(parent: Path) -> list[Path]:
+    pattern = re.compile(re.escape(LOCK_TEMP_PREFIX) + r"[0-9]+\.[0-9a-f]+\.tmp\Z")
+    try:
+        entries = list(parent.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        fail(f"cannot inspect external lock parent: {exc}")
+    if len(entries) > LOCK_NAMESPACE_SCAN_ENTRY_LIMIT:
+        fail("external lock parent exceeds the bounded entry limit")
+    stages: list[Path] = []
+    for entry in entries:
+        if not entry.name.startswith(LOCK_TEMP_PREFIX):
+            continue
+        if not pattern.fullmatch(entry.name):
+            fail("external lock pre-publication stage name is unsafe")
+        stages.append(entry)
+    return sorted(stages)
+
+
+def validate_anchor_stage(
+    path: Path,
+    *,
+    allow_linked_final: bool,
+) -> tuple[os.stat_result, dict[str, Any]]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail("external lock pre-publication stage disappeared")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("external lock pre-publication stage must be a regular file")
+    require_current_user_owner(info, "external lock pre-publication stage")
+    if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail("external lock pre-publication stage must have mode 0600")
+    if info.st_nlink != 1 and not (allow_linked_final and info.st_nlink == 2):
+        fail("external lock pre-publication stage has unsafe link count")
+    if info.st_size > LOCK_BINDING_MAX_BYTES:
+        fail("external lock pre-publication stage binding is too large")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open external lock pre-publication stage: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            fail("external lock pre-publication stage changed while opening")
+        if opened.st_nlink != info.st_nlink:
+            fail("external lock pre-publication stage link count changed while opening")
+        content = read_fd_bounded(
+            descriptor,
+            "external lock pre-publication stage binding",
+            max_bytes=LOCK_BINDING_MAX_BYTES,
+        )
+    finally:
+        os.close(descriptor)
+    if not content:
+        fail("external lock pre-publication stage binding is empty")
+    binding = parse_json_object(content, "external lock pre-publication stage binding")
+    validate_anchor_stage_binding(binding)
+    return info, binding
+
+
+def validate_anchor_stage_binding(binding: dict[str, Any]) -> None:
+    common = {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "namespace": LOCK_NAMESPACE_NAME,
+    }
+    kind = binding.get("kind")
+    if kind == "product":
+        if binding != {**common, "kind": "product"}:
+            fail("external lock pre-publication stage binding mismatch")
+        return
+    if kind != "target":
+        fail("external lock pre-publication stage binding mismatch")
+    if set(binding) != {*common.keys(), "kind", "canonical_target", "target_digest"}:
+        fail("external lock pre-publication stage binding mismatch")
+    canonical = binding.get("canonical_target")
+    digest = binding.get("target_digest")
+    if not isinstance(canonical, str) or not canonical.startswith("/"):
+        fail("external lock pre-publication stage binding mismatch")
+    if not isinstance(digest, str) or digest != target_anchor_digest(Path(canonical)):
+        fail("external lock pre-publication stage binding mismatch")
+
+
+def validated_anchor_stages(
+    parent: Path,
+    expected_binding: dict[str, Any],
+    *,
+    allow_linked_final: bool,
+) -> list[Path]:
+    stages = anchor_stage_paths(parent)
+    for stage in stages:
+        _, binding = validate_anchor_stage(stage, allow_linked_final=allow_linked_final)
+        if binding != expected_binding:
+            fail("external lock pre-publication stage binding mismatch")
+    return stages
+
+
 def recover_anchor_publication_alias(path: Path, descriptor: int, expected: dict[str, Any]) -> None:
     opened = validate_anchor_descriptor(path, descriptor, expected, allow_publication_alias=True)
-    if opened.st_nlink == 1:
+    stages = validated_anchor_stages(
+        path.parent, expected, allow_linked_final=True
+    )
+    if opened.st_nlink == 2:
+        linked_aliases = []
+        for stage in stages:
+            try:
+                stage_info = stage.lstat()
+            except FileNotFoundError:
+                continue
+            if identity_of(stage_info) == identity_of(opened):
+                linked_aliases.append(stage)
+        if len(linked_aliases) != 1:
+            fail("external lock publication alias state is ambiguous")
+    elif opened.st_nlink != 1:
+        fail("external lock anchor has unsafe link count")
+    if not stages:
         return
-    aliases = publication_aliases(path.parent, path, opened)
-    if len(aliases) != 1:
-        fail("external lock publication alias state is ambiguous")
+    parent_metadata = directory_metadata(path.parent, "external lock parent")
     try:
-        aliases[0].unlink()
-        lifecycle_hook(f"lock.{expected['kind']}.alias.unlink")
+        for stage in stages:
+            with contextlib.suppress(FileNotFoundError):
+                stage.unlink()
+                lifecycle_hook(f"lock.{expected['kind']}.stage.unlink")
+        fsync_directory(path.parent, "external lock parent")
+        restore_directory_metadata(path.parent, parent_metadata, "external lock parent")
         fsync_directory(path.parent, "external lock parent")
     except OSError as exc:
-        fail(f"cannot recover external lock publication alias: {exc}")
+        fail(f"cannot recover external lock publication stage: {exc}")
     validate_anchor_descriptor(path, descriptor, expected, allow_publication_alias=False)
 
 
@@ -1157,6 +1290,8 @@ def publish_anchor_no_replace(parent: Path, final: Path, binding: dict[str, Any]
     content = canonical_json(binding)
     if len(content) > LOCK_BINDING_MAX_BYTES:
         fail("external lock binding is too large")
+    parent_metadata_before_temp = directory_metadata(parent, "external lock parent")
+    parent_metadata_after_final: dict[str, Any] | None = None
     temp = parent / f"{LOCK_TEMP_PREFIX}{os.getpid()}.{time.monotonic_ns():x}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_CLOEXEC"):
@@ -1177,20 +1312,32 @@ def publish_anchor_no_replace(parent: Path, final: Path, binding: dict[str, Any]
             final_visible = True
             lifecycle_hook(f"lock.{binding['kind']}.final.visible")
         except FileExistsError:
+            parent_metadata_after_final = directory_metadata(parent, "external lock parent")
             return
+        parent_metadata_after_final = directory_metadata(parent, "external lock parent")
         fsync_directory(parent, "external lock parent")
         lifecycle_hook(f"lock.{binding['kind']}.parent.fsync")
     finally:
         if descriptor >= 0:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
-        with contextlib.suppress(FileNotFoundError):
+        temp_removed = False
+        try:
             temp.unlink()
+            temp_removed = True
             lifecycle_hook(f"lock.{binding['kind']}.alias.cleanup")
+        except FileNotFoundError:
+            pass
+        if temp_removed:
             fsync_directory(parent, "external lock parent")
-        if not final_visible:
-            with contextlib.suppress(FileNotFoundError):
-                temp.unlink()
+            restore_directory_metadata(
+                parent,
+                parent_metadata_after_final
+                if final_visible or parent_metadata_after_final is not None
+                else parent_metadata_before_temp,
+                "external lock parent",
+            )
+            fsync_directory(parent, "external lock parent")
 
 
 def ensure_anchor(
@@ -1202,12 +1349,42 @@ def ensure_anchor(
     recover_alias: bool,
 ) -> ExternalLock | None:
     try:
+        lock = open_anchor_no_create(
+            path, expected, exclusive=exclusive, recover_alias=recover_alias
+        )
+        if not recover_alias and anchor_stage_paths(path.parent):
+            try:
+                validated_anchor_stages(path.parent, expected, allow_linked_final=False)
+            finally:
+                close_external_lock(lock)
+            fail("external lock pre-publication stage requires exclusive recovery")
+        return lock
+    except FileNotFoundError:
+        if not create:
+            if anchor_stage_paths(path.parent):
+                validated_anchor_stages(path.parent, expected, allow_linked_final=False)
+                fail("external lock pre-publication stage exists without final anchor")
+            return None
+    if not recover_alias:
+        fail("external lock pre-publication stage requires exclusive recovery")
+    stages = validated_anchor_stages(path.parent, expected, allow_linked_final=False)
+    if stages:
+        selected = stages[0]
+        try:
+            os.link(selected, path)
+            lifecycle_hook(f"lock.{expected['kind']}.stage.final.visible")
+        except FileExistsError:
+            pass
+        except FileNotFoundError:
+            try:
+                return open_anchor_no_create(
+                    path, expected, exclusive=exclusive, recover_alias=recover_alias
+                )
+            except FileNotFoundError:
+                fail("external lock pre-publication stage disappeared without final anchor")
         return open_anchor_no_create(
             path, expected, exclusive=exclusive, recover_alias=recover_alias
         )
-    except FileNotFoundError:
-        if not create:
-            return None
     publish_anchor_no_replace(path.parent, path, expected)
     return open_anchor_no_create(path, expected, exclusive=exclusive, recover_alias=recover_alias)
 
@@ -1215,16 +1392,39 @@ def ensure_anchor(
 def acquire_product_coordination(
     *, exclusive: bool, create: bool, recover_alias: bool
 ) -> tuple[Path | None, ExternalLock | None]:
+    root_was_absent = False
+    system_root_metadata: dict[str, Any] | None = None
+    if create:
+        root_was_absent = stat_optional(product_lock_root_path(), "product lock root") is None
+        if root_was_absent:
+            system_root_metadata = directory_metadata(
+                bootstrap_system_temp_root(), "system temp root"
+            )
     root = require_product_lock_root(create=create)
     if root is None:
         return None, None
-    lock = ensure_anchor(
-        product_anchor_path(root),
-        anchor_binding("product"),
-        exclusive=exclusive,
-        create=create,
-        recover_alias=recover_alias,
-    )
+    try:
+        lock = ensure_anchor(
+            product_anchor_path(root),
+            anchor_binding("product"),
+            exclusive=exclusive,
+            create=create,
+            recover_alias=recover_alias,
+        )
+    except BaseException:
+        if create and root_was_absent:
+            if stat_optional(product_anchor_path(root), "product anchor") is None:
+                removed_root = False
+                with contextlib.suppress(OSError):
+                    root.rmdir()
+                    removed_root = True
+                    fsync_directory(bootstrap_system_temp_root(), "system temp root")
+                if removed_root and system_root_metadata is not None:
+                    restore_directory_metadata(
+                        bootstrap_system_temp_root(), system_root_metadata, "system temp root"
+                    )
+                    fsync_directory(bootstrap_system_temp_root(), "system temp root")
+        raise
     return root, lock
 
 

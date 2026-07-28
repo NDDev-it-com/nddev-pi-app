@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import re
+import stat
 import sys
+import tempfile
 from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parent.parent
 CURRENT_MODULE_ID = "nddev-pi-app"
@@ -186,6 +192,196 @@ def validate_software_rollback_identity(errors: list[str]) -> None:
             errors.append(f"cli-tools/nddev_pi.py: stale byte-copy rollback helper {fragment!r}")
 
 
+def validate_external_anchor_recovery(errors: list[str]) -> None:
+    manager = ROOT / "cli-tools" / "nddev_pi.py"
+    try:
+        content = manager.read_text(encoding="utf-8")
+    except OSError as exc:
+        errors.append(f"cli-tools/nddev_pi.py: cannot read manager source: {exc}")
+        return
+    required_fragments = [
+        "anchor_stage_paths",
+        "validate_anchor_stage",
+        "validate_anchor_stage_binding",
+        "external lock pre-publication stage exists without final anchor",
+        "external lock pre-publication stage requires exclusive recovery",
+        "lock.{expected['kind']}.stage.final.visible",
+        "lock.{expected['kind']}.stage.unlink",
+        "external lock pre-publication stage binding mismatch",
+        "parent_metadata_before_temp = directory_metadata(parent, \"external lock parent\")",
+        "restore_directory_metadata(\n                parent,",
+        "system_root_metadata = directory_metadata(",
+        "restore_directory_metadata(\n                        bootstrap_system_temp_root()",
+    ]
+    for fragment in required_fragments:
+        if fragment not in content:
+            errors.append(f"cli-tools/nddev_pi.py: missing anchor recovery guard {fragment!r}")
+    forbidden_fragments = [
+        "external lock pre-publication stage state is ambiguous",
+        "if len(stages) > 1:",
+    ]
+    for fragment in forbidden_fragments:
+        if fragment in content:
+            errors.append(f"cli-tools/nddev_pi.py: stale single-stage recovery guard {fragment!r}")
+
+
+def validate_external_anchor_behavior(errors: list[str]) -> None:
+    manager = ROOT / "cli-tools" / "nddev_pi.py"
+    name = "nddev_pi_public_validator_anchor"
+    try:
+        spec = importlib.util.spec_from_file_location(name, manager)
+        if spec is None or spec.loader is None:
+            errors.append("cli-tools/nddev_pi.py: cannot load manager module spec")
+            return
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-anchor.", dir="/private/tmp") as tmp:
+            parent = Path(tmp) / "locks"
+            parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            final = parent / "global.lock"
+            binding = module.anchor_binding("product")
+            content = module.canonical_json(binding)
+            stages: list[Path] = []
+            for suffix in ("000001.aaa", "000002.bbb", "000003.ccc"):
+                stage = parent / f"{module.LOCK_TEMP_PREFIX}{suffix}.tmp"
+                descriptor = os.open(
+                    stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, module.OWNER_FILE_MODE
+                )
+                try:
+                    os.write(descriptor, content)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                stages.append(stage)
+            try:
+                module.ensure_anchor(final, binding, exclusive=False, create=False, recover_alias=False)
+            except module.PiSetupError as exc:
+                if "pre-publication stage exists without final anchor" not in str(exc):
+                    errors.append(f"cli-tools/nddev_pi.py: unexpected read-only stage error: {exc}")
+                    return
+            else:
+                errors.append("cli-tools/nddev_pi.py: read-only accepted pre-publication stages")
+                return
+            stage_snapshots = [
+                (stage.name, stage.lstat().st_ino, stage.lstat().st_mtime_ns, stage.read_bytes())
+                for stage in stages
+            ]
+            if len(stage_snapshots) != 3:
+                errors.append("cli-tools/nddev_pi.py: read-only mutated pre-publication stages")
+                return
+            lock = module.ensure_anchor(final, binding, exclusive=True, create=True, recover_alias=True)
+            try:
+                final_info = final.lstat()
+                if stat.S_IMODE(final_info.st_mode) != module.OWNER_FILE_MODE:
+                    errors.append("cli-tools/nddev_pi.py: recovered anchor mode is not 0600")
+                if final_info.st_nlink != 1:
+                    errors.append("cli-tools/nddev_pi.py: recovered anchor has publication aliases")
+                if final.read_bytes() != content:
+                    errors.append("cli-tools/nddev_pi.py: recovered anchor binding changed")
+                if any(stage.exists() for stage in stages):
+                    errors.append("cli-tools/nddev_pi.py: exclusive recovery left stage residue")
+            finally:
+                module.close_external_lock(lock)
+        with tempfile.TemporaryDirectory(
+            prefix="nddev-pi-public-anchor-mismatch.", dir="/private/tmp"
+        ) as tmp:
+            parent = Path(tmp) / "locks"
+            parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            final = parent / "global.lock"
+            binding = module.anchor_binding("product")
+            target_binding = module.anchor_binding("target", Path(tmp) / "target")
+            stages = []
+            for suffix, stage_binding in (
+                ("000004.ddd", binding),
+                ("000005.eee", target_binding),
+            ):
+                stage = parent / f"{module.LOCK_TEMP_PREFIX}{suffix}.tmp"
+                descriptor = os.open(
+                    stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, module.OWNER_FILE_MODE
+                )
+                try:
+                    os.write(descriptor, module.canonical_json(stage_binding))
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                stages.append(stage)
+            before = [
+                (stage.name, stage.lstat().st_ino, stage.lstat().st_mtime_ns, stage.read_bytes())
+                for stage in stages
+            ]
+            try:
+                module.ensure_anchor(final, binding, exclusive=True, create=True, recover_alias=True)
+            except module.PiSetupError as exc:
+                if "pre-publication stage binding mismatch" not in str(exc):
+                    errors.append(f"cli-tools/nddev_pi.py: unexpected mismatched stage error: {exc}")
+                    return
+            else:
+                errors.append("cli-tools/nddev_pi.py: mismatched pre-publication stage was skipped")
+                return
+            after = [
+                (stage.name, stage.lstat().st_ino, stage.lstat().st_mtime_ns, stage.read_bytes())
+                for stage in stages
+            ]
+            if before != after or final.exists():
+                errors.append("cli-tools/nddev_pi.py: mismatched stage failure mutated namespace")
+        with tempfile.TemporaryDirectory(
+            prefix="nddev-pi-public-anchor-winner.", dir="/private/tmp"
+        ) as tmp:
+            parent = Path(tmp) / "locks"
+            parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            final = parent / "global.lock"
+            binding = module.anchor_binding("product")
+            content = module.canonical_json(binding)
+            selected = parent / f"{module.LOCK_TEMP_PREFIX}000006.fff.tmp"
+            winner = parent / f"{module.LOCK_TEMP_PREFIX}000007.abc.tmp"
+            for stage in (selected, winner):
+                descriptor = os.open(
+                    stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, module.OWNER_FILE_MODE
+                )
+                try:
+                    os.write(descriptor, content)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            original_link = module.os.link
+            raced = False
+
+            def racing_link(source: Path, destination: Path) -> None:
+                nonlocal raced
+                if Path(source) == selected and Path(destination) == final and not raced:
+                    raced = True
+                    selected.unlink()
+                    original_link(winner, final)
+                    raise FileNotFoundError(str(source))
+                original_link(source, destination)
+
+            module.os.link = racing_link
+            lock = None
+            try:
+                lock = module.ensure_anchor(
+                    final, binding, exclusive=True, create=True, recover_alias=True
+                )
+                if not raced:
+                    errors.append("cli-tools/nddev_pi.py: concurrent winner smoke did not race")
+                final_info = final.lstat()
+                if stat.S_IMODE(final_info.st_mode) != module.OWNER_FILE_MODE:
+                    errors.append("cli-tools/nddev_pi.py: concurrent winner mode is not 0600")
+                if final_info.st_nlink != 1:
+                    errors.append("cli-tools/nddev_pi.py: concurrent winner alias was not drained")
+                if final.read_bytes() != content:
+                    errors.append("cli-tools/nddev_pi.py: concurrent winner binding changed")
+                if selected.exists() or winner.exists():
+                    errors.append("cli-tools/nddev_pi.py: concurrent winner left stage residue")
+            finally:
+                module.os.link = original_link
+                module.close_external_lock(lock)
+    except Exception as exc:  # pragma: no cover - validator reports instead of crashing
+        errors.append(f"cli-tools/nddev_pi.py: anchor behavior check failed: {exc}")
+    finally:
+        sys.modules.pop(name, None)
+
+
 def main() -> int:
     errors: list[str] = []
     version = load_json("build/version.json", errors)
@@ -196,6 +392,8 @@ def main() -> int:
     validate_npm_json_output_bound(errors)
     validate_cold_read_coordination(errors)
     validate_software_rollback_identity(errors)
+    validate_external_anchor_recovery(errors)
+    validate_external_anchor_behavior(errors)
 
     version_text = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if version is not None:
