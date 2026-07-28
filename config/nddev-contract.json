@@ -28,11 +28,16 @@
     "identity_source": "<setup>/setup.json:id",
     "list_command": "python3 cli-tools/nddev_pi.py list [--json]",
     "selection_option": "--setup <id>",
-    "setup_ids": ["nddev-builder"],
+    "setup_ids": [
+      "nddev-builder"
+    ],
     "default_setup_id": "nddev-builder",
     "profiles_root": "profiles",
     "profile_selection_option": "--profile <id>",
-    "profile_ids": ["full-auto", "safe"],
+    "profile_ids": [
+      "full-auto",
+      "safe"
+    ],
     "default_profile_id": "full-auto",
     "status_command": "python3 cli-tools/nddev_pi.py status --target <absolute-dir> [--json]"
   },
@@ -75,17 +80,31 @@
     "command": "pi",
     "bin": "dist/cli.js",
     "node_requirement": ">=22.19.0",
-    "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+    "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
     "registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
     "repository": "https://github.com/earendil-works/pi",
     "plan_command": "python3 cli-tools/nddev_pi.py software-plan --target <absolute-dir> [--json]",
     "status_command": "python3 cli-tools/nddev_pi.py software-status --target <absolute-dir> [--json]",
     "install_command": "python3 cli-tools/nddev_pi.py software-install --target <absolute-dir> [--json]",
     "update_command": "python3 cli-tools/nddev_pi.py software-update --target <absolute-dir> [--json]",
-    "install_execution": "npm install --global --ignore-scripts in isolated target-owned staging, then atomic swap",
+    "install_execution": "npm view + npm pack in isolated staging, pinned SRI/sha1 tarball verification, local extraction with scripts disabled, then atomic swap",
     "update_execution": "safe partial repair/update through isolated staging and rollback",
     "installer": {
       "tool": "npm",
+      "metadata_argv": [
+        "view",
+        "@earendil-works/pi-coding-agent@0.82.1",
+        "dist",
+        "--json"
+      ],
+      "pack_argv": [
+        "pack",
+        "--json",
+        "--ignore-scripts",
+        "--pack-destination",
+        "<stage>/tarballs",
+        "@earendil-works/pi-coding-agent@0.82.1"
+      ],
       "argv": [
         "install",
         "--global-style",
@@ -95,17 +114,35 @@
         "--package-lock=false",
         "--prefix",
         "<stage>/install",
-        "@earendil-works/pi-coding-agent@0.82.1"
+        "<verified-tarball>"
       ],
       "trust": false,
+      "byte_verification": {
+        "metadata_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+        "metadata_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+        "tarball_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+        "tarball_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+        "verified_before_extract": true
+      },
       "env": {
         "HOME": "<stage>/home",
         "npm_config_cache": "<stage>/cache",
-        "npm_config_prefix": "<stage>/install",
+        "npm_config_ignore_scripts": "true",
         "npm_config_userconfig": "<stage>/npmrc",
         "XDG_CONFIG_HOME": "<stage>/xdg-config",
         "TMPDIR": "<stage>/tmp"
-      }
+      },
+      "local_install_argv": [
+        "install",
+        "--global-style",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--package-lock=false",
+        "--prefix",
+        "<stage>/install",
+        "<verified-tarball>"
+      ]
     },
     "staged_tree_policy": {
       "verified_calibration": "references/pi-baseline.json:manager_installation.verified_tree_calibration",
@@ -141,7 +178,10 @@
     "version_identity": {
       "required_package_version": "0.82.1",
       "package_version_source": ".nddev-pi-software/current/install/lib/node_modules/@earendil-works/pi-coding-agent/package.json",
-      "probe_argv": ["bin/pi", "--version"],
+      "probe_argv": [
+        "bin/pi",
+        "--version"
+      ],
       "expected_probe_output": "0.0.0",
       "package_and_probe_must_both_match": true
     },
@@ -151,13 +191,18 @@
       "stamp_file": "NDDEV-PI-SOFTWARE.json",
       "status_executes_target_binary": false,
       "launch_uses_target_entrypoint": true
-    }
+    },
+    "registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz"
   },
   "builder_projection": {
     "default_on": true,
     "installation": {
       "install_command": "python3 cli-tools/nddev_pi.py install --setup nddev-builder --profile <id> --target <absolute-target> [--json]",
-      "native_settings_keys": ["skills", "packages", "enableSkillCommands"],
+      "native_settings_keys": [
+        "skills",
+        "packages",
+        "enableSkillCommands"
+      ],
       "native_package_path": "builder/nddev-builder/package.json",
       "preserved_on_switch_restore": true,
       "status_command": "python3 cli-tools/nddev_pi.py status --target <absolute-target> [--json]"
@@ -173,7 +218,12 @@
       "external_marketplace_published": null,
       "status": "unsupported-by-this-manager"
     },
-    "surfaces": ["settings.skills", "settings.packages", "package.pi.skills", "agent.AGENTS.md"],
+    "surfaces": [
+      "settings.skills",
+      "settings.packages",
+      "package.pi.skills",
+      "agent.AGENTS.md"
+    ],
     "unsupported_surfaces": {
       "mcp": "available through third-party Pi extensions/packages, not projected by this manager",
       "plugin_marketplace": null
@@ -183,7 +233,15 @@
     "absolute_target_required": true,
     "canonical_target_binding": true,
     "default_target": null,
-    "explicit_target_required": ["status", "plan", "install", "switch", "restore", "remove", "launch"],
+    "explicit_target_required": [
+      "status",
+      "plan",
+      "install",
+      "switch",
+      "restore",
+      "remove",
+      "launch"
+    ],
     "max_backups": 10,
     "backup_full_pool_behavior": "fail-closed",
     "missing_target_argument_rejected": true,

@@ -8,6 +8,7 @@ import base64
 import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import os
 import platform
@@ -18,11 +19,12 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -175,11 +177,26 @@ PI_PACKAGE_VERSION = "0.82.1"
 PI_PACKAGE_BIN = "dist/cli.js"
 PI_CLI_VERSION_OUTPUT = "0.0.0"
 PI_NODE_REQUIREMENT = ">=22.19.0"
-PI_REGISTRY_INTEGRITY = (
-    "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
-)
+PI_REGISTRY_INTEGRITY = "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
 PI_REGISTRY_SHASUM = "39c00809ff5531b6552b9ecb2c41f4c3529ec988"
-NPM_INSTALL_ARGV = [
+PI_REGISTRY_TARBALL_URL = (
+    "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz"
+)
+NPM_VIEW_ARGV = [
+    "view",
+    f"{PI_PACKAGE_NAME}@{PI_PACKAGE_VERSION}",
+    "dist",
+    "--json",
+]
+NPM_PACK_ARGV = [
+    "pack",
+    "--json",
+    "--ignore-scripts",
+    "--pack-destination",
+    "<stage>/tarballs",
+    f"{PI_PACKAGE_NAME}@{PI_PACKAGE_VERSION}",
+]
+NPM_LOCAL_INSTALL_ARGV = [
     "install",
     "--global-style",
     "--ignore-scripts",
@@ -188,8 +205,9 @@ NPM_INSTALL_ARGV = [
     "--package-lock=false",
     "--prefix",
     "<stage>/install",
-    f"{PI_PACKAGE_NAME}@{PI_PACKAGE_VERSION}",
+    "<verified-tarball>",
 ]
+NPM_INSTALL_ARGV = NPM_LOCAL_INSTALL_ARGV
 SOFTWARE_STAMP_NAME = "NDDEV-PI-SOFTWARE.json"
 SOFTWARE_DIR_NAME = ".nddev-pi-software"
 SOFTWARE_CURRENT_NAME = "current"
@@ -227,7 +245,7 @@ SOFTWARE_STAMP_KEYS = {
     "official_package_scripts",
     "installer",
 }
-SOFTWARE_STAMP_REGISTRY_KEYS = {"integrity", "shasum"}
+SOFTWARE_STAMP_REGISTRY_KEYS = {"integrity", "shasum", "tarball"}
 SOFTWARE_STAMP_TREE_LIMIT_KEYS = {"max_paths", "max_bytes"}
 SOFTWARE_STAMP_NODE_KEYS = {"path", "version", "sha256", "requirement"}
 SOFTWARE_STAMP_PROBE_KEYS = {
@@ -238,11 +256,20 @@ SOFTWARE_STAMP_PROBE_KEYS = {
     "stdout_stderr_sha256",
 }
 SOFTWARE_STAMP_SCRIPT_KEYS = {"preinstall", "install", "postinstall", "prepublishOnly"}
-SOFTWARE_STAMP_INSTALLER_KEYS = {"tool", "argv", "trust_reason", "env"}
+SOFTWARE_STAMP_INSTALLER_KEYS = {
+    "tool",
+    "metadata_argv",
+    "pack_argv",
+    "local_install_argv",
+    "argv",
+    "trust_reason",
+    "env",
+    "byte_verification",
+}
 SOFTWARE_STAMP_INSTALLER_ENV_KEYS = {
     "HOME",
     "npm_config_cache",
-    "npm_config_prefix",
+    "npm_config_ignore_scripts",
     "npm_config_userconfig",
     "XDG_CONFIG_HOME",
     "TMPDIR",
@@ -839,6 +866,13 @@ def fsync_directory(path: Path, label: str) -> None:
         os.close(descriptor)
 
 
+def fsync_file_descriptor(descriptor: int, label: str) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        fail(f"cannot sync {label}: {exc}")
+
+
 def bootstrap_system_temp_root() -> Path:
     if sys.platform == "darwin":
         return Path("/private/tmp")
@@ -1242,28 +1276,61 @@ def ensure_target_directory(target: Path) -> bool:
     return False
 
 
-def safe_write_file(path: Path, content: bytes) -> None:
+def durable_replace_private_file(
+    path: Path,
+    content: bytes,
+    *,
+    mode: int,
+    label: str,
+) -> None:
     parent = path.parent
-    ensure_directory(parent)
-    try:
-        require_regular_file(path, path.as_posix(), max_bytes=MANAGED_PAYLOAD_MAX_BYTES)
-    except FileNotFoundError:
-        raise
-    except PiSetupError as exc:
-        if "is missing" not in str(exc):
-            raise
     temporary = parent / f".{path.name}.tmp-{os.getpid()}-{time.monotonic_ns()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    descriptor = os.open(temporary, flags, OWNER_FILE_MODE)
+    descriptor = os.open(temporary, flags, mode)
+    descriptor_open = True
     try:
-        os.write(descriptor, content)
-        os.fsync(descriptor)
-    finally:
+        os.fchmod(descriptor, mode)
+        lifecycle_hook(f"write.{label}.temp.chmod")
+        write_complete_fd(descriptor, content, label)
+        lifecycle_hook(f"write.{label}.temp.write")
+        fsync_file_descriptor(descriptor, label)
+        lifecycle_hook(f"write.{label}.temp.fsync")
         os.close(descriptor)
-    os.replace(temporary, path)
-    path.chmod(OWNER_FILE_MODE)
+        descriptor_open = False
+        os.replace(temporary, path)
+        lifecycle_hook(f"write.{label}.final.replace")
+        fsync_directory(parent, f"{label} parent")
+        lifecycle_hook(f"write.{label}.parent.fsync")
+    except BaseException:
+        if descriptor_open:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        removed = False
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+            removed = True
+        if removed:
+            with contextlib.suppress(PiSetupError):
+                fsync_directory(parent, f"{label} parent")
+        raise
+
+
+def safe_write_file(path: Path, content: bytes, *, label: str | None = None) -> None:
+    parent = path.parent
+    ensure_directory(parent)
+    try:
+        require_regular_file(path, path.as_posix(), max_bytes=MANAGED_PAYLOAD_MAX_BYTES)
+    except PiSetupError as exc:
+        if "is missing" not in str(exc):
+            raise
+    durable_replace_private_file(
+        path,
+        content,
+        mode=OWNER_FILE_MODE,
+        label=label or "managed-file",
+    )
 
 
 def read_existing_file(path: Path) -> bytes | None:
@@ -1411,6 +1478,39 @@ def validate_cleanup_tree(path: Path, expected: dict[str, Any], label: str) -> N
         fail(f"{label} identity mismatch")
 
 
+def cleanup_parent_identity(path: Path, label: str) -> dict[str, Any]:
+    info = require_directory(path, label)
+    require_current_user_owner(info, label)
+    return {
+        "kind": "directory",
+        "uid": info.st_uid,
+        "mode": stat.S_IMODE(info.st_mode),
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+    }
+
+
+def validate_cleanup_parent_identity(path: Path, expected: dict[str, Any], label: str) -> None:
+    if cleanup_parent_identity(path, label) != expected:
+        fail(f"{label} parent identity mismatch")
+
+
+def validate_cleanup_source_policy(entry: dict[str, Any], label: str) -> None:
+    purpose = entry["purpose"]
+    source_anchor = entry["source_anchor"]
+    source_relative = entry["source_relative"]
+    if purpose == "software-current":
+        if (
+            source_anchor != "target"
+            or source_relative != f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}"
+        ):
+            fail(f"{label} software cleanup source mismatch")
+        if not entry["tombstone_relative"].startswith(f"{CLEANUP_TOMBSTONES_NAME}/{purpose}."):
+            fail(f"{label} software cleanup tombstone mismatch")
+        return
+    fail(f"{label} cleanup purpose is unsupported")
+
+
 def cleanup_entry(
     target: Path,
     *,
@@ -1425,8 +1525,16 @@ def cleanup_entry(
         "source_anchor": source_anchor,
         "source_relative": source_relative,
         "source_kind": "directory",
+        "source_parent": cleanup_parent_identity(
+            anchored_path(target, source_anchor, source_relative).parent,
+            "cleanup source parent",
+        ),
         "tombstone_anchor": "cleanup",
         "tombstone_relative": tombstone_relative,
+        "tombstone_parent": cleanup_parent_identity(
+            (cleanup_parent(target) / tombstone_relative).parent,
+            "cleanup tombstone parent",
+        ),
         "snapshot": snapshot,
     }
 
@@ -1483,8 +1591,10 @@ def validate_cleanup_document(
                 "source_anchor",
                 "source_relative",
                 "source_kind",
+                "source_parent",
                 "tombstone_anchor",
                 "tombstone_relative",
+                "tombstone_parent",
                 "snapshot",
             },
             f"{label} entry",
@@ -1497,6 +1607,19 @@ def validate_cleanup_document(
             fail(f"{label} entry tombstone anchor is invalid")
         bounded_relative(entry["source_relative"], f"{label} source_relative")
         bounded_relative(entry["tombstone_relative"], f"{label} tombstone_relative")
+        for key in ("source_parent", "tombstone_parent"):
+            parent = entry[key]
+            if not isinstance(parent, dict) or set(parent) != {
+                "kind",
+                "uid",
+                "mode",
+                "dev",
+                "ino",
+            }:
+                fail(f"{label} {key} schema is invalid")
+            if parent["kind"] != "directory":
+                fail(f"{label} {key} kind is invalid")
+        validate_cleanup_source_policy(entry, label)
         if entry["tombstone_relative"] in seen_tombstones:
             fail(f"{label} duplicate tombstone")
         seen_tombstones.add(entry["tombstone_relative"])
@@ -1605,6 +1728,10 @@ def move_directory_for_cleanup(
         cleanup_document(target, state="intent", entries=[entry]),
         "intent",
     )
+    validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
+    validate_cleanup_parent_identity(
+        tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+    )
     source.rename(tombstone)
     lifecycle_hook(f"cleanup.{purpose}.source.move.after")
     fsync_directory(source.parent, "cleanup source parent")
@@ -1628,10 +1755,15 @@ def recover_cleanup_intent(target: Path) -> None:
     source_info = stat_optional(source, "cleanup intent source")
     tombstone_info = stat_optional(tombstone, "cleanup intent tombstone")
     if source_info is not None and tombstone_info is None:
+        validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
         delete_file(cleanup_intent_path(target))
         fsync_directory(cleanup_parent(target), "cleanup parent")
         return
     if source_info is None and tombstone_info is not None:
+        validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
+        validate_cleanup_parent_identity(
+            tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+        )
         validate_cleanup_tree(tombstone, entry["snapshot"], "cleanup intent tombstone")
         ensure_directory(source.parent)
         tombstone.rename(source)
@@ -1675,6 +1807,9 @@ def drain_cleanup(target: Path) -> bool:
             info = stat_optional(tombstone, "cleanup tombstone")
             if info is None:
                 continue
+            validate_cleanup_parent_identity(
+                tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+            )
             delete_cleanup_tree(tombstone, entry["snapshot"], entry["purpose"])
         delete_file(cleanup_journal_path(target))
         if cleanup_intent_path(target).exists():
@@ -2216,8 +2351,7 @@ def validate_pre_network_software_target(target: Path) -> None:
     )
 
 
-def load_package_manifest(root: Path) -> dict[str, Any]:
-    manifest = load_json_object(package_manifest_path(root), "Pi package manifest")
+def validate_package_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     if manifest.get("name") != PI_PACKAGE_NAME:
         fail("Pi package manifest has unexpected package name")
     if manifest.get("version") != PI_PACKAGE_VERSION:
@@ -2238,6 +2372,16 @@ def load_package_manifest(root: Path) -> dict[str, Any]:
     return manifest
 
 
+def load_package_manifest(root: Path) -> dict[str, Any]:
+    return validate_package_manifest(
+        load_json_object(package_manifest_path(root), "Pi package manifest")
+    )
+
+
+def load_extracted_package_manifest(root: Path) -> dict[str, Any]:
+    return validate_package_manifest(load_json_object(root / "package.json", "Pi package manifest"))
+
+
 def is_relative_to(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -2248,6 +2392,10 @@ def is_relative_to(path: Path, parent: Path) -> bool:
 
 def private_mode_for_source(info: os.stat_result) -> int:
     return 0o700 if stat.S_IMODE(info.st_mode) & 0o100 else OWNER_FILE_MODE
+
+
+def private_mode_for_tar_entry(member: tarfile.TarInfo) -> int:
+    return 0o700 if member.mode & 0o100 else OWNER_FILE_MODE
 
 
 def read_staged_file(source: Path, label: str) -> tuple[bytes, os.stat_result]:
@@ -2426,23 +2574,31 @@ def safe_npm_env(stage_workspace: Path) -> dict[str, str]:
         xdg_config,
         cache,
         tmp,
-        stage_workspace / "install",
+        stage_workspace / "tarballs",
     ):
         directory.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
-    safe_write_file(userconfig, b"audit=false\nfund=false\nignore-scripts=true\n")
+    safe_write_file(
+        userconfig,
+        b"audit=false\nfund=false\nignore-scripts=true\n",
+        label="npm-userconfig",
+    )
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(xdg_config),
         "TMPDIR": str(tmp),
         "npm_config_cache": str(cache),
-        "npm_config_prefix": str(stage_workspace / "install"),
+        "npm_config_ignore_scripts": "true",
         "npm_config_userconfig": str(userconfig),
     }
     assert_no_sensitive_environment(
         env,
         "npm installer environment",
-        allowed_exact={"npm_config_cache", "npm_config_prefix", "npm_config_userconfig"},
+        allowed_exact={
+            "npm_config_cache",
+            "npm_config_ignore_scripts",
+            "npm_config_userconfig",
+        },
     )
     return env
 
@@ -2458,16 +2614,23 @@ def read_process_output(handle: Any, label: str) -> str:
     return text
 
 
-def npm_install_argv(stage_workspace: Path) -> list[str]:
+def npm_pack_argv(stage_workspace: Path) -> list[str]:
     return [
-        value.replace("<stage>/install", str(stage_workspace / "install"))
-        for value in NPM_INSTALL_ARGV
+        value.replace("<stage>/tarballs", str(stage_workspace / "tarballs"))
+        for value in NPM_PACK_ARGV
     ]
 
 
-def run_npm_install(stage_workspace: Path) -> None:
-    command = ["npm", *npm_install_argv(stage_workspace)]
-    env = safe_npm_env(stage_workspace)
+def npm_local_install_argv(stage_workspace: Path, tarball: Path) -> list[str]:
+    return [
+        value.replace("<stage>/install", str(stage_workspace / "install")).replace(
+            "<verified-tarball>", str(tarball)
+        )
+        for value in NPM_LOCAL_INSTALL_ARGV
+    ]
+
+
+def run_npm_json(command: list[str], env: dict[str, str], label: str) -> Any:
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
             completed = subprocess.run(
@@ -2482,12 +2645,143 @@ def run_npm_install(stage_workspace: Path) -> None:
         except FileNotFoundError:
             fail("npm command was not found on PATH")
         except subprocess.TimeoutExpired:
-            fail("npm install timed out")
+            fail(f"{label} timed out")
         if completed.returncode != 0:
             detail = (
                 read_process_output(stderr, "stderr") or read_process_output(stdout, "stdout")
             ).strip()
-            fail(f"npm install failed with exit code {completed.returncode}: {detail}")
+            fail(f"{label} failed with exit code {completed.returncode}: {detail}")
+        output = read_process_output(stdout, "stdout").strip()
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError as exc:
+            fail(f"{label} returned invalid JSON: {exc}")
+
+
+def run_npm_command(command: list[str], env: dict[str, str], label: str) -> None:
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        try:
+            completed = subprocess.run(
+                command,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                check=False,
+                timeout=PROCESS_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            fail("npm command was not found on PATH")
+        except subprocess.TimeoutExpired:
+            fail(f"{label} timed out")
+        if completed.returncode != 0:
+            detail = (
+                read_process_output(stderr, "stderr") or read_process_output(stdout, "stdout")
+            ).strip()
+            fail(f"{label} failed with exit code {completed.returncode}: {detail}")
+
+
+def verify_registry_dist_metadata(value: Any, label: str) -> None:
+    if not isinstance(value, dict):
+        fail(f"{label} metadata must be an object")
+    if value.get("integrity") != PI_REGISTRY_INTEGRITY:
+        fail(f"{label} integrity mismatch")
+    if value.get("shasum") != PI_REGISTRY_SHASUM:
+        fail(f"{label} shasum mismatch")
+    if value.get("tarball") != PI_REGISTRY_TARBALL_URL:
+        fail(f"{label} tarball URL mismatch")
+
+
+def verify_npm_pack_metadata(value: Any) -> None:
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        fail("npm pack metadata must describe exactly one archive")
+    entry = value[0]
+    if entry.get("name") != PI_PACKAGE_NAME:
+        fail("npm pack package name mismatch")
+    if entry.get("version") != PI_PACKAGE_VERSION:
+        fail("npm pack package version mismatch")
+    if entry.get("integrity") not in {None, PI_REGISTRY_INTEGRITY}:
+        fail("npm pack integrity mismatch")
+    if entry.get("shasum") not in {None, PI_REGISTRY_SHASUM}:
+        fail("npm pack shasum mismatch")
+
+
+def verify_tarball_identity(path: Path) -> bytes:
+    content = read_regular_file(path, "Pi package tarball", max_bytes=SOFTWARE_TREE_MAX_BYTES)
+    integrity = "sha512-" + base64.b64encode(hashlib.sha512(content).digest()).decode("ascii")
+    if integrity != PI_REGISTRY_INTEGRITY:
+        fail("Pi package tarball integrity mismatch")
+    shasum = hashlib.sha1(content).hexdigest()
+    if shasum != PI_REGISTRY_SHASUM:
+        fail("Pi package tarball shasum mismatch")
+    return content
+
+
+def extract_verified_tarball(content: bytes, destination: Path) -> None:
+    destination.mkdir(mode=OWNER_DIRECTORY_MODE)
+    total = 0
+    count = 0
+    with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+        for member in archive.getmembers():
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or ".." in name.parts or not name.parts:
+                fail("Pi package tarball contains an unsafe path")
+            if name.parts[0] != "package":
+                fail("Pi package tarball root must be package/")
+            relative = PurePosixPath(*name.parts[1:])
+            if not relative.parts:
+                continue
+            count += 1
+            if count > SOFTWARE_TREE_MAX_PATHS:
+                fail("Pi package tarball exceeds the path bound")
+            target = destination.joinpath(*relative.parts)
+            if member.isdir():
+                target.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                fail("Pi package tarball contains a non-regular entry")
+            handle = archive.extractfile(member)
+            if handle is None:
+                fail("Pi package tarball entry is unreadable")
+            data = handle.read(SOFTWARE_FILE_MAX_BYTES + 1)
+            if len(data) > SOFTWARE_FILE_MAX_BYTES:
+                fail("Pi package tarball entry exceeds the file bound")
+            total += len(data)
+            if total > SOFTWARE_TREE_MAX_BYTES:
+                fail("Pi package tarball exceeds the byte bound")
+            target.parent.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
+            durable_replace_private_file(
+                target,
+                data,
+                mode=private_mode_for_tar_entry(member),
+                label="tarball-extract",
+            )
+
+
+def run_npm_install(stage_workspace: Path) -> None:
+    env = safe_npm_env(stage_workspace)
+    dist = run_npm_json(["npm", *NPM_VIEW_ARGV], env, "npm view")
+    verify_registry_dist_metadata(dist, "npm view")
+    pack_dir = stage_workspace / "tarballs"
+    before = {path.name for path in pack_dir.iterdir()}
+    pack_metadata = run_npm_json(["npm", *npm_pack_argv(stage_workspace)], env, "npm pack")
+    verify_npm_pack_metadata(pack_metadata)
+    archives = [
+        path
+        for path in pack_dir.glob("*.tgz")
+        if path.is_file() and not path.is_symlink() and path.name not in before
+    ]
+    if len(archives) != 1:
+        fail("npm pack did not produce exactly one new tarball")
+    content = verify_tarball_identity(archives[0])
+    extract_root = stage_workspace / "verified-package"
+    extract_verified_tarball(content, extract_root)
+    load_extracted_package_manifest(extract_root)
+    run_npm_command(
+        ["npm", *npm_local_install_argv(stage_workspace, archives[0])],
+        env,
+        "npm verified tarball install",
+    )
 
 
 def parse_node_version(raw: str) -> tuple[int, int, int]:
@@ -2618,19 +2912,20 @@ def ensure_software_parent(path: Path, target: Path) -> None:
             fail(f"software parent must be private: {current}")
 
 
-def atomic_write_private(path: Path, content: bytes, mode: int = OWNER_FILE_MODE) -> None:
+def atomic_write_private(
+    path: Path,
+    content: bytes,
+    mode: int = OWNER_FILE_MODE,
+    *,
+    label: str | None = None,
+) -> None:
     path.parent.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.nddev.tmp.{os.getpid()}.{time.time_ns()}")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(content)
-        os.replace(temporary, path)
-        path.chmod(mode)
-    except BaseException:
-        with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
-        raise
+    durable_replace_private_file(
+        path,
+        content,
+        mode=mode,
+        label=label or "private-file",
+    )
 
 
 def write_target_entrypoint(target: Path, node_runtime: dict[str, str]) -> str:
@@ -2640,7 +2935,7 @@ def write_target_entrypoint(target: Path, node_runtime: dict[str, str]) -> str:
     content = node_wrapper_content(
         node_runtime["path"], package_binary_path(software_current(target))
     )
-    atomic_write_private(destination, content, 0o700)
+    atomic_write_private(destination, content, 0o700, label="software-entrypoint")
     return file_sha256(destination, label="Pi entrypoint")
 
 
@@ -2680,6 +2975,7 @@ def software_stamp(
             "max_bytes": SOFTWARE_TREE_MAX_BYTES,
         },
         "registry": {
+            "tarball": PI_REGISTRY_TARBALL_URL,
             "integrity": PI_REGISTRY_INTEGRITY,
             "shasum": PI_REGISTRY_SHASUM,
         },
@@ -2709,15 +3005,25 @@ def software_stamp(
         },
         "installer": {
             "tool": "npm",
+            "metadata_argv": NPM_VIEW_ARGV,
+            "pack_argv": NPM_PACK_ARGV,
+            "local_install_argv": NPM_LOCAL_INSTALL_ARGV,
             "argv": NPM_INSTALL_ARGV,
             "trust_reason": None,
             "env": {
                 "HOME": "<stage>/home",
                 "npm_config_cache": "<stage>/cache",
-                "npm_config_prefix": "<stage>/install",
+                "npm_config_ignore_scripts": "true",
                 "npm_config_userconfig": "<stage>/npmrc",
                 "XDG_CONFIG_HOME": "<stage>/xdg-config",
                 "TMPDIR": "<stage>/tmp",
+            },
+            "byte_verification": {
+                "metadata_integrity": PI_REGISTRY_INTEGRITY,
+                "metadata_shasum": PI_REGISTRY_SHASUM,
+                "tarball_integrity": PI_REGISTRY_INTEGRITY,
+                "tarball_shasum": PI_REGISTRY_SHASUM,
+                "verified_before_extract": True,
             },
         },
     }
@@ -2770,7 +3076,7 @@ def expected_installer_env() -> dict[str, str]:
     return {
         "HOME": "<stage>/home",
         "npm_config_cache": "<stage>/cache",
-        "npm_config_prefix": "<stage>/install",
+        "npm_config_ignore_scripts": "true",
         "npm_config_userconfig": "<stage>/npmrc",
         "XDG_CONFIG_HOME": "<stage>/xdg-config",
         "TMPDIR": "<stage>/tmp",
@@ -2791,7 +3097,7 @@ def expected_probe_env() -> dict[str, str]:
     }
 
 
-def software_status_payload(target: Path) -> dict[str, Any]:
+def software_status_payload(target: Path, *, validate_cleanup: bool = True) -> dict[str, Any]:
     canonical = canonical_target_readonly(target)
     payload: dict[str, Any] = {
         "installed": False,
@@ -2811,8 +3117,9 @@ def software_status_payload(target: Path) -> dict[str, Any]:
     }
     if not target.exists():
         return payload
-    cleanup = cleanup_state(target)
-    payload["cleanup_pending"] = cleanup["cleanup_pending"]
+    if validate_cleanup:
+        cleanup = cleanup_state(target)
+        payload["cleanup_pending"] = cleanup["cleanup_pending"]
     target_info = require_directory(target, "target")
     require_current_user_owner(target_info, "target")
     if stat.S_IMODE(target_info.st_mode) != OWNER_DIRECTORY_MODE:
@@ -2916,6 +3223,7 @@ def software_status_payload(target: Path) -> dict[str, Any]:
         registry = stamp.get("registry")
         if (
             not isinstance(registry, dict)
+            or registry.get("tarball") != PI_REGISTRY_TARBALL_URL
             or registry.get("integrity") != PI_REGISTRY_INTEGRITY
             or registry.get("shasum") != PI_REGISTRY_SHASUM
         ):
@@ -2924,9 +3232,20 @@ def software_status_payload(target: Path) -> dict[str, Any]:
         if (
             not isinstance(installer, dict)
             or installer.get("tool") != "npm"
+            or installer.get("metadata_argv") != NPM_VIEW_ARGV
+            or installer.get("pack_argv") != NPM_PACK_ARGV
+            or installer.get("local_install_argv") != NPM_LOCAL_INSTALL_ARGV
             or installer.get("argv") != NPM_INSTALL_ARGV
             or installer.get("env") != expected_installer_env()
             or installer.get("trust_reason") is not None
+            or installer.get("byte_verification")
+            != {
+                "metadata_integrity": PI_REGISTRY_INTEGRITY,
+                "metadata_shasum": PI_REGISTRY_SHASUM,
+                "tarball_integrity": PI_REGISTRY_INTEGRITY,
+                "tarball_shasum": PI_REGISTRY_SHASUM,
+                "verified_before_extract": True,
+            }
         ):
             drift.append("installer")
         official_scripts = stamp.get("official_package_scripts")
@@ -3020,7 +3339,7 @@ def restore_software_file(
                 path.parent.rmdir()
         return
     ensure_software_parent(path, target)
-    atomic_write_private(path, data, mode or OWNER_FILE_MODE)
+    atomic_write_private(path, data, mode or OWNER_FILE_MODE, label="software-rollback-file")
 
 
 def remove_created_target_if_empty(target: Path) -> None:
@@ -3159,9 +3478,12 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                         prepublish_only=prepublish_only,
                     )
                     atomic_write_private(
-                        software_stamp_path(target), canonical_json(stamp), OWNER_FILE_MODE
+                        software_stamp_path(target),
+                        canonical_json(stamp),
+                        OWNER_FILE_MODE,
+                        label="software-stamp",
                     )
-                    verified = software_status_payload(target)
+                    verified = software_status_payload(target, validate_cleanup=False)
                     if not verified["current"]:
                         fail(
                             f"installed software failed status verification: {', '.join(verified['drift'])}"
@@ -3313,46 +3635,45 @@ def prepare_launch_invocation(
     user_args = list(forwarded)
     if user_args and user_args[0] == "--":
         user_args = user_args[1:]
-    with target_lock(target) as target:
-        require_clean_managed(target)
-        software = software_status_payload(target)
-        if not software["current"]:
-            drift = software.get("drift") or ["target-owned Pi package is not installed"]
-            fail(f"launch requires current target-owned Pi package: {', '.join(drift)}")
-        stamp = read_software_stamp(target)
-        if stamp is None:
-            fail("target-owned Pi software stamp is missing")
-        executable = software_entrypoint(target)
-        executable_info = require_regular_file(
-            executable,
-            "target-owned Pi executable",
-            max_bytes=SOFTWARE_FILE_MAX_BYTES,
-        )
-        require_current_user_owner(executable_info, "target-owned Pi executable")
-        if stat.S_IMODE(executable_info.st_mode) != 0o700:
-            fail("target-owned Pi executable must be private executable")
-        require_safe_launch_args(user_args)
-        settings = read_current_settings(target)
-        if settings is None:
-            fail("managed settings are missing")
-        nddev_settings = settings.get("nddev")
-        if not isinstance(nddev_settings, dict):
-            fail("managed nddev settings are missing")
-        launch_args = validate_string_array(
-            nddev_settings.get("launch_args"), "managed launch_args"
-        )
-        child_args = [*launch_args, "--skill", builder_skill_path(target), *user_args]
-        child_env = build_child_env(target, stamp["node_runtime"])
-        return [str(executable), *child_args], child_env
+    require_clean_managed(target)
+    software = software_status_payload(target)
+    if not software["current"]:
+        drift = software.get("drift") or ["target-owned Pi package is not installed"]
+        fail(f"launch requires current target-owned Pi package: {', '.join(drift)}")
+    stamp = read_software_stamp(target)
+    if stamp is None:
+        fail("target-owned Pi software stamp is missing")
+    executable = software_entrypoint(target)
+    executable_info = require_regular_file(
+        executable,
+        "target-owned Pi executable",
+        max_bytes=SOFTWARE_FILE_MAX_BYTES,
+    )
+    require_current_user_owner(executable_info, "target-owned Pi executable")
+    if stat.S_IMODE(executable_info.st_mode) != 0o700:
+        fail("target-owned Pi executable must be private executable")
+    require_safe_launch_args(user_args)
+    settings = read_current_settings(target)
+    if settings is None:
+        fail("managed settings are missing")
+    nddev_settings = settings.get("nddev")
+    if not isinstance(nddev_settings, dict):
+        fail("managed nddev settings are missing")
+    launch_args = validate_string_array(nddev_settings.get("launch_args"), "managed launch_args")
+    child_args = [*launch_args, "--skill", builder_skill_path(target), *user_args]
+    child_env = build_child_env(target, stamp["node_runtime"])
+    return [str(executable), *child_args], child_env
 
 
 def command_launch(target: Path, forwarded: list[str]) -> int:
-    command, child_env = prepare_launch_invocation(target, forwarded)
-    try:
-        completed = subprocess.run(command, env=child_env, check=False)
-    except FileNotFoundError:
-        fail("target-owned pi executable is missing")
-    return completed.returncode
+    with target_lock(target) as target:
+        command, child_env = prepare_launch_invocation(target, forwarded)
+        lifecycle_hook("launch.before_spawn")
+        try:
+            completed = subprocess.run(command, env=child_env, check=False)
+        except FileNotFoundError:
+            fail("target-owned pi executable is missing")
+        return completed.returncode
 
 
 def emit(payload: dict[str, Any], json_enabled: bool) -> None:

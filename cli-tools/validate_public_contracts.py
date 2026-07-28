@@ -23,6 +23,7 @@ REQUIRED_VERSION_KEYS = {
     "pi_product_name",
     "pi_registry_integrity",
     "pi_registry_shasum",
+    "pi_registry_tarball",
     "python_requires",
     "runtime_baseline_ref",
     "schema_version",
@@ -36,7 +37,21 @@ MANAGED_FILES = [
     "agent/packages/nddev-builder/package.json",
     "agent/packages/nddev-builder/skills/nddev-builder/SKILL.md",
 ]
-NPM_INSTALL_ARGV = [
+NPM_VIEW_ARGV = [
+    "view",
+    "@earendil-works/pi-coding-agent@0.82.1",
+    "dist",
+    "--json",
+]
+NPM_PACK_ARGV = [
+    "pack",
+    "--json",
+    "--ignore-scripts",
+    "--pack-destination",
+    "<stage>/tarballs",
+    "@earendil-works/pi-coding-agent@0.82.1",
+]
+NPM_LOCAL_INSTALL_ARGV = [
     "install",
     "--global-style",
     "--ignore-scripts",
@@ -45,11 +60,29 @@ NPM_INSTALL_ARGV = [
     "--package-lock=false",
     "--prefix",
     "<stage>/install",
-    "@earendil-works/pi-coding-agent@0.82.1",
+    "<verified-tarball>",
 ]
-PI_REGISTRY_INTEGRITY = (
-    "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
+NPM_INSTALL_ARGV = NPM_LOCAL_INSTALL_ARGV
+PI_REGISTRY_INTEGRITY = "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
+PI_REGISTRY_SHASUM = "39c00809ff5531b6552b9ecb2c41f4c3529ec988"
+PI_REGISTRY_TARBALL_URL = (
+    "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz"
 )
+INSTALLER_ENV = {
+    "HOME": "<stage>/home",
+    "npm_config_cache": "<stage>/cache",
+    "npm_config_ignore_scripts": "true",
+    "npm_config_userconfig": "<stage>/npmrc",
+    "XDG_CONFIG_HOME": "<stage>/xdg-config",
+    "TMPDIR": "<stage>/tmp",
+}
+BYTE_VERIFICATION = {
+    "metadata_integrity": PI_REGISTRY_INTEGRITY,
+    "metadata_shasum": PI_REGISTRY_SHASUM,
+    "tarball_integrity": PI_REGISTRY_INTEGRITY,
+    "tarball_shasum": PI_REGISTRY_SHASUM,
+    "verified_before_extract": True,
+}
 SUPPORTED_HOSTS = ["macos-arm64", "macos-x64", "ubuntu-glibc-arm64", "ubuntu-glibc-x64"]
 PACKAGE_ID_PATTERN = re.compile(r"@[A-Za-z0-9._-]+/pi-coding-agent")
 REPOSITORY_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9._-]+/pi\b")
@@ -118,8 +151,10 @@ def main() -> int:
             errors.append("build/version.json: python_requires must include Python 3.9")
         if version.get("pi_registry_integrity") != PI_REGISTRY_INTEGRITY:
             errors.append("build/version.json: pi_registry_integrity mismatch")
-        if version.get("pi_registry_shasum") != "39c00809ff5531b6552b9ecb2c41f4c3529ec988":
+        if version.get("pi_registry_shasum") != PI_REGISTRY_SHASUM:
             errors.append("build/version.json: pi_registry_shasum mismatch")
+        if version.get("pi_registry_tarball") != PI_REGISTRY_TARBALL_URL:
+            errors.append("build/version.json: pi_registry_tarball mismatch")
 
     if manifest is not None and version is not None:
         if manifest.get("build_version") != version.get("build_version"):
@@ -154,15 +189,28 @@ def main() -> int:
                 or software.get("node_requirement") != ">=22.19.0"
             ):
                 errors.append("build/manifest.json: software bin/node mismatch")
+            if software.get("registry_tarball") != PI_REGISTRY_TARBALL_URL:
+                errors.append("build/manifest.json: software tarball mismatch")
+            if software.get("registry_integrity") != PI_REGISTRY_INTEGRITY:
+                errors.append("build/manifest.json: software integrity mismatch")
+            if software.get("registry_shasum") != PI_REGISTRY_SHASUM:
+                errors.append("build/manifest.json: software shasum mismatch")
             installer = software.get("installer")
             if not isinstance(installer, dict):
                 errors.append("build/manifest.json: software installer missing")
             elif installer.get("tool") != "npm":
                 errors.append("build/manifest.json: software installer tool mismatch")
-            elif installer.get("argv") != NPM_INSTALL_ARGV:
+            elif (
+                installer.get("metadata_argv") != NPM_VIEW_ARGV
+                or installer.get("pack_argv") != NPM_PACK_ARGV
+                or installer.get("local_install_argv") != NPM_LOCAL_INSTALL_ARGV
+                or installer.get("argv") != NPM_LOCAL_INSTALL_ARGV
+            ):
                 errors.append("build/manifest.json: software installer argv mismatch")
             elif installer.get("trust") is not False:
                 errors.append("build/manifest.json: software installer trust must be false")
+            elif installer.get("byte_verification") != BYTE_VERIFICATION:
+                errors.append("build/manifest.json: software installer verification mismatch")
         compatibility = manifest.get("runtime_compatibility")
         if (
             not isinstance(compatibility, dict)
@@ -225,15 +273,28 @@ def main() -> int:
             errors.append("config/nddev-contract.json: software bin mismatch")
         if software.get("node_requirement") != ">=22.19.0":
             errors.append("config/nddev-contract.json: software node requirement mismatch")
-        if software.get("registry_shasum") != "39c00809ff5531b6552b9ecb2c41f4c3529ec988":
+        if software.get("registry_shasum") != PI_REGISTRY_SHASUM:
             errors.append("config/nddev-contract.json: software shasum mismatch")
+        if software.get("registry_integrity") != PI_REGISTRY_INTEGRITY:
+            errors.append("config/nddev-contract.json: software integrity mismatch")
+        if software.get("registry_tarball") != PI_REGISTRY_TARBALL_URL:
+            errors.append("config/nddev-contract.json: software tarball mismatch")
         installer = software.get("installer")
         if not isinstance(installer, dict) or installer.get("tool") != "npm":
             errors.append("config/nddev-contract.json: software installer tool mismatch")
-        elif installer.get("argv") != NPM_INSTALL_ARGV:
+        elif (
+            installer.get("metadata_argv") != NPM_VIEW_ARGV
+            or installer.get("pack_argv") != NPM_PACK_ARGV
+            or installer.get("local_install_argv") != NPM_LOCAL_INSTALL_ARGV
+            or installer.get("argv") != NPM_LOCAL_INSTALL_ARGV
+        ):
             errors.append("config/nddev-contract.json: software installer argv mismatch")
         elif installer.get("trust") is not False:
             errors.append("config/nddev-contract.json: software installer trust must be false")
+        elif installer.get("env") != INSTALLER_ENV:
+            errors.append("config/nddev-contract.json: software installer env mismatch")
+        elif installer.get("byte_verification") != BYTE_VERIFICATION:
+            errors.append("config/nddev-contract.json: software installer verification mismatch")
         tree_policy = software.get("staged_tree_policy")
         if not isinstance(tree_policy, dict):
             errors.append("config/nddev-contract.json: staged tree policy missing")
@@ -325,15 +386,26 @@ def main() -> int:
         package = baseline.get("package", {})
         if package.get("integrity") != PI_REGISTRY_INTEGRITY:
             errors.append("references/pi-baseline.json: package integrity mismatch")
-        if package.get("shasum") != "39c00809ff5531b6552b9ecb2c41f4c3529ec988":
+        if package.get("shasum") != PI_REGISTRY_SHASUM:
             errors.append("references/pi-baseline.json: package shasum mismatch")
+        if package.get("tarball") != PI_REGISTRY_TARBALL_URL:
+            errors.append("references/pi-baseline.json: package tarball mismatch")
         manager_installation = baseline.get("manager_installation", {})
         if manager_installation.get("tool") != "npm":
             errors.append("references/pi-baseline.json: manager installation tool mismatch")
-        if manager_installation.get("argv") != NPM_INSTALL_ARGV:
+        if (
+            manager_installation.get("metadata_argv") != NPM_VIEW_ARGV
+            or manager_installation.get("pack_argv") != NPM_PACK_ARGV
+            or manager_installation.get("local_install_argv") != NPM_LOCAL_INSTALL_ARGV
+            or manager_installation.get("argv") != NPM_LOCAL_INSTALL_ARGV
+        ):
             errors.append("references/pi-baseline.json: manager installation argv mismatch")
         if manager_installation.get("trust") is not False:
             errors.append("references/pi-baseline.json: manager installation trust must be false")
+        if manager_installation.get("staging_environment") != INSTALLER_ENV:
+            errors.append("references/pi-baseline.json: manager staging environment mismatch")
+        if manager_installation.get("byte_verification") != BYTE_VERIFICATION:
+            errors.append("references/pi-baseline.json: manager byte verification mismatch")
         calibration = manager_installation.get("verified_tree_calibration")
         if calibration != {
             "verified_at": "2026-07-27",

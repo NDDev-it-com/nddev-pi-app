@@ -13,7 +13,7 @@
     "version": "0.82.1",
     "registry": "https://registry.npmjs.org/@earendil-works%2fpi-coding-agent",
     "tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz",
-    "integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+    "integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
     "shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
     "published": "2026-07-25T12:47:12.883Z",
     "file_count": 880,
@@ -25,7 +25,10 @@
     "command": "pi",
     "bin": "dist/cli.js",
     "version_probe": {
-      "argv": ["pi", "--version"],
+      "argv": [
+        "pi",
+        "--version"
+      ],
       "expected_stdout": "0.0.0",
       "package_version_source": "package.version",
       "independent_package_identity_required": true
@@ -44,7 +47,7 @@
       "--package-lock=false",
       "--prefix",
       "<stage>/install",
-      "@earendil-works/pi-coding-agent@0.82.1"
+      "<verified-tarball>"
     ],
     "trust": false,
     "consumer_lifecycle_scripts": {
@@ -56,7 +59,7 @@
     "staging_environment": {
       "HOME": "<stage>/home",
       "npm_config_cache": "<stage>/cache",
-      "npm_config_prefix": "<stage>/install",
+      "npm_config_ignore_scripts": "true",
       "npm_config_userconfig": "<stage>/npmrc",
       "XDG_CONFIG_HOME": "<stage>/xdg-config",
       "TMPDIR": "<stage>/tmp"
@@ -76,7 +79,43 @@
         "max_paths_per_tree": 25000,
         "max_logical_bytes_per_tree": 201326592
       }
-    }
+    },
+    "metadata_argv": [
+      "view",
+      "@earendil-works/pi-coding-agent@0.82.1",
+      "dist",
+      "--json"
+    ],
+    "pack_argv": [
+      "pack",
+      "--json",
+      "--ignore-scripts",
+      "--pack-destination",
+      "<stage>/tarballs",
+      "@earendil-works/pi-coding-agent@0.82.1"
+    ],
+    "byte_verification": {
+      "metadata_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+      "metadata_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+      "tarball_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+      "tarball_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+      "verified_before_extract": true
+    },
+    "local_extraction": {
+      "scripts_disabled": true,
+      "verified_before_extract": true
+    },
+    "local_install_argv": [
+      "install",
+      "--global-style",
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund",
+      "--package-lock=false",
+      "--prefix",
+      "<stage>/install",
+      "<verified-tarball>"
+    ]
   },
   "configuration": {
     "global_settings": "~/.pi/agent/settings.json",
@@ -95,14 +134,28 @@
     "skills": {
       "settings_key": "skills",
       "enable_commands_key": "enableSkillCommands",
-      "global_locations": ["~/.pi/agent/skills", "~/.agents/skills"],
-      "project_locations": [".pi/skills", ".agents/skills"],
-      "cli_flags": ["--skill", "--no-skills"]
+      "global_locations": [
+        "~/.pi/agent/skills",
+        "~/.agents/skills"
+      ],
+      "project_locations": [
+        ".pi/skills",
+        ".agents/skills"
+      ],
+      "cli_flags": [
+        "--skill",
+        "--no-skills"
+      ]
     },
     "packages": {
       "settings_key": "packages",
       "resource_manifest_key": "pi.skills",
-      "commands": ["pi install", "pi remove", "pi list", "pi update"],
+      "commands": [
+        "pi install",
+        "pi remove",
+        "pi list",
+        "pi update"
+      ],
       "documentation": "https://pi.dev/docs/latest/packages"
     },
     "extensions": {
@@ -115,12 +168,21 @@
     "built_in_filesystem_process_network_restrictions": false,
     "permission_popups": false,
     "plan_mode": false,
-    "project_trust_controls": ["defaultProjectTrust", "--approve", "--no-approve"],
+    "project_trust_controls": [
+      "defaultProjectTrust",
+      "--approve",
+      "--no-approve"
+    ],
     "source": "https://github.com/earendil-works/pi"
   },
   "manager_projection": {
     "builder_default_on": true,
-    "builder_surfaces": ["settings.skills", "settings.packages", "package.pi.skills", "agent.AGENTS.md"],
+    "builder_surfaces": [
+      "settings.skills",
+      "settings.packages",
+      "package.pi.skills",
+      "agent.AGENTS.md"
+    ],
     "external_marketplace_published": null,
     "plugin_marketplace": null,
     "mcp_projection": null
