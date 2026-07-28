@@ -199,6 +199,7 @@
     "staging": "same-parent temporary directory",
     "lock": "monotonic product and canonical target anchors",
     "read_only_lock_creation": false,
+    "cold_no_anchor_namespace": "bounded-empty-or-fail-closed-retry-whole-read",
     "anchor_publication": "complete fsynced temp plus atomic no-replace hardlink",
     "external_coordination_root": "private sticky-temp namespace declared by cli-tools/nddev_pi.py",
     "cleanup_journal": {

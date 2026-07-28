@@ -50,6 +50,7 @@ LOCK_NAMESPACE_NAME = "nddev-pi-app-locks"
 LOCK_PRODUCT_ANCHOR_NAME = "global.lock"
 LOCK_TARGET_SUFFIX = ".target.lock"
 LOCK_TEMP_PREFIX = ".nddev-pi-publish."
+LOCK_NAMESPACE_SCAN_ENTRY_LIMIT = 1024
 CLEANUP_DIR_NAME = ".nddev-pi-cleanup"
 CLEANUP_INTENT_NAME = "prepare-intent.json"
 CLEANUP_JOURNAL_NAME = "pending.json"
@@ -322,6 +323,10 @@ LAUNCH_BLOCKED_VALUE_FLAGS = {
 
 class PiSetupError(Exception):
     """A safe, user-facing lifecycle failure."""
+
+
+class RetryColdInspection(PiSetupError):
+    """Discard an uncoordinated cold-read result and recompute it safely."""
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -924,14 +929,71 @@ def target_anchor_path(root: Path, canonical_target: Path) -> Path:
     return root / f"{target_anchor_digest(canonical_target)}{LOCK_TARGET_SUFFIX}"
 
 
-def validate_no_orphan_target_anchors(root: Path) -> None:
+def lstat_no_follow(path: Path, label: str) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
+
+
+def cold_product_namespace_snapshot(root: Path | None) -> dict[str, Any]:
+    if root is None:
+        return {"state": "absent"}
+    root_info = require_directory(root, "product lock root")
+    require_current_user_owner(root_info, "product lock root")
+    if stat.S_IMODE(root_info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail("product lock root must be private")
     try:
         entries = list(root.iterdir())
     except OSError as exc:
         fail(f"cannot inspect product lock root: {exc}")
+    if len(entries) > LOCK_NAMESPACE_SCAN_ENTRY_LIMIT:
+        fail("product lock namespace exceeds the bounded entry limit")
     for entry in entries:
+        info = lstat_no_follow(entry, "product lock namespace entry")
+        if info is None:
+            continue
+        if entry.name == LOCK_PRODUCT_ANCHOR_NAME:
+            fail("product anchor appeared during cold inspection")
+        if re.fullmatch(re.escape(LOCK_TEMP_PREFIX) + r"[0-9]+\.[0-9a-f]+\.tmp", entry.name):
+            fail("product publication alias exists without product coordination anchor")
         if entry.name.endswith(LOCK_TARGET_SUFFIX):
             fail("target anchor exists without product coordination anchor")
+        fail(f"product lock namespace contains an unknown object: {entry.name}")
+    return {
+        "state": "present-empty",
+        "uid": root_info.st_uid,
+        "mode": stat.S_IMODE(root_info.st_mode),
+        "dev": root_info.st_dev,
+        "ino": root_info.st_ino,
+        "nlink": root_info.st_nlink,
+        "size": root_info.st_size,
+        "mtime_ns": root_info.st_mtime_ns,
+    }
+
+
+def product_anchor_present_no_follow(root: Path) -> bool:
+    return lstat_no_follow(product_anchor_path(root), "product anchor") is not None
+
+
+def cold_namespace_changed(before: dict[str, Any]) -> bool:
+    root = require_product_lock_root(create=False)
+    try:
+        after = cold_product_namespace_snapshot(root)
+    except PiSetupError:
+        if root is not None and product_anchor_present_no_follow(root):
+            return True
+        raise
+    return after != before
+
+
+def cold_namespace_should_retry(before: dict[str, Any]) -> bool:
+    if cold_namespace_changed(before):
+        lifecycle_hook("lock.cold.retry")
+        return True
+    return False
 
 
 def anchor_binding(kind: str, canonical_target: Path | None = None) -> dict[str, Any]:
@@ -1211,16 +1273,15 @@ def external_target_coordination(target: Path, *, mutation: bool) -> Iterator[tu
         return
 
     root = require_product_lock_root(create=False)
-    if root is None or not product_anchor_path(root).exists():
-        if root is not None:
-            validate_no_orphan_target_anchors(root)
+    if root is None or not product_anchor_present_no_follow(root):
+        before = cold_product_namespace_snapshot(root)
         canonical = canonical_target_under_lock(target)
-        yield canonical, False
-        root_after = require_product_lock_root(create=False)
-        if root_after is not None:
-            if product_anchor_path(root_after).exists():
-                fail("concurrent mutation published product coordination during read")
-            validate_no_orphan_target_anchors(root_after)
+        try:
+            yield canonical, False
+        except BaseException:
+            raise
+        if cold_namespace_should_retry(before):
+            raise RetryColdInspection("product coordination changed during cold read")
         return
     product_root, product_lock = acquire_product_coordination(
         exclusive=False, create=False, recover_alias=False
@@ -1266,8 +1327,13 @@ def target_lock(target: Path, *, mutation: bool = True) -> Iterator[Path]:
 
 
 def read_only_target(target: Path, callback: Any) -> Any:
-    with target_lock(target, mutation=False) as canonical:
-        return callback(canonical)
+    for _ in range(3):
+        try:
+            with target_lock(target, mutation=False) as canonical:
+                return callback(canonical)
+        except RetryColdInspection:
+            continue
+    fail("product coordination changed repeatedly during read")
 
 
 def ensure_directory(path: Path) -> None:
@@ -2751,31 +2817,33 @@ def write_rendered_files(
 
 
 def command_plan(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
-    with target_lock(target, mutation=False) as target:
+    def build(target: Path) -> dict[str, Any]:
         status = status_for_target(target)
-    operation = "install"
-    backup_required = False
-    if status["state"] == "managed":
-        if status["drift"]:
-            operation = "blocked"
-        elif status.get("cleanup_pending"):
-            operation = "cleanup"
-        elif status["setup_id"] == setup_id and status["profile_id"] == profile_id:
-            operation = "update"
-        else:
-            operation = "switch"
-            backup_required = True
-    return {
-        "operation": operation,
-        "setup_id": setup_id,
-        "profile_id": profile_id,
-        "target": str(target),
-        "mutates": False,
-        "backup_required": backup_required,
-        "state": status["state"],
-        "drift": status["drift"],
-        "cleanup_pending": status.get("cleanup_pending", False),
-    }
+        operation = "install"
+        backup_required = False
+        if status["state"] == "managed":
+            if status["drift"]:
+                operation = "blocked"
+            elif status.get("cleanup_pending"):
+                operation = "cleanup"
+            elif status["setup_id"] == setup_id and status["profile_id"] == profile_id:
+                operation = "update"
+            else:
+                operation = "switch"
+                backup_required = True
+        return {
+            "operation": operation,
+            "setup_id": setup_id,
+            "profile_id": profile_id,
+            "target": str(target),
+            "mutates": False,
+            "backup_required": backup_required,
+            "state": status["state"],
+            "drift": status["drift"],
+            "cleanup_pending": status.get("cleanup_pending", False),
+        }
+
+    return read_only_target(target, build)
 
 
 def command_install(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
@@ -4166,27 +4234,29 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
 
 
 def software_plan(target: Path) -> dict[str, Any]:
-    with target_lock(target, mutation=False) as target:
+    def build(target: Path) -> dict[str, Any]:
         status = software_precondition_state(target)
-    operation = "none"
-    if not status["present"]:
-        operation = "install"
-    elif not status["current"]:
-        operation = "repair-or-update"
-    if status.get("cleanup_pending"):
-        operation = "cleanup"
-    return {
-        "operation": operation,
-        "target": canonical_target_readonly(target),
-        "mutates": False,
-        "package": PI_PACKAGE_NAME,
-        "version": PI_PACKAGE_VERSION,
-        "installed": status["installed"],
-        "current": status["current"],
-        "presence": status["presence"],
-        "drift": status["drift"],
-        "cleanup_pending": status.get("cleanup_pending", False),
-    }
+        operation = "none"
+        if not status["present"]:
+            operation = "install"
+        elif not status["current"]:
+            operation = "repair-or-update"
+        if status.get("cleanup_pending"):
+            operation = "cleanup"
+        return {
+            "operation": operation,
+            "target": canonical_target_readonly(target),
+            "mutates": False,
+            "package": PI_PACKAGE_NAME,
+            "version": PI_PACKAGE_VERSION,
+            "installed": status["installed"],
+            "current": status["current"],
+            "presence": status["presence"],
+            "drift": status["drift"],
+            "cleanup_pending": status.get("cleanup_pending", False),
+        }
+
+    return read_only_target(target, build)
 
 
 def build_child_env(target: Path, node_runtime: dict[str, str]) -> dict[str, str]:

@@ -26,8 +26,10 @@ state. Unknown files and user-owned settings keys are preserved. Co-owned
 
 Mutating commands drain a valid manager-owned cleanup journal before active
 changes. Read-only commands expose `cleanup_pending` and do not repair, adopt,
-chmod, or delete cleanup state. The journal schema and lock policy are owned by
-`config/nddev-contract.json`.
+chmod, or delete cleanup state. If no product coordination anchor exists,
+read-only commands accept only a bounded empty coordination namespace; any
+namespace change discards and recomputes the observation. The journal schema and
+lock policy are owned by `config/nddev-contract.json`.
 
 ## Pi Capability Model
 

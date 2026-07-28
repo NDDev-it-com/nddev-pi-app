@@ -139,6 +139,27 @@ def validate_npm_json_output_bound(errors: list[str]) -> None:
         errors.append("cli-tools/nddev_pi.py: npm JSON parser must fail instead of truncating")
 
 
+def validate_cold_read_coordination(errors: list[str]) -> None:
+    manager = ROOT / "cli-tools" / "nddev_pi.py"
+    try:
+        content = manager.read_text(encoding="utf-8")
+    except OSError as exc:
+        errors.append(f"cli-tools/nddev_pi.py: cannot read manager source: {exc}")
+        return
+    required_fragments = [
+        "LOCK_NAMESPACE_SCAN_ENTRY_LIMIT",
+        "cold_product_namespace_snapshot",
+        "product publication alias exists without product coordination anchor",
+        "target anchor exists without product coordination anchor",
+        "RetryColdInspection",
+        "product coordination changed during cold read",
+        "return read_only_target(target, build)",
+    ]
+    for fragment in required_fragments:
+        if fragment not in content:
+            errors.append(f"cli-tools/nddev_pi.py: missing cold-read guard {fragment!r}")
+
+
 def main() -> int:
     errors: list[str] = []
     version = load_json("build/version.json", errors)
@@ -147,6 +168,7 @@ def main() -> int:
     baseline = load_json("references/pi-baseline.json", errors)
     builder_package = load_json("builder/nddev-builder/package.json", errors)
     validate_npm_json_output_bound(errors)
+    validate_cold_read_coordination(errors)
 
     version_text = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if version is not None:
@@ -239,6 +261,8 @@ def main() -> int:
         elif (
             transaction.get("lock") != "monotonic product and canonical target anchors"
             or transaction.get("read_only_lock_creation") is not False
+            or transaction.get("cold_no_anchor_namespace")
+            != "bounded-empty-or-fail-closed-retry-whole-read"
         ):
             errors.append("build/manifest.json: external lock policy mismatch")
         cleanup_journal = (
@@ -378,6 +402,8 @@ def main() -> int:
             errors.append("config/nddev-contract.json: external coordination contract missing")
         elif (
             coordination.get("read_only_creates_anchors") is not False
+            or coordination.get("cold_no_anchor_namespace")
+            != "bounded-empty-or-fail-closed-retry-whole-read"
             or coordination.get("mutation_publishes_missing_target_anchor") is not True
             or coordination.get("published_anchors_unlinked_by_lifecycle") is not False
         ):

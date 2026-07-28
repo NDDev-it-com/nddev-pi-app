@@ -257,6 +257,7 @@
       "product_anchor": "global.lock",
       "canonical_target_anchor": "<sha256>.target.lock",
       "read_only_creates_anchors": false,
+      "cold_no_anchor_namespace": "bounded-empty-or-fail-closed-retry-whole-read",
       "mutation_publishes_missing_target_anchor": true,
       "publication": "atomic no-replace hardlink of complete fsynced binding",
       "published_anchors_unlinked_by_lifecycle": false
