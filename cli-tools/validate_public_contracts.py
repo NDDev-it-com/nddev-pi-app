@@ -236,7 +236,7 @@ def validate_external_anchor_behavior(errors: list[str]) -> None:
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
-        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-anchor.", dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-anchor.") as tmp:
             parent = Path(tmp) / "locks"
             parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
             final = parent / "global.lock"
@@ -283,9 +283,7 @@ def validate_external_anchor_behavior(errors: list[str]) -> None:
                     errors.append("cli-tools/nddev_pi.py: exclusive recovery left stage residue")
             finally:
                 module.close_external_lock(lock)
-        with tempfile.TemporaryDirectory(
-            prefix="nddev-pi-public-anchor-mismatch.", dir="/private/tmp"
-        ) as tmp:
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-anchor-mismatch.") as tmp:
             parent = Path(tmp) / "locks"
             parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
             final = parent / "global.lock"
@@ -325,9 +323,7 @@ def validate_external_anchor_behavior(errors: list[str]) -> None:
             ]
             if before != after or final.exists():
                 errors.append("cli-tools/nddev_pi.py: mismatched stage failure mutated namespace")
-        with tempfile.TemporaryDirectory(
-            prefix="nddev-pi-public-anchor-winner.", dir="/private/tmp"
-        ) as tmp:
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-anchor-winner.") as tmp:
             parent = Path(tmp) / "locks"
             parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
             final = parent / "global.lock"
