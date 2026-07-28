@@ -1014,6 +1014,8 @@ def publication_aliases(parent: Path, final: Path, final_info: os.stat_result) -
             continue
         if identity_of(info) == identity_of(final_info):
             aliases.append(entry)
+        else:
+            fail("external lock publication alias state is ambiguous")
     return aliases
 
 
@@ -1478,6 +1480,82 @@ def validate_cleanup_tree(path: Path, expected: dict[str, Any], label: str) -> N
         fail(f"{label} identity mismatch")
 
 
+def cleanup_snapshot_records(expected: dict[str, Any], label: str) -> dict[str, dict[str, Any]]:
+    objects = expected.get("objects")
+    if not isinstance(objects, list):
+        fail(f"{label} snapshot objects are invalid")
+    records: dict[str, dict[str, Any]] = {}
+    for item in objects:
+        if not isinstance(item, dict) or "relative" not in item:
+            fail(f"{label} snapshot object is invalid")
+        relative = item["relative"]
+        if not isinstance(relative, str):
+            fail(f"{label} snapshot relative path is invalid")
+        if relative != ".":
+            bounded_relative(relative, f"{label} snapshot relative path")
+        if relative in records:
+            fail(f"{label} snapshot contains duplicate object")
+        records[relative] = item
+    if expected.get("object_count") != len(records):
+        fail(f"{label} snapshot object count mismatch")
+    if "." not in records:
+        fail(f"{label} snapshot root is missing")
+    return records
+
+
+def validate_cleanup_object(path: Path, expected: dict[str, Any], label: str) -> None:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        fail(f"{label} must not be a symlink")
+    if expected["kind"] == "directory":
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} kind mismatch")
+        checks = {
+            "uid": info.st_uid,
+            "mode": stat.S_IMODE(info.st_mode),
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+        }
+        for key, value in checks.items():
+            if expected.get(key) != value:
+                fail(f"{label} identity mismatch")
+        return
+    if expected["kind"] == "file":
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"{label} kind mismatch")
+        content = read_regular_file(path, label, max_bytes=SOFTWARE_FILE_MAX_BYTES)
+        checks = {
+            "uid": info.st_uid,
+            "mode": stat.S_IMODE(info.st_mode),
+            "nlink": info.st_nlink,
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+            "sha256": sha256_bytes(content),
+        }
+        for key, value in checks.items():
+            if expected.get(key) != value:
+                fail(f"{label} identity mismatch")
+        return
+    fail(f"{label} kind is unsupported")
+
+
+def validate_cleanup_tree_partial(path: Path, expected: dict[str, Any], label: str) -> None:
+    records = cleanup_snapshot_records(expected, label)
+    if not path.exists():
+        return
+    actual_paths = [
+        path,
+        *sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()),
+    ]
+    for item in actual_paths:
+        relative = "." if item == path else item.relative_to(path).as_posix()
+        if relative not in records:
+            fail(f"{label} contains an unknown object: {relative}")
+        validate_cleanup_object(item, records[relative], f"{label}:{relative}")
+
+
 def cleanup_parent_identity(path: Path, label: str) -> dict[str, Any]:
     info = require_directory(path, label)
     require_current_user_owner(info, label)
@@ -1674,18 +1752,148 @@ def publish_json_no_replace(path: Path, payload: dict[str, Any], label: str) -> 
                 temp.unlink()
 
 
+def cleanup_publication_aliases(path: Path, final_info: os.stat_result) -> list[Path]:
+    pattern = re.compile(re.escape(LOCK_TEMP_PREFIX) + r"[0-9]+\.[0-9a-f]+\.tmp\Z")
+    aliases: list[Path] = []
+    try:
+        entries = list(path.parent.iterdir())
+    except OSError as exc:
+        fail(f"cannot inspect cleanup publication parent: {exc}")
+    for entry in entries:
+        if entry.name == path.name:
+            continue
+        if not pattern.fullmatch(entry.name):
+            continue
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if identity_of(info) == identity_of(final_info):
+            aliases.append(entry)
+        else:
+            fail("cleanup publication alias state is ambiguous")
+    return aliases
+
+
+def validate_cleanup_document_file(
+    path: Path,
+    target: Path,
+    label: str,
+    *,
+    allow_publication_alias: bool,
+) -> tuple[dict[str, Any], os.stat_result]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail(f"{label} must be a regular non-symlink file")
+    require_bounded_size(info, label, METADATA_MAX_BYTES)
+    require_current_user_owner(info, label)
+    if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail(f"{label} must have mode 0600")
+    if info.st_nlink != 1 and not (allow_publication_alias and info.st_nlink == 2):
+        fail(f"{label} has unsafe link count")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open {label}: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            fail(f"{label} changed while it was being opened")
+        if not stat.S_ISREG(opened.st_mode):
+            fail(f"{label} changed to an unsafe file")
+        if opened.st_nlink != info.st_nlink:
+            fail(f"{label} link count changed while opening")
+        content = read_fd_bounded(descriptor, label, max_bytes=METADATA_MAX_BYTES)
+    finally:
+        os.close(descriptor)
+    document = parse_json_object(content, label)
+    validate_cleanup_document(target, document, label)
+    return document, info
+
+
+def recover_cleanup_publication_alias(path: Path, target: Path, label: str) -> None:
+    if stat_optional(path, label) is None:
+        return
+    document, info = validate_cleanup_document_file(
+        path, target, label, allow_publication_alias=True
+    )
+    if info.st_nlink == 1:
+        return
+    aliases = cleanup_publication_aliases(path, info)
+    if len(aliases) != 1:
+        fail(f"{label} publication alias state is ambiguous")
+    alias = aliases[0]
+    alias_document, alias_info = validate_cleanup_document_file(
+        alias, target, f"{label} publication alias", allow_publication_alias=True
+    )
+    if identity_of(alias_info) != identity_of(info) or alias_document != document:
+        fail(f"{label} publication alias mismatch")
+    try:
+        alias.unlink()
+        lifecycle_hook(f"cleanup.{label}.alias.unlink")
+        fsync_directory(path.parent, f"{label} parent")
+        lifecycle_hook(f"cleanup.{label}.alias.parent.fsync")
+    except OSError as exc:
+        fail(f"cannot recover {label} publication alias: {exc}")
+    validate_cleanup_document_file(path, target, label, allow_publication_alias=False)
+
+
 def read_cleanup_document(path: Path, target: Path, label: str) -> dict[str, Any] | None:
     info = stat_optional(path, label)
     if info is None:
         return None
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        fail(f"{label} must be a regular non-hardlinked file")
-    require_current_user_owner(info, label)
-    if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
-        fail(f"{label} must have mode 0600")
-    document = load_json_object(path, label)
-    validate_cleanup_document(target, document, label)
+    document, _ = validate_cleanup_document_file(path, target, label, allow_publication_alias=False)
     return document
+
+
+def validate_cleanup_pending_readonly(target: Path, entries: list[dict[str, Any]]) -> None:
+    cleanup_root = cleanup_parent(target)
+    root_info = require_directory(cleanup_root, "cleanup parent")
+    require_current_user_owner(root_info, "cleanup parent")
+    if stat.S_IMODE(root_info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail("cleanup parent must be private")
+    expected_root_names = {CLEANUP_JOURNAL_NAME, CLEANUP_TOMBSTONES_NAME}
+    if cleanup_intent_path(target).exists():
+        expected_root_names.add(CLEANUP_INTENT_NAME)
+    try:
+        root_entries = list(cleanup_root.iterdir())
+    except OSError as exc:
+        fail(f"cannot inspect cleanup parent: {exc}")
+    for entry in root_entries:
+        if entry.name not in expected_root_names:
+            fail(f"cleanup parent contains an unknown object: {entry.name}")
+    expected_tombstones = {
+        Path(entry["tombstone_relative"]).parts[1]
+        for entry in entries
+        if len(Path(entry["tombstone_relative"]).parts) == 2
+    }
+    tombstones = cleanup_tombstones(target)
+    tombstone_info = stat_optional(tombstones, "cleanup tombstones")
+    if tombstone_info is not None:
+        if not stat.S_ISDIR(tombstone_info.st_mode):
+            fail("cleanup tombstones must be a directory")
+        require_current_user_owner(tombstone_info, "cleanup tombstones")
+        if stat.S_IMODE(tombstone_info.st_mode) != OWNER_DIRECTORY_MODE:
+            fail("cleanup tombstones must be private")
+        for child in tombstones.iterdir():
+            if child.name not in expected_tombstones:
+                fail(f"cleanup tombstones contain an unknown object: {child.name}")
+    for entry in entries:
+        tombstone = anchored_path(target, entry["tombstone_anchor"], entry["tombstone_relative"])
+        if stat_optional(tombstone, "cleanup tombstone") is None:
+            continue
+        validate_cleanup_parent_identity(
+            tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+        )
+        validate_cleanup_tree_partial(tombstone, entry["snapshot"], entry["purpose"])
 
 
 def cleanup_state(target: Path) -> dict[str, Any]:
@@ -1693,6 +1901,7 @@ def cleanup_state(target: Path) -> dict[str, Any]:
     intent = read_cleanup_document(cleanup_intent_path(target), target, "cleanup intent")
     if pending is not None:
         entries = validate_cleanup_document(target, pending, "cleanup journal")
+        validate_cleanup_pending_readonly(target, entries)
         return {"cleanup_pending": True, "cleanup_entries": len(entries)}
     if intent is not None:
         fail("cleanup intent is incomplete and requires exclusive recovery")
@@ -1777,23 +1986,32 @@ def recover_cleanup_intent(target: Path) -> None:
 
 
 def delete_cleanup_tree(path: Path, expected: dict[str, Any], label: str) -> None:
-    validate_cleanup_tree(path, expected, label)
-    for item in sorted(
-        path.rglob("*"), key=lambda entry: len(entry.relative_to(path).parts), reverse=True
+    validate_cleanup_tree_partial(path, expected, label)
+    records = cleanup_snapshot_records(expected, label)
+    for relative, record in sorted(
+        records.items(), key=lambda item: len(Path(item[0]).parts), reverse=True
     ):
-        info = item.lstat()
+        item = path if relative == "." else path / relative
+        info = stat_optional(item, f"{label}:{relative}")
+        if info is None:
+            continue
+        validate_cleanup_object(item, record, f"{label}:{relative}")
         if stat.S_ISDIR(info.st_mode):
+            lifecycle_hook(f"cleanup.{label}.object.rmdir.before")
             item.rmdir()
+            lifecycle_hook(f"cleanup.{label}.object.rmdir.after")
         else:
+            lifecycle_hook(f"cleanup.{label}.object.unlink.before")
             delete_file(item)
-        lifecycle_hook(f"cleanup.{label}.object.delete")
+            lifecycle_hook(f"cleanup.{label}.object.unlink.after")
+        lifecycle_hook(f"cleanup.{label}.object.parent.fsync.before")
         fsync_directory(item.parent, f"{label} parent")
-    path.rmdir()
-    lifecycle_hook(f"cleanup.{label}.root.rmdir")
-    fsync_directory(path.parent, f"{label} parent")
+        lifecycle_hook(f"cleanup.{label}.object.parent.fsync.after")
 
 
 def drain_cleanup(target: Path) -> bool:
+    recover_cleanup_publication_alias(cleanup_journal_path(target), target, "cleanup journal")
+    recover_cleanup_publication_alias(cleanup_intent_path(target), target, "cleanup intent")
     pending = read_cleanup_document(cleanup_journal_path(target), target, "cleanup journal")
     if pending is None:
         recover_cleanup_intent(target)
@@ -1811,25 +2029,46 @@ def drain_cleanup(target: Path) -> bool:
                 tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
             )
             delete_cleanup_tree(tombstone, entry["snapshot"], entry["purpose"])
-        delete_file(cleanup_journal_path(target))
         if cleanup_intent_path(target).exists():
+            lifecycle_hook("cleanup.intent.retire.unlink.before")
             delete_file(cleanup_intent_path(target))
+            lifecycle_hook("cleanup.intent.retire.unlink.after")
+            fsync_directory(cleanup_parent(target), "cleanup parent")
+            lifecycle_hook("cleanup.intent.retire.parent.fsync")
         with contextlib.suppress(OSError):
             cleanup_tombstones(target).rmdir()
-        with contextlib.suppress(OSError):
-            cleanup_parent(target).rmdir()
+            lifecycle_hook("cleanup.tombstones.rmdir")
+            fsync_directory(cleanup_parent(target), "cleanup parent")
+        lifecycle_hook("cleanup.drain.target.fsync.before")
         fsync_directory(target, "target")
-        return False
     except BaseException:
         return True
+    try:
+        lifecycle_hook("cleanup.journal.retire.unlink.before")
+        delete_file(cleanup_journal_path(target))
+        lifecycle_hook("cleanup.journal.retire.unlink.after")
+        fsync_directory(cleanup_parent(target), "cleanup parent")
+        lifecycle_hook("cleanup.journal.retire.parent.fsync")
+    except BaseException:
+        return stat_optional(cleanup_journal_path(target), "cleanup journal") is not None
+    with contextlib.suppress(OSError):
+        cleanup_parent(target).rmdir()
+    return False
 
 
 def publish_cleanup_pending(target: Path, entries: list[dict[str, Any]]) -> bool:
-    publish_json_no_replace(
-        cleanup_journal_path(target),
-        cleanup_document(target, state="pending", entries=entries),
-        "journal",
-    )
+    try:
+        publish_json_no_replace(
+            cleanup_journal_path(target),
+            cleanup_document(target, state="pending", entries=entries),
+            "journal",
+        )
+    except BaseException:
+        if stat_optional(cleanup_journal_path(target), "cleanup journal") is None:
+            raise
+        recover_cleanup_publication_alias(cleanup_journal_path(target), target, "cleanup journal")
+        read_cleanup_document(cleanup_journal_path(target), target, "cleanup journal")
+        return True
     pending = drain_cleanup(target)
     return pending
 
@@ -3282,11 +3521,18 @@ def software_status_payload(target: Path, *, validate_cleanup: bool = True) -> d
     return payload
 
 
+def is_cleanup_state_error(exc: PiSetupError) -> bool:
+    message = str(exc)
+    return message.startswith("cleanup ") or message.startswith("cannot inspect cleanup ")
+
+
 def software_precondition_state(target: Path) -> dict[str, Any]:
     validate_pre_network_software_target(target)
     try:
         return software_status_payload(target)
     except PiSetupError as exc:
+        if is_cleanup_state_error(exc):
+            raise
         info = stat_optional(target, "target")
         if info is None or not stat.S_ISDIR(info.st_mode):
             raise
