@@ -124,6 +124,21 @@ def validate_current_identity_only(errors: list[str]) -> None:
                 errors.append(f"{path.relative_to(ROOT)}: cross-module id {match.group(0)!r}")
 
 
+def validate_npm_json_output_bound(errors: list[str]) -> None:
+    manager = ROOT / "cli-tools" / "nddev_pi.py"
+    try:
+        content = manager.read_text(encoding="utf-8")
+    except OSError as exc:
+        errors.append(f"cli-tools/nddev_pi.py: cannot read manager source: {exc}")
+        return
+    if "NPM_JSON_OUTPUT_MAX_BYTES = 1024 * 1024" not in content:
+        errors.append("cli-tools/nddev_pi.py: missing bounded npm JSON output limit")
+    if "max_bytes=NPM_JSON_OUTPUT_MAX_BYTES" not in content:
+        errors.append("cli-tools/nddev_pi.py: npm JSON parser must use the npm output limit")
+    if "truncate=False" not in content:
+        errors.append("cli-tools/nddev_pi.py: npm JSON parser must fail instead of truncating")
+
+
 def main() -> int:
     errors: list[str] = []
     version = load_json("build/version.json", errors)
@@ -131,6 +146,7 @@ def main() -> int:
     contract = load_json("config/nddev-contract.json", errors)
     baseline = load_json("references/pi-baseline.json", errors)
     builder_package = load_json("builder/nddev-builder/package.json", errors)
+    validate_npm_json_output_bound(errors)
 
     version_text = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if version is not None:
@@ -329,9 +345,9 @@ def main() -> int:
         if not isinstance(entrypoint_materialization, dict):
             errors.append("config/nddev-contract.json: entrypoint materialization missing")
         elif entrypoint_materialization != {
-            "npm_source": "<stage>/install/bin/pi",
+            "npm_source": "<stage>/install/node_modules/.bin/pi",
             "required_package_target": (
-                "<stage>/install/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+                "<stage>/install/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
             ),
             "persisted_kind": "private-relative-node-wrapper",
             "persisted_path": ".nddev-pi-software/current/bin/pi",
@@ -343,7 +359,7 @@ def main() -> int:
         if version_identity != {
             "required_package_version": "0.82.1",
             "package_version_source": (
-                ".nddev-pi-software/current/install/lib/node_modules/"
+                ".nddev-pi-software/current/install/node_modules/"
                 "@earendil-works/pi-coding-agent/package.json"
             ),
             "probe_argv": ["bin/pi", "--version"],

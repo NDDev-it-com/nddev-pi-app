@@ -217,8 +217,9 @@ SOFTWARE_FILE_MAX_BYTES = 192 * 1024 * 1024
 SOFTWARE_TREE_MAX_BYTES = 192 * 1024 * 1024
 SOFTWARE_TREE_MAX_PATHS = 25000
 PROCESS_OUTPUT_MAX_BYTES = 64 * 1024
+NPM_JSON_OUTPUT_MAX_BYTES = 1024 * 1024
 PROCESS_TIMEOUT_SECONDS = 120
-PI_PACKAGE_RELATIVE = "install/lib/node_modules/@earendil-works/pi-coding-agent"
+PI_PACKAGE_RELATIVE = "install/node_modules/@earendil-works/pi-coding-agent"
 PI_PACKAGE_BINARY_RELATIVE = f"{PI_PACKAGE_RELATIVE}/{PI_PACKAGE_BIN}"
 SOFTWARE_STAMP_KEYS = {
     "schema_version",
@@ -3123,7 +3124,7 @@ def materialize_staged_entrypoint(
     allowed_roots: tuple[Path, ...],
     node_runtime: dict[str, str],
 ) -> None:
-    source_root = stage_workspace / "install" / "bin"
+    source_root = stage_workspace / "install" / "node_modules" / ".bin"
     require_directory(source_root, "staged bin tree")
     paths = sorted(
         source_root.rglob("*"),
@@ -3217,14 +3218,22 @@ def safe_npm_env(stage_workspace: Path) -> dict[str, str]:
     return env
 
 
-def read_process_output(handle: Any, label: str) -> str:
+def read_process_output(
+    handle: Any,
+    label: str,
+    *,
+    max_bytes: int = PROCESS_OUTPUT_MAX_BYTES,
+    truncate: bool = True,
+) -> str:
     handle.seek(0, os.SEEK_END)
     size = handle.tell()
     handle.seek(0)
-    data = handle.read(PROCESS_OUTPUT_MAX_BYTES + 1)
+    data = handle.read(max_bytes + 1)
     text = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
-    if size > PROCESS_OUTPUT_MAX_BYTES:
-        return text[:PROCESS_OUTPUT_MAX_BYTES] + f"\n[{label} truncated]\n"
+    if size > max_bytes:
+        if not truncate:
+            fail(f"{label} output exceeds the {max_bytes}-byte bound")
+        return text[:max_bytes] + f"\n[{label} truncated]\n"
     return text
 
 
@@ -3265,7 +3274,12 @@ def run_npm_json(command: list[str], env: dict[str, str], label: str) -> Any:
                 read_process_output(stderr, "stderr") or read_process_output(stdout, "stdout")
             ).strip()
             fail(f"{label} failed with exit code {completed.returncode}: {detail}")
-        output = read_process_output(stdout, "stdout").strip()
+        output = read_process_output(
+            stdout,
+            "stdout",
+            max_bytes=NPM_JSON_OUTPUT_MAX_BYTES,
+            truncate=False,
+        ).strip()
         try:
             return json.loads(output)
         except json.JSONDecodeError as exc:
