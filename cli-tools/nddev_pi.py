@@ -467,6 +467,8 @@ def stat_optional(path: Path, label: str) -> os.stat_result | None:
         info = path.lstat()
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
     if stat.S_ISLNK(info.st_mode):
         fail(f"{label} must not be a symlink")
     return info
@@ -631,9 +633,7 @@ def load_json_object(path: Path, label: str) -> dict[str, Any]:
 
 
 def maybe_load_json_object(path: Path, label: str) -> dict[str, Any] | None:
-    try:
-        path.lstat()
-    except FileNotFoundError:
+    if stat_optional(path, label) is None:
         return None
     return load_json_object(path, label)
 
