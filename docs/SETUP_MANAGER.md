@@ -60,5 +60,10 @@ protective limits and preserved path, symlink, mode, and digest checks. The
 software stamp records the installed tree metrics and limits for status
 revalidation.
 
+Software install/update publishes a bounded cleanup intent before any visible
+replacement move. Failures before the pending cleanup journal restore exact
+prior software objects; once the desired state is verified, cleanup failures
+return success with `cleanup_pending`.
+
 The pinned package has no consumer `preinstall`, `install`, or `postinstall`
 script in the recorded baseline. npm is invoked with consumer scripts disabled.

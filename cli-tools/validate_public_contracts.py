@@ -160,6 +160,32 @@ def validate_cold_read_coordination(errors: list[str]) -> None:
             errors.append(f"cli-tools/nddev_pi.py: missing cold-read guard {fragment!r}")
 
 
+def validate_software_rollback_identity(errors: list[str]) -> None:
+    manager = ROOT / "cli-tools" / "nddev_pi.py"
+    try:
+        content = manager.read_text(encoding="utf-8")
+    except OSError as exc:
+        errors.append(f"cli-tools/nddev_pi.py: cannot read manager source: {exc}")
+        return
+    required_fragments = [
+        "cleanup_replacement",
+        "prepare_cleanup_intent",
+        "move_cleanup_sources_to_tombstones",
+        "restore_cleanup_entries_from_tombstones",
+        "desired_software_state_is_current",
+        "software.current.rename.after",
+        "software.entrypoint.rename.after",
+        "software.stamp.rename.after",
+    ]
+    for fragment in required_fragments:
+        if fragment not in content:
+            errors.append(f"cli-tools/nddev_pi.py: missing software rollback guard {fragment!r}")
+    forbidden_fragments = ["def snapshot_software_file", "def restore_software_file"]
+    for fragment in forbidden_fragments:
+        if fragment in content:
+            errors.append(f"cli-tools/nddev_pi.py: stale byte-copy rollback helper {fragment!r}")
+
+
 def main() -> int:
     errors: list[str] = []
     version = load_json("build/version.json", errors)
@@ -169,6 +195,7 @@ def main() -> int:
     builder_package = load_json("builder/nddev-builder/package.json", errors)
     validate_npm_json_output_bound(errors)
     validate_cold_read_coordination(errors)
+    validate_software_rollback_identity(errors)
 
     version_text = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if version is not None:
@@ -285,6 +312,18 @@ def main() -> int:
             or setup_rollback.get("backup_commit_after_desired_postcondition") is not True
         ):
             errors.append("build/manifest.json: setup rollback policy mismatch")
+        software_rollback = (
+            transaction.get("software_rollback") if isinstance(transaction, dict) else None
+        )
+        if (
+            not isinstance(software_rollback, dict)
+            or software_rollback.get("strategy")
+            != "object-preserving cleanup intent replacements"
+            or software_rollback.get("restores_original_file_identity") is not True
+            or software_rollback.get("prepare_intent_before_visible_replacement") is not True
+            or software_rollback.get("committed_success_cleanup_pending") is not True
+        ):
+            errors.append("build/manifest.json: software rollback policy mismatch")
         backup_policy = manifest.get("backup_policy")
         if (
             not isinstance(backup_policy, dict)
@@ -425,6 +464,16 @@ def main() -> int:
             or setup_rollback.get("backup_commit_after_desired_postcondition") is not True
         ):
             errors.append("config/nddev-contract.json: setup rollback policy mismatch")
+        software_rollback = contract.get("safety", {}).get("software_rollback")
+        if (
+            not isinstance(software_rollback, dict)
+            or software_rollback.get("strategy")
+            != "object-preserving cleanup intent replacements"
+            or software_rollback.get("restores_original_file_identity") is not True
+            or software_rollback.get("prepare_intent_before_visible_replacement") is not True
+            or software_rollback.get("committed_success_cleanup_pending") is not True
+        ):
+            errors.append("config/nddev-contract.json: software rollback policy mismatch")
         marketplace = contract.get("builder_projection", {}).get("marketplace", {})
         if marketplace.get("external_marketplace_published") is not None:
             errors.append("config/nddev-contract.json: external marketplace must remain null")

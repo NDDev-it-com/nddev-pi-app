@@ -1670,11 +1670,21 @@ def anchored_path(target: Path, anchor: str, relative: str) -> Path:
 
 
 def snapshot_cleanup_tree(path: Path, label: str) -> dict[str, Any]:
-    root_info = require_directory(path, label)
+    try:
+        root_info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    if stat.S_ISLNK(root_info.st_mode):
+        fail(f"{label} must not be a symlink")
+    if not stat.S_ISDIR(root_info.st_mode) and not stat.S_ISREG(root_info.st_mode):
+        fail(f"{label} must be a regular file or directory")
     require_current_user_owner(root_info, label)
     entries: list[dict[str, Any]] = []
     total = 0
-    paths = [path, *sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix())]
+    if stat.S_ISDIR(root_info.st_mode):
+        paths = [path, *sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix())]
+    else:
+        paths = [path]
     if len(paths) > CLEANUP_MAX_OBJECTS:
         fail(f"{label} exceeds cleanup object bound")
     for item in paths:
@@ -1782,10 +1792,14 @@ def validate_cleanup_tree_partial(path: Path, expected: dict[str, Any], label: s
     records = cleanup_snapshot_records(expected, label)
     if not path.exists():
         return
-    actual_paths = [
-        path,
-        *sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()),
-    ]
+    root_info = path.lstat()
+    if stat.S_ISDIR(root_info.st_mode):
+        actual_paths = [
+            path,
+            *sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()),
+        ]
+    else:
+        actual_paths = [path]
     for item in actual_paths:
         relative = "." if item == path else item.relative_to(path).as_posix()
         if relative not in records:
@@ -1814,16 +1828,70 @@ def validate_cleanup_source_policy(entry: dict[str, Any], label: str) -> None:
     purpose = entry["purpose"]
     source_anchor = entry["source_anchor"]
     source_relative = entry["source_relative"]
+    source_kind = entry["source_kind"]
     if purpose == "software-current":
         if (
             source_anchor != "target"
             or source_relative != f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}"
+            or source_kind != "directory"
         ):
             fail(f"{label} software cleanup source mismatch")
         if not entry["tombstone_relative"].startswith(f"{CLEANUP_TOMBSTONES_NAME}/{purpose}."):
             fail(f"{label} software cleanup tombstone mismatch")
         return
+    if purpose == "software-entrypoint":
+        if (
+            source_anchor != "target"
+            or source_relative != software_entrypoint_relative().as_posix()
+            or source_kind != "file"
+        ):
+            fail(f"{label} software entrypoint cleanup source mismatch")
+        if not entry["tombstone_relative"].startswith(f"{CLEANUP_TOMBSTONES_NAME}/{purpose}."):
+            fail(f"{label} software entrypoint cleanup tombstone mismatch")
+        return
+    if purpose == "software-stamp":
+        if (
+            source_anchor != "target"
+            or source_relative != SOFTWARE_STAMP_NAME
+            or source_kind != "file"
+        ):
+            fail(f"{label} software stamp cleanup source mismatch")
+        if not entry["tombstone_relative"].startswith(f"{CLEANUP_TOMBSTONES_NAME}/{purpose}."):
+            fail(f"{label} software stamp cleanup tombstone mismatch")
+        return
     fail(f"{label} cleanup purpose is unsupported")
+
+
+def validate_cleanup_replacement_policy(replacement: dict[str, Any], label: str) -> None:
+    purpose = replacement["purpose"]
+    source_anchor = replacement["source_anchor"]
+    source_relative = replacement["source_relative"]
+    source_kind = replacement["source_kind"]
+    if purpose == "software-current":
+        if (
+            source_anchor != "target"
+            or source_relative != f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}"
+            or source_kind != "directory"
+        ):
+            fail(f"{label} software replacement source mismatch")
+        return
+    if purpose == "software-entrypoint":
+        if (
+            source_anchor != "target"
+            or source_relative != software_entrypoint_relative().as_posix()
+            or source_kind != "file"
+        ):
+            fail(f"{label} software entrypoint replacement source mismatch")
+        return
+    if purpose == "software-stamp":
+        if (
+            source_anchor != "target"
+            or source_relative != SOFTWARE_STAMP_NAME
+            or source_kind != "file"
+        ):
+            fail(f"{label} software stamp replacement source mismatch")
+        return
+    fail(f"{label} cleanup replacement purpose is unsupported")
 
 
 def cleanup_entry(
@@ -1835,11 +1903,14 @@ def cleanup_entry(
     tombstone_relative: str,
     snapshot: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    root_kind = cleanup_snapshot_records(snapshot, f"cleanup source {purpose}")["."].get("kind")
+    if root_kind not in {"directory", "file"}:
+        fail(f"cleanup source {purpose} kind is unsupported")
+    entry = {
         "purpose": purpose,
         "source_anchor": source_anchor,
         "source_relative": source_relative,
-        "source_kind": "directory",
+        "source_kind": root_kind,
         "source_parent": cleanup_parent_identity(
             anchored_path(target, source_anchor, source_relative).parent,
             "cleanup source parent",
@@ -1852,12 +1923,58 @@ def cleanup_entry(
         ),
         "snapshot": snapshot,
     }
+    validate_cleanup_source_policy(entry, "cleanup source")
+    return entry
 
 
-def cleanup_document(target: Path, *, state: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
+def cleanup_entries_for_pending(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for entry in entries:
+        pending_entry = dict(entry)
+        pending_entry.pop("replacement", None)
+        result.append(pending_entry)
+    return result
+
+
+def cleanup_replacement(
+    target: Path,
+    *,
+    purpose: str,
+    source_anchor: str,
+    source_relative: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    root_kind = cleanup_snapshot_records(snapshot, f"cleanup replacement {purpose}")["."].get(
+        "kind"
+    )
+    if root_kind not in {"directory", "file"}:
+        fail(f"cleanup replacement {purpose} kind is unsupported")
+    source = anchored_path(target, source_anchor, source_relative)
+    replacement = {
+        "purpose": purpose,
+        "source_anchor": source_anchor,
+        "source_relative": source_relative,
+        "source_kind": root_kind,
+        "source_parent": cleanup_parent_identity(source.parent, "cleanup replacement parent"),
+        "snapshot": snapshot,
+    }
+    validate_cleanup_replacement_policy(replacement, "cleanup replacement")
+    return replacement
+
+
+def cleanup_document(
+    target: Path,
+    *,
+    state: str,
+    entries: list[dict[str, Any]],
+    replacements: list[dict[str, Any]] | None = None,
+    restore_parents: dict[str, dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
     if len(entries) > CLEANUP_MAX_ENTRIES:
         fail("cleanup journal has too many entries")
-    return {
+    if replacements is not None and len(replacements) > CLEANUP_MAX_ENTRIES:
+        fail("cleanup intent has too many replacements")
+    document: dict[str, Any] = {
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
@@ -1866,31 +1983,35 @@ def cleanup_document(target: Path, *, state: str, entries: list[dict[str, Any]])
         "cleanup_anchor": CLEANUP_DIR_NAME,
         "entries": entries,
     }
+    if state == "intent":
+        document["replacements"] = replacements or []
+        document["restore_parents"] = restore_parents or {}
+    return document
 
 
 def validate_cleanup_document(
     target: Path, document: dict[str, Any], label: str
 ) -> list[dict[str, Any]]:
-    require_exact_keys(
-        document,
-        {
-            "schema_version",
-            "product_name",
-            "build_version",
-            "canonical_target",
-            "state",
-            "cleanup_anchor",
-            "entries",
-        },
-        label,
-    )
+    state = document.get("state")
+    document_keys = {
+        "schema_version",
+        "product_name",
+        "build_version",
+        "canonical_target",
+        "state",
+        "cleanup_anchor",
+        "entries",
+    }
+    if state == "intent":
+        document_keys.update({"replacements", "restore_parents"})
+    require_exact_keys(document, document_keys, label)
     if document["schema_version"] != 1 or document["product_name"] != PRODUCT_NAME:
         fail(f"{label} identity mismatch")
     if document["canonical_target"] != str(target):
         fail(f"{label} target mismatch")
     if document["cleanup_anchor"] != CLEANUP_DIR_NAME:
         fail(f"{label} cleanup anchor mismatch")
-    if document["state"] not in {"intent", "pending"}:
+    if state not in {"intent", "pending"}:
         fail(f"{label} state is invalid")
     entries = document["entries"]
     if not isinstance(entries, list) or len(entries) > CLEANUP_MAX_ENTRIES:
@@ -1899,22 +2020,19 @@ def validate_cleanup_document(
     for entry in entries:
         if not isinstance(entry, dict):
             fail(f"{label} entry must be an object")
-        require_exact_keys(
-            entry,
-            {
-                "purpose",
-                "source_anchor",
-                "source_relative",
-                "source_kind",
-                "source_parent",
-                "tombstone_anchor",
-                "tombstone_relative",
-                "tombstone_parent",
-                "snapshot",
-            },
-            f"{label} entry",
-        )
-        if entry["source_kind"] != "directory":
+        entry_keys = {
+            "purpose",
+            "source_anchor",
+            "source_relative",
+            "source_kind",
+            "source_parent",
+            "tombstone_anchor",
+            "tombstone_relative",
+            "tombstone_parent",
+            "snapshot",
+        }
+        require_exact_keys(entry, entry_keys, f"{label} entry")
+        if entry["source_kind"] not in {"directory", "file"}:
             fail(f"{label} entry source kind is unsupported")
         if entry["source_anchor"] not in {"target", "backup_pool"}:
             fail(f"{label} entry source anchor is invalid")
@@ -1947,6 +2065,69 @@ def validate_cleanup_document(
             fail(f"{label} entry snapshot schema is invalid")
         if snapshot["object_count"] != len(snapshot["objects"]):
             fail(f"{label} entry object count mismatch")
+        root_record = cleanup_snapshot_records(snapshot, f"{label} entry snapshot")["."]
+        if root_record.get("kind") != entry["source_kind"]:
+            fail(f"{label} entry source kind does not match snapshot")
+    replacements = document.get("replacements", [])
+    if state == "pending" and replacements:
+        fail(f"{label} pending document must not contain replacement metadata")
+    if not isinstance(replacements, list) or len(replacements) > CLEANUP_MAX_ENTRIES:
+        fail(f"{label} replacements are invalid")
+    for replacement in replacements:
+        if not isinstance(replacement, dict):
+            fail(f"{label} replacement must be an object")
+        require_exact_keys(
+            replacement,
+            {"purpose", "source_anchor", "source_relative", "source_kind", "source_parent", "snapshot"},
+            f"{label} replacement",
+        )
+        if replacement["source_kind"] not in {"directory", "file"}:
+            fail(f"{label} replacement source kind is unsupported")
+        if replacement["source_anchor"] != "target":
+            fail(f"{label} replacement source anchor is invalid")
+        bounded_relative(replacement["source_relative"], f"{label} replacement source_relative")
+        source_parent = replacement["source_parent"]
+        if not isinstance(source_parent, dict) or set(source_parent) != {
+            "kind",
+            "uid",
+            "mode",
+            "dev",
+            "ino",
+        }:
+            fail(f"{label} replacement source_parent schema is invalid")
+        replacement_snapshot = replacement["snapshot"]
+        if not isinstance(replacement_snapshot, dict) or set(replacement_snapshot) != {
+            "objects",
+            "object_count",
+            "byte_count",
+        }:
+            fail(f"{label} replacement snapshot schema is invalid")
+        replacement_root = cleanup_snapshot_records(
+            replacement_snapshot, f"{label} replacement snapshot"
+        )["."]
+        if replacement_root.get("kind") != replacement["source_kind"]:
+            fail(f"{label} replacement source kind does not match snapshot")
+        validate_cleanup_replacement_policy(replacement, label)
+    restore_parents = document.get("restore_parents", {})
+    if state == "pending" and restore_parents:
+        fail(f"{label} pending document must not contain restore parent metadata")
+    if not isinstance(restore_parents, dict) or len(restore_parents) > CLEANUP_MAX_ENTRIES + 4:
+        fail(f"{label} restore parent metadata is invalid")
+    for relative, metadata in restore_parents.items():
+        if not isinstance(relative, str):
+            fail(f"{label} restore parent path is invalid")
+        bounded_relative(relative, f"{label} restore parent path")
+        if metadata is None:
+            continue
+        if not isinstance(metadata, dict) or set(metadata) != {
+            "mode",
+            "uid",
+            "dev",
+            "ino",
+            "atime_ns",
+            "mtime_ns",
+        }:
+            fail(f"{label} restore parent metadata schema is invalid")
     return entries
 
 
@@ -2152,82 +2333,215 @@ def move_directory_for_cleanup(
     source_anchor: str,
     source_relative: str,
 ) -> dict[str, Any]:
+    entries = prepare_cleanup_intent(
+        target,
+        [
+            {
+                "purpose": purpose,
+                "source_anchor": source_anchor,
+                "source_relative": source_relative,
+            }
+        ],
+        replacements=[],
+        restore_parents={},
+    )
+    move_cleanup_sources_to_tombstones(target, entries)
+    return entries[0]
+
+
+def prepare_cleanup_intent(
+    target: Path,
+    source_specs: list[dict[str, str]],
+    *,
+    replacements: list[dict[str, Any]],
+    restore_parents: dict[str, dict[str, Any] | None],
+) -> list[dict[str, Any]]:
     cleanup_root = cleanup_parent(target)
     tombstones = cleanup_tombstones(target)
     ensure_directory(cleanup_root)
     ensure_directory(tombstones)
-    source = anchored_path(target, source_anchor, source_relative)
-    snapshot = snapshot_cleanup_tree(source, f"cleanup source {purpose}")
-    tombstone_name = f"{purpose}.{os.getpid()}.{time.monotonic_ns():x}"
-    tombstone_relative = f"{CLEANUP_TOMBSTONES_NAME}/{tombstone_name}"
-    tombstone = cleanup_root / tombstone_relative
-    entry = cleanup_entry(
-        target,
-        purpose=purpose,
-        source_anchor=source_anchor,
-        source_relative=source_relative,
-        tombstone_relative=tombstone_relative,
-        snapshot=snapshot,
-    )
+    entries: list[dict[str, Any]] = []
+    for spec in source_specs:
+        purpose = spec["purpose"]
+        source_anchor = spec["source_anchor"]
+        source_relative = spec["source_relative"]
+        source = anchored_path(target, source_anchor, source_relative)
+        source_info = stat_optional(source, f"cleanup source {purpose}")
+        if source_info is None:
+            continue
+        if stat.S_ISLNK(source_info.st_mode):
+            fail(f"cleanup source {purpose} must not be a symlink")
+        snapshot = snapshot_cleanup_tree(source, f"cleanup source {purpose}")
+        tombstone_name = f"{purpose}.{os.getpid()}.{time.monotonic_ns():x}"
+        tombstone_relative = f"{CLEANUP_TOMBSTONES_NAME}/{tombstone_name}"
+        entry = cleanup_entry(
+            target,
+            purpose=purpose,
+            source_anchor=source_anchor,
+            source_relative=source_relative,
+            tombstone_relative=tombstone_relative,
+            snapshot=snapshot,
+        )
+        entries.append(entry)
+    if not entries and not replacements:
+        return []
     publish_json_no_replace(
         cleanup_intent_path(target),
-        cleanup_document(target, state="intent", entries=[entry]),
+        cleanup_document(
+            target,
+            state="intent",
+            entries=entries,
+            replacements=replacements,
+            restore_parents=restore_parents,
+        ),
         "intent",
     )
-    validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
-    validate_cleanup_parent_identity(
-        tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
-    )
-    source.rename(tombstone)
-    lifecycle_hook(f"cleanup.{purpose}.source.move.after")
-    fsync_directory(source.parent, "cleanup source parent")
-    lifecycle_hook(f"cleanup.{purpose}.source.parent.fsync")
-    fsync_directory(tombstone.parent, "cleanup tombstone parent")
-    lifecycle_hook(f"cleanup.{purpose}.tombstone.parent.fsync")
-    validate_cleanup_tree(tombstone, snapshot, f"cleanup tombstone {purpose}")
-    return entry
+    return entries
 
 
-def recover_cleanup_intent(target: Path) -> None:
-    intent = read_cleanup_document(cleanup_intent_path(target), target, "cleanup intent")
-    if intent is None:
-        return
-    entries = validate_cleanup_document(target, intent, "cleanup intent")
-    if len(entries) != 1:
-        fail("cleanup intent recovery supports exactly one entry")
-    entry = entries[0]
-    source = anchored_path(target, entry["source_anchor"], entry["source_relative"])
-    tombstone = anchored_path(target, entry["tombstone_anchor"], entry["tombstone_relative"])
-    source_info = stat_optional(source, "cleanup intent source")
-    tombstone_info = stat_optional(tombstone, "cleanup intent tombstone")
-    if source_info is not None and tombstone_info is None:
-        validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
-        delete_file(cleanup_intent_path(target))
-        fsync_directory(cleanup_parent(target), "cleanup parent")
-        return
-    if source_info is not None and tombstone_info is not None:
+def move_cleanup_sources_to_tombstones(target: Path, entries: list[dict[str, Any]]) -> None:
+    for entry in entries:
+        purpose = entry["purpose"]
+        source = anchored_path(target, entry["source_anchor"], entry["source_relative"])
+        tombstone = anchored_path(target, entry["tombstone_anchor"], entry["tombstone_relative"])
         validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
         validate_cleanup_parent_identity(
             tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
         )
-        validate_cleanup_tree(tombstone, entry["snapshot"], "cleanup intent tombstone")
-        publish_cleanup_pending(target, entries)
-        return
-    if source_info is None and tombstone_info is not None:
-        validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
+        source.rename(tombstone)
+        lifecycle_hook(f"cleanup.{purpose}.source.move.after")
+        fsync_directory(source.parent, "cleanup source parent")
+        lifecycle_hook(f"cleanup.{purpose}.source.parent.fsync")
+        fsync_directory(tombstone.parent, "cleanup tombstone parent")
+        lifecycle_hook(f"cleanup.{purpose}.tombstone.parent.fsync")
+        validate_cleanup_tree(tombstone, entry["snapshot"], f"cleanup tombstone {purpose}")
+
+
+def cleanup_path_matches(path: Path, expected: dict[str, Any], label: str) -> bool:
+    try:
+        validate_cleanup_tree(path, expected, label)
+    except PiSetupError:
+        return False
+    return True
+
+
+def cleanup_replacements_present(
+    target: Path, replacements: list[dict[str, Any]]
+) -> bool:
+    for replacement in replacements:
+        source = anchored_path(
+            target, replacement["source_anchor"], replacement["source_relative"]
+        )
+        if stat_optional(source, f"cleanup replacement {replacement['purpose']}") is None:
+            return False
+        validate_cleanup_parent_identity(
+            source.parent, replacement["source_parent"], "cleanup replacement"
+        )
+        validate_cleanup_tree(
+            source, replacement["snapshot"], f"cleanup replacement {replacement['purpose']}"
+        )
+    return True
+
+
+def desired_software_state_is_current(
+    target: Path, replacements: list[dict[str, Any]]
+) -> bool:
+    if not replacements or not cleanup_replacements_present(target, replacements):
+        return False
+    try:
+        status = software_status_payload(target, validate_cleanup=False)
+    except PiSetupError:
+        return False
+    return bool(status.get("current"))
+
+
+def delete_cleanup_replacements(target: Path, replacements: list[dict[str, Any]]) -> None:
+    for replacement in reversed(replacements):
+        source = anchored_path(
+            target, replacement["source_anchor"], replacement["source_relative"]
+        )
+        if stat_optional(source, f"cleanup replacement {replacement['purpose']}") is None:
+            continue
+        validate_cleanup_parent_identity(
+            source.parent, replacement["source_parent"], "cleanup replacement"
+        )
+        delete_cleanup_tree(
+            source,
+            replacement["snapshot"],
+            f"cleanup replacement {replacement['purpose']}",
+        )
+
+
+def restore_cleanup_entries_from_tombstones(target: Path, entries: list[dict[str, Any]]) -> None:
+    for entry in reversed(entries):
+        source = anchored_path(target, entry["source_anchor"], entry["source_relative"])
+        tombstone = anchored_path(target, entry["tombstone_anchor"], entry["tombstone_relative"])
+        source_info = stat_optional(source, "cleanup intent source")
+        tombstone_info = stat_optional(tombstone, "cleanup intent tombstone")
+        if tombstone_info is None:
+            if source_info is None:
+                fail("cleanup intent is incoherent")
+            validate_cleanup_parent_identity(
+                source.parent, entry["source_parent"], "cleanup source"
+            )
+            validate_cleanup_tree(source, entry["snapshot"], "cleanup restored source")
+            continue
         validate_cleanup_parent_identity(
             tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
         )
         validate_cleanup_tree(tombstone, entry["snapshot"], "cleanup intent tombstone")
-        ensure_directory(source.parent)
+        if source_info is not None:
+            if cleanup_path_matches(source, entry["snapshot"], "cleanup restored source"):
+                fail("cleanup intent contains duplicate restored source and tombstone")
+            fail("cleanup intent source is occupied by an unknown object")
+        validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
         tombstone.rename(source)
         fsync_directory(source.parent, "cleanup source parent")
         fsync_directory(tombstone.parent, "cleanup tombstone parent")
         validate_cleanup_tree(source, entry["snapshot"], "cleanup restored source")
+
+
+def restore_cleanup_parents(
+    target: Path, restore_parents: dict[str, dict[str, Any] | None]
+) -> None:
+    for relative, metadata in sorted(
+        restore_parents.items(), key=lambda item: len(Path(item[0]).parts), reverse=True
+    ):
+        path = target / bounded_relative(relative, "cleanup restore parent path")
+        restore_directory_metadata(path, metadata, f"cleanup restore parent {relative}")
+
+
+def recover_cleanup_intent(target: Path) -> bool:
+    intent = read_cleanup_document(cleanup_intent_path(target), target, "cleanup intent")
+    if intent is None:
+        return False
+    entries = validate_cleanup_document(target, intent, "cleanup intent")
+    replacements = intent.get("replacements", [])
+    restore_parents = intent.get("restore_parents", {})
+    if desired_software_state_is_current(target, replacements):
+        if entries:
+            publish_cleanup_pending(target, cleanup_entries_for_pending(entries))
+        else:
+            delete_file(cleanup_intent_path(target))
+            fsync_directory(cleanup_parent(target), "cleanup parent")
+        return True
+    delete_cleanup_replacements(target, replacements)
+    restore_cleanup_entries_from_tombstones(target, entries)
+    restore_cleanup_parents(target, restore_parents)
+    try:
         delete_file(cleanup_intent_path(target))
         fsync_directory(cleanup_parent(target), "cleanup parent")
-        return
-    fail("cleanup intent is incoherent")
+        with contextlib.suppress(OSError):
+            cleanup_tombstones(target).rmdir()
+            fsync_directory(cleanup_parent(target), "cleanup parent")
+        with contextlib.suppress(OSError):
+            cleanup_parent(target).rmdir()
+            fsync_directory(target, "target")
+    except BaseException:
+        if stat_optional(cleanup_intent_path(target), "cleanup intent") is not None:
+            raise
+        fsync_directory(cleanup_parent(target), "cleanup parent")
+    return False
 
 
 def delete_cleanup_tree(path: Path, expected: dict[str, Any], label: str) -> None:
@@ -2992,8 +3306,12 @@ def software_stamp_path(target: Path) -> Path:
     return target / SOFTWARE_STAMP_NAME
 
 
+def software_entrypoint_relative() -> Path:
+    return Path("bin") / PI_COMMAND
+
+
 def software_entrypoint(target: Path) -> Path:
-    return target / "bin" / PI_COMMAND
+    return target / software_entrypoint_relative()
 
 
 def package_manifest_path(root: Path) -> Path:
@@ -4014,37 +4332,6 @@ def software_precondition_state(target: Path) -> dict[str, Any]:
         }
 
 
-def snapshot_software_file(
-    path: Path, label: str, max_bytes: int
-) -> tuple[bytes | None, int | None]:
-    info = stat_optional(path, label)
-    if info is None:
-        return None, None
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        fail(f"{label} must be a regular non-hardlinked file")
-    content = read_regular_file(path, label, max_bytes=max_bytes)
-    return content, stat.S_IMODE(info.st_mode)
-
-
-def restore_software_file(
-    path: Path,
-    target: Path,
-    data: bytes | None,
-    mode: int | None,
-    *,
-    remove_empty_parent: bool,
-) -> None:
-    if data is None:
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        if remove_empty_parent:
-            with contextlib.suppress(OSError):
-                path.parent.rmdir()
-        return
-    ensure_software_parent(path, target)
-    atomic_write_private(path, data, mode or OWNER_FILE_MODE, label="software-rollback-file")
-
-
 def remove_created_target_if_empty(target: Path) -> None:
     for candidate in (software_stamp_path(target), software_entrypoint(target)):
         with contextlib.suppress(FileNotFoundError):
@@ -4063,6 +4350,9 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
     with target_lock(target) as target:
         target_parent_state = directory_metadata(target.parent, "target parent")
         created_target = stat_optional(target, "target") is None
+        target_state = directory_metadata(target, "target")
+        software_root_state = directory_metadata(software_root(target), "software root")
+        entrypoint_parent_state = directory_metadata(software_entrypoint(target).parent, "bin")
         try:
             if not created_target and drain_cleanup(target):
                 fail("cleanup is still pending")
@@ -4133,89 +4423,153 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                     os.chmod(target, OWNER_DIRECTORY_MODE)
                 else:
                     require_safe_partial_directory(target, "target")
-                software_root_was_present = (
-                    stat_optional(software_root(target), "software root") is not None
-                )
-                entrypoint_parent_was_present = (
-                    stat_optional(software_entrypoint(target).parent, "bin") is not None
-                )
                 software_root(target).mkdir(mode=OWNER_DIRECTORY_MODE, exist_ok=True)
                 os.chmod(software_root(target), OWNER_DIRECTORY_MODE)
+                ensure_software_parent(software_entrypoint(target), target)
                 current = software_current(target)
-                previous_entrypoint, previous_entrypoint_mode = snapshot_software_file(
-                    software_entrypoint(target),
-                    "Pi entrypoint",
-                    SOFTWARE_FILE_MAX_BYTES,
+                entrypoint_content = node_wrapper_content(
+                    node_runtime["path"], package_binary_path(current)
                 )
-                previous_stamp, previous_stamp_mode = snapshot_software_file(
-                    software_stamp_path(target), SOFTWARE_STAMP_NAME, METADATA_MAX_BYTES
+                entrypoint_digest = sha256_bytes(entrypoint_content)
+                stamp = software_stamp(
+                    target,
+                    entrypoint_digest=entrypoint_digest,
+                    installed_tree_digest=installed_tree_digest,
+                    installed_tree_path_count=installed_tree_path_count,
+                    installed_tree_bytes=installed_tree_bytes,
+                    package_binary_digest=package_binary_digest,
+                    version_probe_digest=version_probe_digest,
+                    node_runtime=node_runtime,
+                    prepublish_only=prepublish_only,
                 )
-                cleanup_entries: list[dict[str, Any]] = []
-                new_current_installed = False
-                try:
-                    current_info = stat_optional(current, "current software tree")
-                    if current_info is not None:
-                        if not stat.S_ISDIR(current_info.st_mode):
-                            fail("current software tree must be a directory")
-                        cleanup_entries.append(
-                            move_directory_for_cleanup(
-                                target,
-                                purpose="software-current",
-                                source_anchor="target",
-                                source_relative=f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}",
-                            )
-                        )
-                    stage_current.rename(current)
-                    new_current_installed = True
-                    entrypoint_digest = write_target_entrypoint(target, node_runtime)
-                    stamp = software_stamp(
+                staged_entrypoint_file = stage_root / "staged-entrypoint"
+                staged_stamp_file = stage_root / "staged-stamp"
+                atomic_write_private(
+                    staged_entrypoint_file,
+                    entrypoint_content,
+                    0o700,
+                    label="staged-software-entrypoint",
+                )
+                atomic_write_private(
+                    staged_stamp_file,
+                    canonical_json(stamp),
+                    OWNER_FILE_MODE,
+                    label="staged-software-stamp",
+                )
+                replacements = [
+                    cleanup_replacement(
                         target,
-                        entrypoint_digest=entrypoint_digest,
-                        installed_tree_digest=installed_tree_digest,
-                        installed_tree_path_count=installed_tree_path_count,
-                        installed_tree_bytes=installed_tree_bytes,
-                        package_binary_digest=package_binary_digest,
-                        version_probe_digest=version_probe_digest,
-                        node_runtime=node_runtime,
-                        prepublish_only=prepublish_only,
+                        purpose="software-current",
+                        source_anchor="target",
+                        source_relative=f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}",
+                        snapshot=snapshot_cleanup_tree(
+                            stage_current, "cleanup replacement software-current"
+                        ),
+                    ),
+                    cleanup_replacement(
+                        target,
+                        purpose="software-entrypoint",
+                        source_anchor="target",
+                        source_relative=software_entrypoint_relative().as_posix(),
+                        snapshot=snapshot_cleanup_tree(
+                            staged_entrypoint_file,
+                            "cleanup replacement software-entrypoint",
+                        ),
+                    ),
+                    cleanup_replacement(
+                        target,
+                        purpose="software-stamp",
+                        source_anchor="target",
+                        source_relative=SOFTWARE_STAMP_NAME,
+                        snapshot=snapshot_cleanup_tree(
+                            staged_stamp_file, "cleanup replacement software-stamp"
+                        ),
+                    ),
+                ]
+                restore_parents = {
+                    SOFTWARE_DIR_NAME: software_root_state,
+                    software_entrypoint_relative().parent.as_posix(): entrypoint_parent_state,
+                }
+                cleanup_entries: list[dict[str, Any]] = []
+                try:
+                    cleanup_entries = prepare_cleanup_intent(
+                        target,
+                        [
+                            {
+                                "purpose": "software-current",
+                                "source_anchor": "target",
+                                "source_relative": f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}",
+                            },
+                            {
+                                "purpose": "software-entrypoint",
+                                "source_anchor": "target",
+                                "source_relative": software_entrypoint_relative().as_posix(),
+                            },
+                            {
+                                "purpose": "software-stamp",
+                                "source_anchor": "target",
+                                "source_relative": SOFTWARE_STAMP_NAME,
+                            },
+                        ],
+                        replacements=replacements,
+                        restore_parents=restore_parents,
                     )
-                    atomic_write_private(
+                    move_cleanup_sources_to_tombstones(target, cleanup_entries)
+                    stage_current.rename(current)
+                    lifecycle_hook("software.current.rename.after")
+                    fsync_directory(current.parent, "current software parent")
+                    validate_cleanup_tree(
+                        current, replacements[0]["snapshot"], "software current replacement"
+                    )
+                    staged_entrypoint_file.rename(software_entrypoint(target))
+                    lifecycle_hook("software.entrypoint.rename.after")
+                    fsync_directory(software_entrypoint(target).parent, "software entrypoint parent")
+                    validate_cleanup_tree(
+                        software_entrypoint(target),
+                        replacements[1]["snapshot"],
+                        "software entrypoint replacement",
+                    )
+                    staged_stamp_file.rename(software_stamp_path(target))
+                    lifecycle_hook("software.stamp.rename.after")
+                    fsync_directory(target, "software stamp parent")
+                    validate_cleanup_tree(
                         software_stamp_path(target),
-                        canonical_json(stamp),
-                        OWNER_FILE_MODE,
-                        label="software-stamp",
+                        replacements[2]["snapshot"],
+                        "software stamp replacement",
                     )
                     verified = software_status_payload(target, validate_cleanup=False)
                     if not verified["current"]:
                         fail(
                             f"installed software failed status verification: {', '.join(verified['drift'])}"
                         )
+                    cleanup_pending = False
+                    if cleanup_entries or replacements:
+                        cleanup_pending = publish_cleanup_pending(
+                            target, cleanup_entries_for_pending(cleanup_entries)
+                        )
                 except BaseException:
-                    if new_current_installed:
-                        delete_tree(current)
-                    if cleanup_entries:
-                        recover_cleanup_intent(target)
-                    restore_software_file(
-                        software_entrypoint(target),
-                        target,
-                        previous_entrypoint,
-                        previous_entrypoint_mode,
-                        remove_empty_parent=not entrypoint_parent_was_present,
+                    completed = recover_cleanup_intent(target)
+                    if completed:
+                        cleanup = cleanup_state(target)
+                        return {
+                            "changed": True,
+                            "cleanup_pending": cleanup["cleanup_pending"],
+                            "package": PI_PACKAGE_NAME,
+                            "version": PI_PACKAGE_VERSION,
+                            "command": PI_COMMAND,
+                            "executable": str(software_entrypoint(target)),
+                            "installed_tree": str(software_current(target)),
+                            "target": canonical_target_readonly(target),
+                        }
+                    restore_directory_metadata(
+                        software_entrypoint(target).parent,
+                        entrypoint_parent_state,
+                        "bin",
                     )
-                    restore_software_file(
-                        software_stamp_path(target),
-                        target,
-                        previous_stamp,
-                        previous_stamp_mode,
-                        remove_empty_parent=False,
+                    restore_directory_metadata(
+                        software_root(target), software_root_state, "software root"
                     )
-                    if not software_root_was_present:
-                        with contextlib.suppress(OSError):
-                            software_root(target).rmdir()
                     raise
-                cleanup_pending = False
-                if cleanup_entries:
-                    cleanup_pending = publish_cleanup_pending(target, cleanup_entries)
                 return {
                     "changed": True,
                     "cleanup_pending": cleanup_pending,
@@ -4229,6 +4583,9 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
         except BaseException:
             if created_target:
                 remove_created_target_if_empty(target)
+                restore_directory_metadata(target.parent, target_parent_state, "target parent")
+            else:
+                restore_directory_metadata(target, target_state, "target")
                 restore_directory_metadata(target.parent, target_parent_state, "target parent")
             raise
 

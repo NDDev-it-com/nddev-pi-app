@@ -213,6 +213,12 @@
       "strategy": "object-preserving held managed files",
       "restores_original_file_identity": true,
       "backup_commit_after_desired_postcondition": true
+    },
+    "software_rollback": {
+      "strategy": "object-preserving cleanup intent replacements",
+      "restores_original_file_identity": true,
+      "prepare_intent_before_visible_replacement": true,
+      "committed_success_cleanup_pending": true
     }
   },
   "profiles": {
