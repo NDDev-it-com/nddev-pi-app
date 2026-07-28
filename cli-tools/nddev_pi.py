@@ -309,6 +309,16 @@ LAUNCH_BLOCKED_VALUE_FLAGS = {
     "--session-id": "session identity override",
     "--fork": "session fork override",
     "--session-dir": "session directory override",
+    "--workspace": "workspace override",
+    "--project": "project workspace override",
+    "--project-dir": "project workspace override",
+    "--project-directory": "project workspace override",
+    "--cwd": "working directory override",
+    "--workdir": "working directory override",
+    "--working-directory": "working directory override",
+    "--directory": "working directory override",
+    "--dir": "working directory override",
+    "-C": "working directory override",
     "--tools": "tool selection override",
     "-t": "tool selection override",
     "--exclude-tools": "tool selection override",
@@ -319,6 +329,9 @@ LAUNCH_BLOCKED_VALUE_FLAGS = {
     "--prompt-template": "prompt resource override",
     "--theme": "theme resource override",
 }
+LAUNCH_BLOCKED_ATTACHED_PREFIX_FLAGS = {
+    "-C": "working directory override",
+}
 
 
 class PiSetupError(Exception):
@@ -327,6 +340,12 @@ class PiSetupError(Exception):
 
 class RetryColdInspection(PiSetupError):
     """Discard an uncoordinated cold-read result and recompute it safely."""
+
+
+@dataclass(frozen=True)
+class LaunchWorkspace:
+    path: Path
+    source: str
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -811,6 +830,54 @@ def lexical_target(raw_target: str | None) -> Path:
     if not expanded.is_absolute():
         fail("--target must be an absolute path")
     return expanded
+
+
+def validate_launch_workspace(path: Path, label: str) -> Path:
+    if not path.is_absolute():
+        fail(f"{label} must be an absolute path")
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
+    if stat.S_ISLNK(before.st_mode):
+        fail(f"{label} must not be a symlink")
+    if not stat.S_ISDIR(before.st_mode):
+        fail(f"{label} must be a directory")
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    except OSError as exc:
+        fail(f"cannot resolve {label}: {exc}")
+    try:
+        after = resolved.lstat()
+    except FileNotFoundError:
+        fail(f"{label} disappeared while resolving")
+    except OSError as exc:
+        fail(f"cannot re-inspect {label}: {exc}")
+    if stat.S_ISLNK(after.st_mode) or not stat.S_ISDIR(after.st_mode):
+        fail(f"{label} resolved to an unsafe directory")
+    if identity_of(before) != identity_of(after):
+        fail(f"{label} changed while resolving")
+    if not os.access(resolved, os.R_OK | os.X_OK):
+        fail(f"{label} must be accessible")
+    return resolved
+
+
+def resolve_launch_workspace(raw_workspace: str | None) -> LaunchWorkspace:
+    if raw_workspace is None:
+        try:
+            captured = Path.cwd()
+        except OSError as exc:
+            fail(f"cannot capture current workspace: {exc}")
+        return LaunchWorkspace(
+            validate_launch_workspace(captured, "current working directory"),
+            "caller-cwd",
+        )
+    workspace = Path(raw_workspace)
+    return LaunchWorkspace(validate_launch_workspace(workspace, "--workspace"), "explicit")
 
 
 def canonical_target_under_lock(target: Path) -> Path:
@@ -5073,7 +5140,8 @@ def require_safe_launch_args(child_args: list[str]) -> None:
     while index < len(child_args):
         token = child_args[index]
         if token == "--":
-            return
+            index += 1
+            continue
         if (
             not first_non_option_checked
             and token
@@ -5088,6 +5156,9 @@ def require_safe_launch_args(child_args: list[str]) -> None:
         flag = token.split("=", 1)[0]
         if flag in LAUNCH_BLOCKED_VALUE_FLAGS:
             fail(f"launch argument {flag} is not allowed: {LAUNCH_BLOCKED_VALUE_FLAGS[flag]}")
+        for prefix, reason in LAUNCH_BLOCKED_ATTACHED_PREFIX_FLAGS.items():
+            if token.startswith(prefix) and token != prefix:
+                fail(f"launch argument {prefix} is not allowed: {reason}")
         index += 1
 
 
@@ -5127,14 +5198,17 @@ def prepare_launch_invocation(
     return [str(executable), *child_args], child_env
 
 
-def command_launch(target: Path, forwarded: list[str]) -> int:
+def command_launch(target: Path, raw_workspace: str | None, forwarded: list[str]) -> int:
+    workspace = resolve_launch_workspace(raw_workspace)
     with target_lock(target) as target:
         if drain_cleanup(target):
             fail("cleanup is still pending")
         command, child_env = prepare_launch_invocation(target, forwarded)
         lifecycle_hook("launch.before_spawn")
         try:
-            completed = subprocess.run(command, env=child_env, check=False)
+            completed = subprocess.run(
+                command, env=child_env, cwd=str(workspace.path), check=False
+            )
         except FileNotFoundError:
             fail("target-owned pi executable is missing")
         return completed.returncode
@@ -5166,6 +5240,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     launch_parser = subparsers.add_parser("launch")
     launch_parser.add_argument("--target")
+    launch_parser.add_argument("--workspace")
     launch_parser.add_argument("--json", action="store_true")
     launch_parser.add_argument("forwarded", nargs=argparse.REMAINDER)
 
@@ -5259,7 +5334,7 @@ def main(argv: list[str] | None = None) -> int:
             emit(command_remove(lexical_target(args.target)), json_enabled)
             return 0
         if args.command == "launch":
-            return command_launch(lexical_target(args.target), args.forwarded)
+            return command_launch(lexical_target(args.target), args.workspace, args.forwarded)
         if args.command == "software-plan":
             emit(software_plan(lexical_target(args.target)), json_enabled)
             return 0

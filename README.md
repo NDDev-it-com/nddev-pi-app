@@ -27,7 +27,7 @@ python3 cli-tools/nddev_pi.py software-plan --target /absolute/pi-target
 python3 cli-tools/nddev_pi.py software-status --target /absolute/pi-target
 python3 cli-tools/nddev_pi.py software-install --target /absolute/pi-target
 python3 cli-tools/nddev_pi.py software-update --target /absolute/pi-target
-python3 cli-tools/nddev_pi.py launch --target /absolute/pi-target -- --help
+python3 cli-tools/nddev_pi.py launch --target /absolute/pi-target [--workspace /absolute/project] -- --help
 ```
 
 `software-install` uses Pi's reproducible npm package channel in an isolated
@@ -39,7 +39,12 @@ files named above.
 `HOME`, `XDG_*`, `TMPDIR`, `PATH`, `PI_CODING_AGENT_DIR`,
 `PI_CODING_AGENT_SESSION_DIR`, and `PI_PACKAGE_DIR`. Source-proven provider
 credential environment variables may be inherited by the child process only;
-they are not copied into target files.
+they are not copied into target files. The target is not the project workspace:
+when `--workspace` is omitted, launch captures the caller's current working
+directory once and passes it as the child process `cwd`. An explicit
+`--workspace` must be an absolute existing directory whose final component is
+not a symlink. Pi `0.82.1` does not expose a native workspace, project, or cwd
+flag, so the manager does not inject one and rejects forwarded scope overrides.
 
 ## Setup And Profiles
 

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import re
@@ -90,6 +92,24 @@ BYTE_VERIFICATION = {
     "verified_before_extract": True,
 }
 SUPPORTED_HOSTS = ["macos-arm64", "macos-x64", "ubuntu-glibc-arm64", "ubuntu-glibc-x64"]
+LAUNCH_WORKSPACE_REQUIREMENTS = [
+    "absolute",
+    "existing-directory",
+    "final-component-not-symlink",
+    "accessible",
+]
+LAUNCH_BLOCKED_SCOPE_OVERRIDES = [
+    "--workspace",
+    "--project",
+    "--project-dir",
+    "--project-directory",
+    "--cwd",
+    "--workdir",
+    "--working-directory",
+    "--directory",
+    "--dir",
+    "-C",
+]
 PACKAGE_ID_PATTERN = re.compile(r"@[A-Za-z0-9._-]+/pi-coding-agent")
 REPOSITORY_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9._-]+/pi\b")
 NDDEV_MODULE_PATTERN = re.compile(r"nddev-[a-z0-9-]+-app")
@@ -465,6 +485,222 @@ def validate_cleanup_metadata_behavior(errors: list[str]) -> None:
         sys.modules.pop(name, None)
 
 
+def validate_launch_workspace_behavior(errors: list[str]) -> None:
+    manager = ROOT / "cli-tools" / "nddev_pi.py"
+    name = "nddev_pi_public_validator_launch_workspace"
+    try:
+        spec = importlib.util.spec_from_file_location(name, manager)
+        if spec is None or spec.loader is None:
+            errors.append("cli-tools/nddev_pi.py: cannot load manager module spec")
+            return
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-launch-workspace.") as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            workspace = root / "workspace"
+            default_workspace = root / "default-workspace"
+            target.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            workspace.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            default_workspace.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            child = target / "bin" / "pi"
+            child.parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            child.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            child.chmod(0o700)
+            file_workspace = root / "not-a-directory"
+            file_workspace.write_text("not a directory", encoding="utf-8")
+            symlink_workspace = root / "workspace-link"
+            symlink_workspace.symlink_to(workspace, target_is_directory=True)
+
+            captures: list[dict[str, object]] = []
+
+            class FakeCompleted:
+                returncode = 37
+
+            class FakeTargetLock:
+                def __init__(self, locked_target: Path) -> None:
+                    self.locked_target = locked_target
+
+                def __enter__(self) -> Path:
+                    return self.locked_target
+
+                def __exit__(self, *_exc: object) -> bool:
+                    return False
+
+            def fake_target_lock(locked_target: Path, mutation: bool = True) -> FakeTargetLock:
+                _ = mutation
+                return FakeTargetLock(locked_target)
+
+            def fake_run(
+                command: list[str],
+                *,
+                env: dict[str, str] | None = None,
+                cwd: str | None = None,
+                check: bool = False,
+                **_kwargs: object,
+            ) -> FakeCompleted:
+                captures.append(
+                    {
+                        "command": list(command),
+                        "env": dict(env or {}),
+                        "cwd": cwd,
+                        "check": check,
+                    }
+                )
+                return FakeCompleted()
+
+            def invoke(argv: list[str]) -> int:
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    return module.main(argv)
+
+            originals = {
+                "target_lock": module.target_lock,
+                "drain_cleanup": module.drain_cleanup,
+                "require_clean_managed": module.require_clean_managed,
+                "software_status_payload": module.software_status_payload,
+                "read_software_stamp": module.read_software_stamp,
+                "read_current_settings": module.read_current_settings,
+                "subprocess_run": module.subprocess.run,
+            }
+            old_cwd = Path.cwd()
+            try:
+                module.target_lock = fake_target_lock
+                module.drain_cleanup = lambda _target: False
+                module.require_clean_managed = lambda _target: None
+                module.software_status_payload = lambda _target: {"current": True, "drift": []}
+                module.read_software_stamp = lambda _target: {
+                    "node_runtime": {"path": "/usr/bin/node"}
+                }
+                module.read_current_settings = lambda _target: {
+                    "nddev": {"launch_args": ["--offline", "--approve"]}
+                }
+                module.subprocess.run = fake_run
+
+                rc = invoke(
+                    [
+                        "launch",
+                        "--json",
+                        "--target",
+                        str(target),
+                        "--workspace",
+                        str(workspace),
+                        "--",
+                        "--help",
+                    ]
+                )
+                if rc != FakeCompleted.returncode or len(captures) != 1:
+                    errors.append("cli-tools/nddev_pi.py: explicit workspace launch did not spawn once")
+                    return
+                explicit_capture = captures[-1]
+                expected_command = [
+                    str(child),
+                    "--offline",
+                    "--approve",
+                    "--skill",
+                    str((target / "agent" / "skills" / "nddev-builder").resolve()),
+                    "--help",
+                ]
+                if explicit_capture["command"] != expected_command:
+                    errors.append("cli-tools/nddev_pi.py: launch argv is not manager-owned")
+                if explicit_capture["cwd"] != str(workspace.resolve()):
+                    errors.append("cli-tools/nddev_pi.py: explicit workspace cwd was not used")
+                env = explicit_capture["env"]
+                if not isinstance(env, dict):
+                    errors.append("cli-tools/nddev_pi.py: launch environment was not captured")
+                    return
+                expected_env = {
+                    "HOME": target / ".nddev-pi-runtime" / "home",
+                    "XDG_CONFIG_HOME": target / ".nddev-pi-runtime" / "xdg-config",
+                    "XDG_DATA_HOME": target / ".nddev-pi-runtime" / "xdg-data",
+                    "XDG_STATE_HOME": target / ".nddev-pi-runtime" / "xdg-state",
+                    "XDG_CACHE_HOME": target / ".nddev-pi-runtime" / "xdg-cache",
+                    "TMPDIR": target / ".nddev-pi-runtime" / "tmp",
+                    "PI_CODING_AGENT_DIR": target / "agent",
+                    "PI_CODING_AGENT_SESSION_DIR": target / "agent" / "sessions",
+                    "PI_PACKAGE_DIR": target / "agent" / "package-cache",
+                }
+                for key, expected_path in expected_env.items():
+                    if env.get(key) != str(expected_path.resolve()):
+                        errors.append(f"cli-tools/nddev_pi.py: launch env {key} is not target-owned")
+                if env.get("PI_OFFLINE") != "1" or env.get("PI_TELEMETRY") != "0":
+                    errors.append("cli-tools/nddev_pi.py: launch network/telemetry env drifted")
+
+                captures.clear()
+                os.chdir(default_workspace)
+                rc = invoke(["launch", "--json", "--target", str(target), "--", "--version"])
+                if rc != FakeCompleted.returncode or len(captures) != 1:
+                    errors.append("cli-tools/nddev_pi.py: default workspace launch did not spawn once")
+                    return
+                if captures[-1]["cwd"] != str(default_workspace.resolve()):
+                    errors.append("cli-tools/nddev_pi.py: caller cwd was not captured as workspace")
+                os.chdir(old_cwd)
+
+                invalid_workspaces = [
+                    ["--workspace", "relative"],
+                    ["--workspace", str(root / "missing")],
+                    ["--workspace", str(file_workspace)],
+                    ["--workspace", str(symlink_workspace)],
+                ]
+                for workspace_args in invalid_workspaces:
+                    captures.clear()
+                    rc = invoke(
+                        [
+                            "launch",
+                            "--json",
+                            "--target",
+                            str(target),
+                            *workspace_args,
+                            "--",
+                            "--help",
+                        ]
+                    )
+                    if rc != 2 or captures:
+                        errors.append(
+                            "cli-tools/nddev_pi.py: invalid workspace reached child spawn"
+                        )
+
+                forwarded_overrides = [
+                    ["--workspace=/tmp"],
+                    ["--project", "/tmp"],
+                    ["--cwd=/tmp"],
+                    ["-C/tmp"],
+                ]
+                for forwarded in forwarded_overrides:
+                    captures.clear()
+                    rc = invoke(
+                        [
+                            "launch",
+                            "--json",
+                            "--target",
+                            str(target),
+                            "--workspace",
+                            str(workspace),
+                            "--",
+                            *forwarded,
+                        ]
+                    )
+                    if rc != 2 or captures:
+                        errors.append(
+                            "cli-tools/nddev_pi.py: forwarded workspace override reached child spawn"
+                        )
+            finally:
+                os.chdir(old_cwd)
+                module.target_lock = originals["target_lock"]
+                module.drain_cleanup = originals["drain_cleanup"]
+                module.require_clean_managed = originals["require_clean_managed"]
+                module.software_status_payload = originals["software_status_payload"]
+                module.read_software_stamp = originals["read_software_stamp"]
+                module.read_current_settings = originals["read_current_settings"]
+                module.subprocess.run = originals["subprocess_run"]
+    except Exception as exc:  # pragma: no cover - validator reports instead of crashing
+        errors.append(f"cli-tools/nddev_pi.py: launch workspace behavior check failed: {exc}")
+    finally:
+        sys.modules.pop(name, None)
+
+
 def main() -> int:
     errors: list[str] = []
     version = load_json("build/version.json", errors)
@@ -478,6 +714,7 @@ def main() -> int:
     validate_external_anchor_recovery(errors)
     validate_external_anchor_behavior(errors)
     validate_cleanup_metadata_behavior(errors)
+    validate_launch_workspace_behavior(errors)
 
     version_text = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if version is not None:
@@ -525,6 +762,17 @@ def main() -> int:
             or runtime.get("provider_secret_inheritance") != "child-process-allowlist-only"
         ):
             errors.append("build/manifest.json: launch provider inheritance mismatch")
+        elif (
+            runtime.get("target_role") != "configuration-runtime-home"
+            or runtime.get("workspace_option") != "--workspace <absolute-existing-dir>"
+            or runtime.get("default_workspace_source") != "caller-cwd-captured-once"
+            or runtime.get("explicit_workspace_requirements") != LAUNCH_WORKSPACE_REQUIREMENTS
+            or runtime.get("child_cwd") != "resolved-workspace"
+            or runtime.get("native_workspace_argument_supported") is not False
+            or runtime.get("native_workspace_argument") is not None
+            or runtime.get("blocked_forwarded_scope_overrides") != LAUNCH_BLOCKED_SCOPE_OVERRIDES
+        ):
+            errors.append("build/manifest.json: launch workspace contract mismatch")
         software = manifest.get("software")
         if not isinstance(software, dict):
             errors.append("build/manifest.json: software contract is missing")
@@ -638,6 +886,19 @@ def main() -> int:
             or compatibility.get("ubuntu_version_floor") is not None
         ):
             errors.append("config/nddev-contract.json: supported host contract mismatch")
+        runtime = contract.get("runtime_launch")
+        if (
+            not isinstance(runtime, dict)
+            or runtime.get("target_role") != "configuration-runtime-home"
+            or runtime.get("workspace_option") != "--workspace <absolute-existing-dir>"
+            or runtime.get("default_workspace_source") != "caller-cwd-captured-once"
+            or runtime.get("explicit_workspace_requirements") != LAUNCH_WORKSPACE_REQUIREMENTS
+            or runtime.get("child_cwd") != "resolved-workspace"
+            or runtime.get("native_workspace_argument_supported") is not False
+            or runtime.get("native_workspace_argument") is not None
+            or runtime.get("blocked_forwarded_scope_overrides") != LAUNCH_BLOCKED_SCOPE_OVERRIDES
+        ):
+            errors.append("config/nddev-contract.json: launch workspace contract mismatch")
         safety = contract.get("safety", {})
         if (
             safety.get("backup_full_pool_behavior") != "fail-closed"
@@ -834,6 +1095,21 @@ def main() -> int:
         permission_model = baseline.get("permission_model", {})
         if permission_model.get("permission_popups") is not False:
             errors.append("references/pi-baseline.json: permission popups must be false")
+        launch_scope = baseline.get("launch_scope")
+        if (
+            not isinstance(launch_scope, dict)
+            or launch_scope.get("target_role") != "configuration-runtime-home"
+            or launch_scope.get("default_workspace_source") != "caller-cwd-captured-once"
+            or launch_scope.get("manager_workspace_option") != "--workspace <absolute-existing-dir>"
+            or launch_scope.get("explicit_workspace_requirements")
+            != LAUNCH_WORKSPACE_REQUIREMENTS
+            or launch_scope.get("child_cwd") != "resolved-workspace"
+            or launch_scope.get("native_workspace_argument_supported") is not False
+            or launch_scope.get("native_workspace_argument") is not None
+            or launch_scope.get("official_cli_grammar", {}).get("workspace_project_cwd_flags")
+            != []
+        ):
+            errors.append("references/pi-baseline.json: launch scope baseline mismatch")
 
     setup_ids: list[str] = []
     for setup_dir in sorted((ROOT / "setups").iterdir()):

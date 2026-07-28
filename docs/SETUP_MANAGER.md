@@ -12,6 +12,14 @@ absolute target. The target becomes the Pi runtime root for managed launches:
 - `TMPDIR=<target>/.nddev-pi-runtime/tmp`
 - `PATH=<target>/bin:<recorded-node-dir>:/usr/bin:/bin`
 
+The target is a configuration/runtime home, not the project workspace. Managed
+launch selects the workspace independently: `--workspace` must name an absolute
+existing directory whose final component is not a symlink, and omitting it
+captures the caller's current working directory once. The resolved workspace is
+passed as the child process `cwd`. Official Pi `0.82.1` CLI grammar does not
+provide a native workspace, project, or cwd flag, so the manager uses process
+`cwd` only and blocks forwarded scope overrides.
+
 The manager rejects relative targets, target symlinks, symlinked managed files,
 hard-linked managed files, and oversized managed metadata. Backups are stored in
 the target-bound sibling directory `.<target-name>.nddev-pi-backups` and are

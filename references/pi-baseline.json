@@ -36,6 +36,26 @@
     "install_docs": "https://pi.dev/docs/latest",
     "install_script": "https://pi.dev/install.sh"
   },
+  "launch_scope": {
+    "target_role": "configuration-runtime-home",
+    "default_workspace_source": "caller-cwd-captured-once",
+    "manager_workspace_option": "--workspace <absolute-existing-dir>",
+    "explicit_workspace_requirements": [
+      "absolute",
+      "existing-directory",
+      "final-component-not-symlink",
+      "accessible"
+    ],
+    "child_cwd": "resolved-workspace",
+    "native_workspace_argument_supported": false,
+    "native_workspace_argument": null,
+    "official_cli_grammar": {
+      "package": "@earendil-works/pi-coding-agent@0.82.1",
+      "parser": "dist/cli/args.js",
+      "documentation": "https://pi.dev/docs/latest/usage",
+      "workspace_project_cwd_flags": []
+    }
+  },
   "manager_installation": {
     "tool": "npm",
     "argv": [
