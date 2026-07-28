@@ -243,6 +243,9 @@
       "launch"
     ],
     "max_backups": 10,
+    "backup_envelope_schema": 2,
+    "backup_records_sizes_and_digests": true,
+    "backup_exact_managed_path_set": true,
     "backup_full_pool_behavior": "fail-closed",
     "missing_target_argument_rejected": true,
     "new_target_mode": "0700",
@@ -265,6 +268,11 @@
       "read_only_repairs": false,
       "mutation_drains_before_active_change": true,
       "absolute_paths_in_documents": false
+    },
+    "setup_rollback": {
+      "strategy": "object-preserving held managed files",
+      "restores_original_file_identity": true,
+      "backup_commit_after_desired_postcondition": true
     }
   }
 }

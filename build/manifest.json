@@ -50,6 +50,12 @@
   "backup_policy": {
     "canonical_target_bound": true,
     "envelope": "NDDEV-PI-BACKUP.json",
+    "envelope_schema": 2,
+    "file_metadata": [
+      "size",
+      "sha256"
+    ],
+    "exact_managed_path_set": true,
     "location": "sibling .<target-name>.nddev-pi-backups",
     "slots": 10,
     "full_pool_behavior": "fail-closed"
@@ -201,6 +207,11 @@
       "journal": "complete immutable no-replace pending.json",
       "read_only_repairs": false,
       "mutation_drains_before_active_change": true
+    },
+    "setup_rollback": {
+      "strategy": "object-preserving held managed files",
+      "restores_original_file_identity": true,
+      "backup_commit_after_desired_postcondition": true
     }
   },
   "profiles": {

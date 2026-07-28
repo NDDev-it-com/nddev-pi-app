@@ -235,12 +235,25 @@ def main() -> int:
             or cleanup_journal.get("mutation_drains_before_active_change") is not True
         ):
             errors.append("build/manifest.json: cleanup journal policy mismatch")
+        setup_rollback = (
+            transaction.get("setup_rollback") if isinstance(transaction, dict) else None
+        )
+        if (
+            not isinstance(setup_rollback, dict)
+            or setup_rollback.get("strategy") != "object-preserving held managed files"
+            or setup_rollback.get("restores_original_file_identity") is not True
+            or setup_rollback.get("backup_commit_after_desired_postcondition") is not True
+        ):
+            errors.append("build/manifest.json: setup rollback policy mismatch")
         backup_policy = manifest.get("backup_policy")
         if (
             not isinstance(backup_policy, dict)
             or backup_policy.get("full_pool_behavior") != "fail-closed"
+            or backup_policy.get("envelope_schema") != 2
+            or backup_policy.get("file_metadata") != ["size", "sha256"]
+            or backup_policy.get("exact_managed_path_set") is not True
         ):
-            errors.append("build/manifest.json: backup full-pool policy mismatch")
+            errors.append("build/manifest.json: backup policy mismatch")
 
     if contract is not None:
         if contract.get("contract_version") != 2:
@@ -264,8 +277,14 @@ def main() -> int:
             or compatibility.get("ubuntu_version_floor") is not None
         ):
             errors.append("config/nddev-contract.json: supported host contract mismatch")
-        if contract.get("safety", {}).get("backup_full_pool_behavior") != "fail-closed":
-            errors.append("config/nddev-contract.json: backup full-pool policy mismatch")
+        safety = contract.get("safety", {})
+        if (
+            safety.get("backup_full_pool_behavior") != "fail-closed"
+            or safety.get("backup_envelope_schema") != 2
+            or safety.get("backup_records_sizes_and_digests") is not True
+            or safety.get("backup_exact_managed_path_set") is not True
+        ):
+            errors.append("config/nddev-contract.json: backup policy mismatch")
         if contract.get("software", {}).get("package") != CURRENT_PACKAGE:
             errors.append("config/nddev-contract.json: software package mismatch")
         software = contract.get("software", {})
@@ -356,6 +375,14 @@ def main() -> int:
             or cleanup.get("absolute_paths_in_documents") is not False
         ):
             errors.append("config/nddev-contract.json: cleanup journal policy mismatch")
+        setup_rollback = contract.get("safety", {}).get("setup_rollback")
+        if (
+            not isinstance(setup_rollback, dict)
+            or setup_rollback.get("strategy") != "object-preserving held managed files"
+            or setup_rollback.get("restores_original_file_identity") is not True
+            or setup_rollback.get("backup_commit_after_desired_postcondition") is not True
+        ):
+            errors.append("config/nddev-contract.json: setup rollback policy mismatch")
         marketplace = contract.get("builder_projection", {}).get("marketplace", {})
         if marketplace.get("external_marketplace_published") is not None:
             errors.append("config/nddev-contract.json: external marketplace must remain null")

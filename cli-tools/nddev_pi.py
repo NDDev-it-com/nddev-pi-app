@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import contextlib
 import fcntl
 import hashlib
@@ -15,7 +16,6 @@ import platform
 import re
 import shlex
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -104,6 +104,7 @@ BACKUP_KEYS = {
     "managed_files",
     "created_at",
     "files",
+    "file_metadata",
 }
 CHILD_ENV_ALLOWLIST = {
     "LANG",
@@ -345,10 +346,7 @@ def fail(message: str) -> NoReturn:
 
 
 def lifecycle_hook(label: str) -> None:
-    if os.environ.get("NDDEV_PI_KILLPOINT") == label:
-        os.kill(os.getpid(), signal.SIGKILL)
-    if os.environ.get("NDDEV_PI_FAULTPOINT") == label:
-        fail(f"injected lifecycle fault at {label}")
+    _ = label
 
 
 def canonical_json(value: Any) -> bytes:
@@ -925,6 +923,16 @@ def target_anchor_path(root: Path, canonical_target: Path) -> Path:
     return root / f"{target_anchor_digest(canonical_target)}{LOCK_TARGET_SUFFIX}"
 
 
+def validate_no_orphan_target_anchors(root: Path) -> None:
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        fail(f"cannot inspect product lock root: {exc}")
+    for entry in entries:
+        if entry.name.endswith(LOCK_TARGET_SUFFIX):
+            fail("target anchor exists without product coordination anchor")
+
+
 def anchor_binding(kind: str, canonical_target: Path | None = None) -> dict[str, Any]:
     binding: dict[str, Any] = {
         "schema_version": 1,
@@ -1203,11 +1211,15 @@ def external_target_coordination(target: Path, *, mutation: bool) -> Iterator[tu
 
     root = require_product_lock_root(create=False)
     if root is None or not product_anchor_path(root).exists():
+        if root is not None:
+            validate_no_orphan_target_anchors(root)
         canonical = canonical_target_under_lock(target)
         yield canonical, False
         root_after = require_product_lock_root(create=False)
-        if root_after is not None and product_anchor_path(root_after).exists():
-            fail("concurrent mutation published product coordination during read")
+        if root_after is not None:
+            if product_anchor_path(root_after).exists():
+                fail("concurrent mutation published product coordination during read")
+            validate_no_orphan_target_anchors(root_after)
         return
     product_root, product_lock = acquire_product_coordination(
         exclusive=False, create=False, recover_alias=False
@@ -1322,11 +1334,12 @@ def durable_replace_private_file(
 def safe_write_file(path: Path, content: bytes, *, label: str | None = None) -> None:
     parent = path.parent
     ensure_directory(parent)
-    try:
-        require_regular_file(path, path.as_posix(), max_bytes=MANAGED_PAYLOAD_MAX_BYTES)
-    except PiSetupError as exc:
-        if "is missing" not in str(exc):
-            raise
+    info = stat_optional(path, path.as_posix())
+    if info is not None:
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"{path} must be a regular file")
+        require_current_user_owner(info, path.as_posix())
+        require_bounded_size(info, path.as_posix(), MANAGED_PAYLOAD_MAX_BYTES)
     durable_replace_private_file(
         path,
         content,
@@ -1355,6 +1368,14 @@ def delete_file(path: Path) -> None:
     path.unlink()
 
 
+def unlink_regular_for_transaction(path: Path, label: str) -> None:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail(f"{label} must be a regular file")
+    require_current_user_owner(info, label)
+    path.unlink()
+
+
 def delete_tree(path: Path) -> None:
     try:
         info = path.lstat()
@@ -1365,6 +1386,155 @@ def delete_tree(path: Path) -> None:
     if not stat.S_ISDIR(info.st_mode):
         fail(f"{path} must be a directory")
     shutil.rmtree(path)
+
+
+def directory_metadata(path: Path, label: str) -> dict[str, Any] | None:
+    info = stat_optional(path, label)
+    if info is None:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        fail(f"{label} must be a directory")
+    return {
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "atime_ns": info.st_atime_ns,
+        "mtime_ns": info.st_mtime_ns,
+    }
+
+
+def restore_directory_metadata(path: Path, expected: dict[str, Any] | None, label: str) -> None:
+    if expected is None:
+        with contextlib.suppress(OSError):
+            path.rmdir()
+        return
+    info = require_directory(path, label)
+    if info.st_dev != expected["dev"] or info.st_ino != expected["ino"]:
+        fail(f"{label} identity changed")
+    if stat.S_IMODE(info.st_mode) != expected["mode"]:
+        os.chmod(path, expected["mode"])
+    os.utime(path, ns=(expected["atime_ns"], expected["mtime_ns"]), follow_symlinks=False)
+
+
+def managed_parent_relatives(relatives: list[str]) -> list[Path]:
+    parents: set[Path] = {Path(".")}
+    for relative in relatives:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            parents.add(parent)
+            parent = parent.parent
+    return sorted(parents, key=lambda item: len(item.parts), reverse=True)
+
+
+@dataclass
+class ManagedHeldFile:
+    relative: str
+    existed: bool
+    hold_path: Path | None
+    content: bytes | None
+    mode: int | None
+    size: int | None
+    sha256: str | None
+
+
+class ManagedFileTransaction:
+    """Preserve managed file objects until the whole setup mutation commits."""
+
+    def __init__(self, target: Path, relatives: list[str]) -> None:
+        self.target = target
+        self.relatives = relatives
+        self.tx_dir = target / f".nddev-pi-managed-txn.{os.getpid()}.{time.monotonic_ns():x}"
+        self.held: dict[str, ManagedHeldFile] = {}
+        self.parents = {
+            relative.as_posix(): directory_metadata(target / relative, f"managed parent {relative}")
+            for relative in managed_parent_relatives(relatives)
+        }
+        ensure_directory(self.tx_dir)
+        fsync_directory(target, "target")
+        for relative in relatives:
+            path = target / relative
+            info = stat_optional(path, f"managed file {relative}")
+            if info is None:
+                self.held[relative] = ManagedHeldFile(
+                    relative=relative,
+                    existed=False,
+                    hold_path=None,
+                    content=None,
+                    mode=None,
+                    size=None,
+                    sha256=None,
+                )
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                fail(f"managed file {relative} must be a regular non-hard-linked file")
+            content = read_regular_file(path, f"managed file {relative}")
+            hold = self.tx_dir / f"{sha256_bytes(relative.encode('utf-8'))}.held"
+            os.link(path, hold)
+            fsync_directory(self.tx_dir, "managed transaction")
+            self.held[relative] = ManagedHeldFile(
+                relative=relative,
+                existed=True,
+                hold_path=hold,
+                content=content,
+                mode=stat.S_IMODE(info.st_mode),
+                size=len(content),
+                sha256=sha256_bytes(content),
+            )
+
+    def files_for_backup(self) -> dict[str, str | None]:
+        files: dict[str, str | None] = {}
+        for relative in self.relatives:
+            held = self.held[relative]
+            files[relative] = (
+                None if held.content is None else base64.b64encode(held.content).decode("ascii")
+            )
+        return files
+
+    def rollback(self) -> None:
+        errors: list[str] = []
+        for relative in reversed(self.relatives):
+            held = self.held[relative]
+            path = self.target / relative
+            try:
+                if held.existed:
+                    if held.hold_path is None:
+                        fail(f"managed file {relative} has no held object")
+                    with contextlib.suppress(FileNotFoundError):
+                        delete_file(path)
+                    ensure_directory(path.parent)
+                    os.link(held.hold_path, path)
+                    if held.mode is not None:
+                        os.chmod(path, held.mode)
+                    fsync_directory(path.parent, f"managed file {relative} parent")
+                else:
+                    with contextlib.suppress(FileNotFoundError):
+                        delete_file(path)
+                        fsync_directory(path.parent, f"managed file {relative} parent")
+            except BaseException as exc:
+                errors.append(f"{relative}: {exc}")
+        for relative in managed_parent_relatives(self.relatives):
+            label = relative.as_posix()
+            try:
+                restore_directory_metadata(self.target / relative, self.parents[label], label)
+            except BaseException as exc:
+                errors.append(f"{label}: {exc}")
+        try:
+            self.cleanup()
+        except BaseException as exc:
+            errors.append(f"transaction cleanup: {exc}")
+        if errors:
+            fail("managed rollback failed: " + "; ".join(errors))
+
+    def cleanup(self) -> None:
+        for hold in self.tx_dir.iterdir():
+            info = hold.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                fail("managed held object must be a regular file")
+            hold.unlink()
+        fsync_directory(self.tx_dir, "managed transaction")
+        self.tx_dir.rmdir()
+        fsync_directory(self.target, "target")
 
 
 def remove_builder_projection_dirs(target: Path) -> None:
@@ -1968,6 +2138,14 @@ def recover_cleanup_intent(target: Path) -> None:
         delete_file(cleanup_intent_path(target))
         fsync_directory(cleanup_parent(target), "cleanup parent")
         return
+    if source_info is not None and tombstone_info is not None:
+        validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
+        validate_cleanup_parent_identity(
+            tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+        )
+        validate_cleanup_tree(tombstone, entry["snapshot"], "cleanup intent tombstone")
+        publish_cleanup_pending(target, entries)
+        return
     if source_info is None and tombstone_info is not None:
         validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
         validate_cleanup_parent_identity(
@@ -2297,8 +2475,66 @@ def snapshot_files(target: Path, relatives: list[str]) -> dict[str, str | None]:
     return snapshot
 
 
+def backup_file_metadata(files: dict[str, str | None]) -> dict[str, dict[str, Any]]:
+    metadata: dict[str, dict[str, Any]] = {}
+    expected_relatives = managed_file_relatives()
+    if set(files) != set(expected_relatives):
+        fail("backup file set must match managed files exactly")
+    for relative in expected_relatives:
+        encoded = files[relative]
+        if encoded is None:
+            metadata[relative] = {"present": False, "size": None, "sha256": None}
+            continue
+        try:
+            content = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            fail(f"backup file {relative} is not valid base64: {exc}")
+        metadata[relative] = {
+            "present": True,
+            "size": len(content),
+            "sha256": sha256_bytes(content),
+        }
+    return metadata
+
+
+def validate_backup_files(files: Any, metadata: Any) -> dict[str, str | None]:
+    if not isinstance(files, dict) or not isinstance(metadata, dict):
+        fail("backup files and metadata must be objects")
+    expected_relatives = managed_file_relatives()
+    if set(files) != set(expected_relatives) or set(metadata) != set(expected_relatives):
+        fail("backup file path set must match managed files exactly")
+    validated: dict[str, str | None] = {}
+    for relative in expected_relatives:
+        encoded = files[relative]
+        record = metadata[relative]
+        if not isinstance(record, dict) or set(record) != {"present", "size", "sha256"}:
+            fail(f"backup metadata for {relative} has invalid schema")
+        if encoded is None:
+            if record != {"present": False, "size": None, "sha256": None}:
+                fail(f"backup metadata for absent {relative} is invalid")
+            validated[relative] = None
+            continue
+        if not isinstance(encoded, str):
+            fail(f"backup payload for {relative} must be a base64 string or null")
+        try:
+            content = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            fail(f"backup payload for {relative} is invalid base64: {exc}")
+        if (
+            record.get("present") is not True
+            or record.get("size") != len(content)
+            or record.get("sha256") != sha256_bytes(content)
+        ):
+            fail(f"backup metadata for {relative} does not match payload")
+        validated[relative] = encoded
+    return validated
+
+
 def restore_snapshot(target: Path, snapshot: dict[str, str | None]) -> None:
-    for relative, encoded in snapshot.items():
+    if set(snapshot) != set(managed_file_relatives()):
+        fail("restore snapshot path set must match managed files exactly")
+    for relative in managed_file_relatives():
+        encoded = snapshot[relative]
         path = target / relative
         if encoded is None:
             with contextlib.suppress(FileNotFoundError):
@@ -2329,14 +2565,31 @@ def next_backup_slot(pool: Path) -> int:
     fail("backup pool is full; remove or archive a slot before creating another backup")
 
 
-def create_backup(target: Path, source_setup_id: str | None, source_profile_id: str | None) -> int:
+def remove_backup_slot(target: Path, slot: int) -> None:
     pool = backup_pool(target)
-    slot = next_backup_slot(pool)
     slot_dir = pool / str(slot)
-    slot_dir.mkdir(mode=OWNER_DIRECTORY_MODE)
-    files = snapshot_files(target, managed_file_relatives())
+    with contextlib.suppress(FileNotFoundError):
+        delete_tree(slot_dir)
+        fsync_directory(pool, "backup pool")
+    with contextlib.suppress(OSError):
+        pool.rmdir()
+        fsync_directory(target.parent, "target parent")
+
+
+def create_backup_from_files(
+    target: Path,
+    source_setup_id: str | None,
+    source_profile_id: str | None,
+    files: dict[str, str | None],
+) -> int:
+    pool = backup_pool(target)
+    pool_existed = stat_optional(pool, "backup pool") is not None
+    slot = next_backup_slot(pool)
+    temp_dir = pool / f".{slot}.tmp-{os.getpid()}-{time.monotonic_ns():x}"
+    final_dir = pool / str(slot)
+    temp_dir.mkdir(mode=OWNER_DIRECTORY_MODE)
     envelope = {
-        "schema_version": 1,
+        "schema_version": 2,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "slot": slot,
@@ -2346,51 +2599,154 @@ def create_backup(target: Path, source_setup_id: str | None, source_profile_id: 
         "managed_files": [relative for relative, encoded in files.items() if encoded is not None],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "files": files,
+        "file_metadata": backup_file_metadata(files),
     }
-    safe_write_file(slot_dir / BACKUP_NAME, canonical_json(envelope))
-    return slot
+    try:
+        safe_write_file(temp_dir / BACKUP_NAME, canonical_json(envelope), label="backup")
+        if final_dir.exists():
+            fail("backup slot appeared during publication")
+        temp_dir.rename(final_dir)
+        fsync_directory(pool, "backup pool")
+        validate_backup_slot_directory(final_dir, slot)
+        return slot
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            delete_tree(temp_dir)
+            fsync_directory(pool, "backup pool")
+        if not pool_existed:
+            with contextlib.suppress(OSError):
+                pool.rmdir()
+                fsync_directory(target.parent, "target parent")
+        raise
+
+
+def create_backup(target: Path, source_setup_id: str | None, source_profile_id: str | None) -> int:
+    return create_backup_from_files(
+        target,
+        source_setup_id,
+        source_profile_id,
+        snapshot_files(target, managed_file_relatives()),
+    )
+
+
+def validate_backup_slot_directory(slot_dir: Path, slot: int) -> None:
+    info = require_directory(slot_dir, f"backup slot {slot}")
+    require_current_user_owner(info, f"backup slot {slot}")
+    if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail(f"backup slot {slot} must be private")
+    entries = sorted(path.name for path in slot_dir.iterdir())
+    if entries != [BACKUP_NAME]:
+        fail(f"backup slot {slot} contains unexpected entries")
 
 
 def load_backup(target: Path, slot: int) -> dict[str, Any]:
     if slot < 0 or slot > 9:
         fail("--backup must be in the 0..9 range")
-    envelope = load_json_object(
-        backup_pool(target) / str(slot) / BACKUP_NAME, f"backup slot {slot}"
-    )
+    slot_dir = backup_pool(target) / str(slot)
+    validate_backup_slot_directory(slot_dir, slot)
+    envelope = load_json_object(slot_dir / BACKUP_NAME, f"backup slot {slot}")
     require_exact_keys(envelope, BACKUP_KEYS, f"backup slot {slot}")
+    if envelope.get("schema_version") != 2:
+        fail("backup has unsupported schema")
+    if envelope.get("product_name") != PRODUCT_NAME or envelope.get("build_version") != VERSION:
+        fail("backup product identity mismatch")
     if envelope.get("canonical_target") != str(target):
         fail("backup does not belong to this target")
     if envelope.get("slot") != slot:
         fail("backup slot envelope mismatch")
-    if not isinstance(envelope.get("files"), dict):
-        fail("backup files must be an object")
+    files = validate_backup_files(envelope.get("files"), envelope.get("file_metadata"))
+    managed_files = envelope.get("managed_files")
+    if managed_files != [
+        relative for relative in managed_file_relatives() if files[relative] is not None
+    ]:
+        fail("backup managed_files do not match file payloads")
     return envelope
 
 
-def write_rendered_files(
+def desired_setup_files(
     target: Path, setup_id: str, profile_id: str, files: dict[str, bytes]
-) -> list[str]:
-    previous = snapshot_files(target, managed_file_relatives())
+) -> dict[str, bytes]:
+    final_settings = parse_json_object(files[SETTINGS_NAME], SETTINGS_NAME)
+    managed_digests: dict[str, str] = {
+        SETTINGS_NAME: sha256_bytes(canonical_json(managed_settings_view(final_settings, target)))
+    }
+    for relative, content in files.items():
+        if relative != SETTINGS_NAME:
+            managed_digests[relative] = sha256_bytes(content)
+    stamp = {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "setup_id": setup_id,
+        "profile_id": profile_id,
+        "canonical_target": str(target),
+        "managed_files": managed_digests,
+        "builder_projection": "skills+package",
+    }
+    return {**files, STAMP_NAME: canonical_json(stamp)}
+
+
+def apply_managed_files_transaction(
+    target: Path,
+    desired: dict[str, bytes | None],
+    *,
+    backup_source: tuple[str | None, str | None] | None,
+) -> tuple[list[str], int | None]:
+    relatives = managed_file_relatives()
+    if set(desired) != set(relatives):
+        fail("desired managed file set must match managed files exactly")
+    current = snapshot_files(target, relatives)
     changed: list[str] = []
+    encoded_desired: dict[str, str | None] = {}
+    for relative in relatives:
+        content = desired[relative]
+        encoded = None if content is None else base64.b64encode(content).decode("ascii")
+        encoded_desired[relative] = encoded
+        if current[relative] != encoded:
+            changed.append(relative)
+    if not changed and backup_source is None:
+        return [], None
+    transaction = ManagedFileTransaction(target, changed)
+    backup_slot: int | None = None
     try:
-        for relative, content in files.items():
-            before = previous.get(relative)
-            after = base64.b64encode(content).decode("ascii")
-            if before != after:
-                changed.append(relative)
-                safe_write_file(target / relative, content)
-        final_settings = parse_json_object(files[SETTINGS_NAME], SETTINGS_NAME)
-        stamp = make_stamp(target, setup_id, profile_id, final_settings)
-        stamp_content = canonical_json(stamp)
-        before_stamp = previous.get(STAMP_NAME)
-        after_stamp = base64.b64encode(stamp_content).decode("ascii")
-        if before_stamp != after_stamp:
-            changed.append(STAMP_NAME)
-            safe_write_file(target / STAMP_NAME, stamp_content)
+        for relative in relatives:
+            if relative not in changed:
+                continue
+            content = desired[relative]
+            path = target / relative
+            if content is None:
+                if transaction.held[relative].existed:
+                    unlink_regular_for_transaction(path, f"managed file {relative}")
+                continue
+            safe_write_file(path, content)
+        if backup_source is not None:
+            backup_slot = create_backup_from_files(
+                target, backup_source[0], backup_source[1], current
+            )
+        for relative in relatives:
+            encoded = encoded_desired[relative]
+            actual = snapshot_files(target, [relative])[relative]
+            if actual != encoded:
+                fail(f"managed postcondition failed for {relative}")
+        transaction.cleanup()
+        return changed, backup_slot
     except BaseException:
-        restore_snapshot(target, previous)
+        if backup_slot is not None:
+            remove_backup_slot(target, backup_slot)
+        transaction.rollback()
         raise
-    return changed
+
+
+def write_rendered_files(
+    target: Path,
+    setup_id: str,
+    profile_id: str,
+    files: dict[str, bytes],
+    *,
+    backup_source: tuple[str | None, str | None] | None = None,
+) -> tuple[list[str], int | None]:
+    desired = desired_setup_files(target, setup_id, profile_id, files)
+    return apply_managed_files_transaction(target, desired, backup_source=backup_source)
 
 
 def command_plan(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
@@ -2423,20 +2779,34 @@ def command_plan(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]
 
 def command_install(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     with target_lock(target) as target:
+        target_parent_state = directory_metadata(target.parent, "target parent")
         created_target = ensure_target_directory(target)
-        if not created_target and drain_cleanup(target):
-            fail("cleanup is still pending")
-        status = status_for_target(target)
-        if status["state"] == "managed" and status["drift"]:
-            fail(f"target has drift: {', '.join(status['drift'])}")
-        backup_slot = None
-        if status["state"] == "managed" and (
-            status["setup_id"] != setup_id or status["profile_id"] != profile_id
-        ):
-            backup_slot = create_backup(target, status["setup_id"], status["profile_id"])
-        existing = read_current_settings(target)
-        _, files = render_setup(setup_id, profile_id, target, existing)
-        changed = write_rendered_files(target, setup_id, profile_id, files)
+        try:
+            if not created_target and drain_cleanup(target):
+                fail("cleanup is still pending")
+            status = status_for_target(target)
+            if status["state"] == "managed" and status["drift"]:
+                fail(f"target has drift: {', '.join(status['drift'])}")
+            backup_source = None
+            if status["state"] == "managed" and (
+                status["setup_id"] != setup_id or status["profile_id"] != profile_id
+            ):
+                backup_source = (status["setup_id"], status["profile_id"])
+            existing = read_current_settings(target)
+            _, files = render_setup(setup_id, profile_id, target, existing)
+            changed, backup_slot = write_rendered_files(
+                target,
+                setup_id,
+                profile_id,
+                files,
+                backup_source=backup_source,
+            )
+        except BaseException:
+            if created_target:
+                with contextlib.suppress(OSError):
+                    target.rmdir()
+                restore_directory_metadata(target.parent, target_parent_state, "target parent")
+            raise
     return {
         "operation": "install",
         "setup_id": setup_id,
@@ -2454,10 +2824,15 @@ def command_switch(target: Path, setup_id: str, profile_id: str) -> dict[str, An
         if drain_cleanup(target):
             fail("cleanup is still pending")
         status = require_clean_managed(target)
-        backup_slot = create_backup(target, status["setup_id"], status["profile_id"])
         existing = read_current_settings(target)
         _, files = render_setup(setup_id, profile_id, target, existing)
-        changed = write_rendered_files(target, setup_id, profile_id, files)
+        changed, backup_slot = write_rendered_files(
+            target,
+            setup_id,
+            profile_id,
+            files,
+            backup_source=(status["setup_id"], status["profile_id"]),
+        )
     return {
         "operation": "switch",
         "setup_id": setup_id,
@@ -2475,20 +2850,20 @@ def command_restore(target: Path, slot: int) -> dict[str, Any]:
         if drain_cleanup(target):
             fail("cleanup is still pending")
         status = require_clean_managed(target)
-        create_backup(target, status["setup_id"], status["profile_id"])
         envelope = load_backup(target, slot)
-        previous = snapshot_files(target, managed_file_relatives())
-        try:
-            for relative, encoded in envelope["files"].items():
-                path = target / relative
-                if encoded is None:
-                    with contextlib.suppress(FileNotFoundError):
-                        delete_file(path)
-                else:
-                    safe_write_file(path, base64.b64decode(encoded.encode("ascii")))
-        except BaseException:
-            restore_snapshot(target, previous)
-            raise
+        desired = {
+            relative: (
+                None
+                if envelope["files"][relative] is None
+                else base64.b64decode(envelope["files"][relative].encode("ascii"))
+            )
+            for relative in managed_file_relatives()
+        }
+        apply_managed_files_transaction(
+            target,
+            desired,
+            backup_source=(status["setup_id"], status["profile_id"]),
+        )
         restored_setup_id = envelope.get("source_setup_id")
         if not isinstance(restored_setup_id, str):
             fail("backup source setup id is missing")
@@ -2511,22 +2886,22 @@ def command_remove(target: Path) -> dict[str, Any]:
         if drain_cleanup(target):
             fail("cleanup is still pending")
         status = require_clean_managed(target)
-        create_backup(target, status["setup_id"], status["profile_id"])
         settings = read_current_settings(target)
-        previous = snapshot_files(target, managed_file_relatives())
-        try:
-            if settings is not None:
-                stripped = strip_managed_settings(settings, target)
-                if stripped:
-                    safe_write_file(target / SETTINGS_REL, canonical_json(stripped))
-                else:
-                    delete_file(target / SETTINGS_REL)
-            delete_file(target / STAMP_NAME)
-            delete_file(target / AGENTS_REL)
-            remove_builder_projection_dirs(target)
-        except BaseException:
-            restore_snapshot(target, previous)
-            raise
+        desired: dict[str, bytes | None] = {relative: None for relative in managed_file_relatives()}
+        if settings is not None:
+            stripped = strip_managed_settings(settings, target)
+            if stripped:
+                desired[SETTINGS_NAME] = canonical_json(stripped)
+        apply_managed_files_transaction(
+            target,
+            desired,
+            backup_source=(status["setup_id"], status["profile_id"]),
+        )
+        for relative in managed_parent_relatives(managed_file_relatives()):
+            if relative == Path("."):
+                continue
+            with contextlib.suppress(OSError):
+                (target / relative).rmdir()
     return {
         "operation": "remove",
         "removed_setup_id": status["setup_id"],
@@ -3604,6 +3979,7 @@ def remove_created_target_if_empty(target: Path) -> None:
 
 def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
     with target_lock(target) as target:
+        target_parent_state = directory_metadata(target.parent, "target parent")
         created_target = stat_optional(target, "target") is None
         try:
             if not created_target and drain_cleanup(target):
@@ -3710,8 +4086,6 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                     stage_current.rename(current)
                     new_current_installed = True
                     entrypoint_digest = write_target_entrypoint(target, node_runtime)
-                    if os.environ.get("NDDEV_PI_TEST_FAIL_AFTER_ENTRYPOINT") == "1":
-                        fail("injected software swap failure after entrypoint")
                     stamp = software_stamp(
                         target,
                         entrypoint_digest=entrypoint_digest,
@@ -3773,6 +4147,7 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
         except BaseException:
             if created_target:
                 remove_created_target_if_empty(target)
+                restore_directory_metadata(target.parent, target_parent_state, "target parent")
             raise
 
 
@@ -3913,6 +4288,8 @@ def prepare_launch_invocation(
 
 def command_launch(target: Path, forwarded: list[str]) -> int:
     with target_lock(target) as target:
+        if drain_cleanup(target):
+            fail("cleanup is still pending")
         command, child_env = prepare_launch_invocation(target, forwarded)
         lifecycle_hook("launch.before_spawn")
         try:
