@@ -14,8 +14,8 @@ absolute target. The target becomes the Pi runtime root for managed launches:
 
 The manager rejects relative targets, target symlinks, symlinked managed files,
 hard-linked managed files, and oversized managed metadata. Backups are stored in
-the target-bound sibling directory `.<target-name>.nddev-pi-backups` and rotate
-across ten slots.
+the target-bound sibling directory `.<target-name>.nddev-pi-backups` and are
+bounded to the slot policy declared in `build/manifest.json`.
 
 ## Lifecycle
 
@@ -23,6 +23,11 @@ across ten slots.
 a clean managed target and create target-bound backups before replacing managed
 state. Unknown files and user-owned settings keys are preserved. Co-owned
 `skills` and `packages` arrays keep non-NDDev entries.
+
+Mutating commands drain a valid manager-owned cleanup journal before active
+changes. Read-only commands expose `cleanup_pending` and do not repair, adopt,
+chmod, or delete cleanup state. The journal schema and lock policy are owned by
+`config/nddev-contract.json`.
 
 ## Pi Capability Model
 

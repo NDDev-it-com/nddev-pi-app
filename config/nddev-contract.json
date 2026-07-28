@@ -185,6 +185,7 @@
     "default_target": null,
     "explicit_target_required": ["status", "plan", "install", "switch", "restore", "remove", "launch"],
     "max_backups": 10,
+    "backup_full_pool_behavior": "fail-closed",
     "missing_target_argument_rejected": true,
     "new_target_mode": "0700",
     "preserve_existing_target_mode": true,
@@ -198,6 +199,14 @@
       "mutation_publishes_missing_target_anchor": true,
       "publication": "atomic no-replace hardlink of complete fsynced binding",
       "published_anchors_unlinked_by_lifecycle": false
+    },
+    "cleanup_journal": {
+      "cleanup_parent": ".nddev-pi-cleanup",
+      "prepare_intent": "durable before first source-to-tombstone move",
+      "pending_flag": "cleanup_pending",
+      "read_only_repairs": false,
+      "mutation_drains_before_active_change": true,
+      "absolute_paths_in_documents": false
     }
   }
 }

@@ -48,8 +48,7 @@ NPM_INSTALL_ARGV = [
     "@earendil-works/pi-coding-agent@0.82.1",
 ]
 PI_REGISTRY_INTEGRITY = (
-    "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
-    "XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
+    "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
 )
 SUPPORTED_HOSTS = ["macos-arm64", "macos-x64", "ubuntu-glibc-arm64", "ubuntu-glibc-x64"]
 PACKAGE_ID_PATTERN = re.compile(r"@[A-Za-z0-9._-]+/pi-coding-agent")
@@ -178,6 +177,22 @@ def main() -> int:
             or transaction.get("read_only_lock_creation") is not False
         ):
             errors.append("build/manifest.json: external lock policy mismatch")
+        cleanup_journal = (
+            transaction.get("cleanup_journal") if isinstance(transaction, dict) else None
+        )
+        if (
+            not isinstance(cleanup_journal, dict)
+            or cleanup_journal.get("pending_flag") != "cleanup_pending"
+            or cleanup_journal.get("read_only_repairs") is not False
+            or cleanup_journal.get("mutation_drains_before_active_change") is not True
+        ):
+            errors.append("build/manifest.json: cleanup journal policy mismatch")
+        backup_policy = manifest.get("backup_policy")
+        if (
+            not isinstance(backup_policy, dict)
+            or backup_policy.get("full_pool_behavior") != "fail-closed"
+        ):
+            errors.append("build/manifest.json: backup full-pool policy mismatch")
 
     if contract is not None:
         if contract.get("contract_version") != 2:
@@ -201,6 +216,8 @@ def main() -> int:
             or compatibility.get("ubuntu_version_floor") is not None
         ):
             errors.append("config/nddev-contract.json: supported host contract mismatch")
+        if contract.get("safety", {}).get("backup_full_pool_behavior") != "fail-closed":
+            errors.append("config/nddev-contract.json: backup full-pool policy mismatch")
         if contract.get("software", {}).get("package") != CURRENT_PACKAGE:
             errors.append("config/nddev-contract.json: software package mismatch")
         software = contract.get("software", {})
@@ -269,6 +286,15 @@ def main() -> int:
             or coordination.get("published_anchors_unlinked_by_lifecycle") is not False
         ):
             errors.append("config/nddev-contract.json: external coordination policy mismatch")
+        cleanup = contract.get("safety", {}).get("cleanup_journal")
+        if (
+            not isinstance(cleanup, dict)
+            or cleanup.get("pending_flag") != "cleanup_pending"
+            or cleanup.get("read_only_repairs") is not False
+            or cleanup.get("mutation_drains_before_active_change") is not True
+            or cleanup.get("absolute_paths_in_documents") is not False
+        ):
+            errors.append("config/nddev-contract.json: cleanup journal policy mismatch")
         marketplace = contract.get("builder_projection", {}).get("marketplace", {})
         if marketplace.get("external_marketplace_published") is not None:
             errors.append("config/nddev-contract.json: external marketplace must remain null")

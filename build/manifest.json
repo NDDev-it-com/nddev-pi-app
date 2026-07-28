@@ -38,7 +38,8 @@
     "canonical_target_bound": true,
     "envelope": "NDDEV-PI-BACKUP.json",
     "location": "sibling .<target-name>.nddev-pi-backups",
-    "slots": 10
+    "slots": 10,
+    "full_pool_behavior": "fail-closed"
   },
   "runtime_compatibility": {
     "baseline_ref": "references/pi-baseline.json",
@@ -141,7 +142,14 @@
     "lock": "monotonic product and canonical target anchors",
     "read_only_lock_creation": false,
     "anchor_publication": "complete fsynced temp plus atomic no-replace hardlink",
-    "external_coordination_root": "private sticky-temp namespace declared by cli-tools/nddev_pi.py"
+    "external_coordination_root": "private sticky-temp namespace declared by cli-tools/nddev_pi.py",
+    "cleanup_journal": {
+      "pending_flag": "cleanup_pending",
+      "prepare_intent": "durable before first source-to-tombstone move",
+      "journal": "complete immutable no-replace pending.json",
+      "read_only_repairs": false,
+      "mutation_drains_before_active_change": true
+    }
   },
   "profiles": {
     "default": "full-auto",
