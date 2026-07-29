@@ -301,6 +301,14 @@
       "mutation_drains_before_active_change": true,
       "absolute_paths_in_documents": false
     },
+    "switch_noop": {
+      "same_setup_profile_result": "success",
+      "changed": [],
+      "backup_slot": null,
+      "managed_transaction": false,
+      "backup_created": false,
+      "cleanup_pending_drains_before_result": true
+    },
     "setup_rollback": {
       "strategy": "object-preserving held managed files",
       "restores_original_file_identity": true,

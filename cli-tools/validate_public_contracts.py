@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import importlib.util
 import contextlib
+import hashlib
 import io
 import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -701,6 +703,260 @@ def validate_launch_workspace_behavior(errors: list[str]) -> None:
         sys.modules.pop(name, None)
 
 
+def validate_switch_noop_behavior(errors: list[str]) -> None:
+    manager = ROOT / "cli-tools" / "nddev_pi.py"
+    python = Path("/usr/bin/python3")
+    if not python.exists():
+        python = Path(sys.executable)
+    name = "nddev_pi_public_validator_switch_noop"
+
+    def snapshot_tree(path: Path, *, exclude_names: set[str] | None = None) -> dict[str, object]:
+        exclude = exclude_names or set()
+        try:
+            root_info = path.lstat()
+        except FileNotFoundError:
+            return {"exists": False}
+        records: dict[str, dict[str, object]] = {}
+
+        def add(item: Path, relative: str) -> None:
+            info = item.lstat()
+            if item.name in exclude:
+                return
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISDIR(info.st_mode):
+                kind = "directory"
+            elif stat.S_ISREG(info.st_mode):
+                kind = "file"
+            elif stat.S_ISLNK(info.st_mode):
+                kind = "symlink"
+            else:
+                kind = "other"
+            record: dict[str, object] = {
+                "kind": kind,
+                "mode": mode,
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "dev": info.st_dev,
+                "ino": info.st_ino,
+                "nlink": info.st_nlink,
+                "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns,
+            }
+            if kind == "file":
+                record["sha256"] = hashlib.sha256(item.read_bytes()).hexdigest()
+            if kind == "symlink":
+                record["target"] = os.readlink(item)
+            records[relative] = record
+            if kind == "directory":
+                for child in sorted(item.iterdir(), key=lambda child: child.name):
+                    add(child, child.relative_to(path).as_posix())
+
+        add(path, ".")
+        return {"exists": True, "records": records, "root_ino": root_info.st_ino}
+
+    def run_json(argv: list[str], expected_rc: int) -> dict[str, object]:
+        completed = subprocess.run(
+            [str(python), "-B", str(manager), *argv],
+            cwd=str(ROOT),
+            env={},
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if completed.returncode != expected_rc:
+            errors.append(
+                "cli-tools/nddev_pi.py: raw switch command returned "
+                f"{completed.returncode}, expected {expected_rc}: "
+                f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
+            )
+            return {}
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            errors.append(f"cli-tools/nddev_pi.py: raw switch JSON parse failed: {exc}")
+            return {}
+        if not isinstance(payload, dict):
+            errors.append("cli-tools/nddev_pi.py: raw switch JSON was not an object")
+            return {}
+        return payload
+
+    def assert_noop_payload(payload: dict[str, object], *, cleanup_drained: bool) -> None:
+        if (
+            payload.get("operation") != "switch"
+            or payload.get("changed") != []
+            or payload.get("backup_slot") is not None
+            or payload.get("already_current") is not True
+            or payload.get("cleanup_drained") is not cleanup_drained
+            or payload.get("cleanup_pending") is not False
+        ):
+            errors.append("cli-tools/nddev_pi.py: switch no-op payload mismatch")
+
+    try:
+        spec = importlib.util.spec_from_file_location(name, manager)
+        if spec is None or spec.loader is None:
+            errors.append("cli-tools/nddev_pi.py: cannot load manager module spec")
+            return
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-switch-noop.") as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            install = run_json(
+                [
+                    "install",
+                    "--json",
+                    "--target",
+                    str(target),
+                    "--setup",
+                    "nddev-builder",
+                    "--profile",
+                    "full-auto",
+                ],
+                0,
+            )
+            if not install:
+                return
+            canonical = target.resolve(strict=True)
+            backup = module.backup_pool(canonical)
+            before_target = snapshot_tree(canonical)
+            before_backup = snapshot_tree(backup)
+            first = run_json(
+                [
+                    "switch",
+                    "--json",
+                    "--target",
+                    str(target),
+                    "--setup",
+                    "nddev-builder",
+                    "--profile",
+                    "full-auto",
+                ],
+                0,
+            )
+            second = run_json(
+                [
+                    "switch",
+                    "--json",
+                    "--target",
+                    str(target),
+                    "--setup",
+                    "nddev-builder",
+                    "--profile",
+                    "full-auto",
+                ],
+                0,
+            )
+            if not first or not second:
+                return
+            assert_noop_payload(first, cleanup_drained=False)
+            assert_noop_payload(second, cleanup_drained=False)
+            if snapshot_tree(canonical) != before_target:
+                errors.append("cli-tools/nddev_pi.py: identical switch changed active target graph")
+            if snapshot_tree(backup) != before_backup:
+                errors.append("cli-tools/nddev_pi.py: identical switch created or changed backup graph")
+
+            source = canonical / module.SOFTWARE_STAMP_NAME
+            source.write_text("cleanup payload", encoding="utf-8")
+            source.chmod(module.OWNER_FILE_MODE)
+            module.fsync_directory(canonical, "public switch cleanup target")
+            entries = module.prepare_cleanup_intent(
+                canonical,
+                [
+                    {
+                        "purpose": "software-stamp",
+                        "source_anchor": "target",
+                        "source_relative": module.SOFTWARE_STAMP_NAME,
+                    }
+                ],
+                replacements=[],
+                restore_parents={},
+            )
+            module.move_cleanup_sources_to_tombstones(canonical, entries)
+            module.publish_json_no_replace(
+                module.cleanup_journal_path(canonical),
+                module.cleanup_document(canonical, state="pending", entries=entries),
+                "journal",
+            )
+            active_before_cleanup = {
+                relative: snapshot_tree(canonical / relative)
+                for relative in module.managed_file_relatives()
+            }
+            backup_before_cleanup = snapshot_tree(backup)
+            cleanup_switch = run_json(
+                [
+                    "switch",
+                    "--json",
+                    "--target",
+                    str(target),
+                    "--setup",
+                    "nddev-builder",
+                    "--profile",
+                    "full-auto",
+                ],
+                0,
+            )
+            if not cleanup_switch:
+                return
+            assert_noop_payload(cleanup_switch, cleanup_drained=True)
+            active_after_cleanup = {
+                relative: snapshot_tree(canonical / relative)
+                for relative in module.managed_file_relatives()
+            }
+            if active_after_cleanup != active_before_cleanup:
+                errors.append("cli-tools/nddev_pi.py: cleanup-drain switch rewrote active files")
+            if snapshot_tree(backup) != backup_before_cleanup:
+                errors.append("cli-tools/nddev_pi.py: cleanup-drain switch changed backup graph")
+            cleanup_after = module.cleanup_state(canonical)
+            if cleanup_after.get("cleanup_pending") is not False:
+                errors.append("cli-tools/nddev_pi.py: cleanup-drain switch left cleanup pending")
+
+            cleanup_root = module.cleanup_parent(canonical)
+            cleanup_root.mkdir(mode=module.OWNER_DIRECTORY_MODE, exist_ok=True)
+            malformed = module.cleanup_journal_path(canonical)
+            malformed.write_text("{}\n", encoding="utf-8")
+            malformed.chmod(module.OWNER_FILE_MODE)
+            module.fsync_directory(cleanup_root, "malformed cleanup parent")
+            malformed_before = snapshot_tree(cleanup_root)
+            active_before_malformed = {
+                relative: snapshot_tree(canonical / relative)
+                for relative in module.managed_file_relatives()
+            }
+            backup_before_malformed = snapshot_tree(backup)
+            failure = run_json(
+                [
+                    "switch",
+                    "--json",
+                    "--target",
+                    str(target),
+                    "--setup",
+                    "nddev-builder",
+                    "--profile",
+                    "full-auto",
+                ],
+                2,
+            )
+            if not failure:
+                return
+            if "error" not in failure:
+                errors.append("cli-tools/nddev_pi.py: malformed cleanup did not return JSON error")
+            if snapshot_tree(cleanup_root) != malformed_before:
+                errors.append("cli-tools/nddev_pi.py: malformed cleanup failure mutated cleanup graph")
+            active_after_malformed = {
+                relative: snapshot_tree(canonical / relative)
+                for relative in module.managed_file_relatives()
+            }
+            if active_after_malformed != active_before_malformed:
+                errors.append("cli-tools/nddev_pi.py: malformed cleanup failure changed active files")
+            if snapshot_tree(backup) != backup_before_malformed:
+                errors.append("cli-tools/nddev_pi.py: malformed cleanup failure changed backup graph")
+    except Exception as exc:  # pragma: no cover - validator reports instead of crashing
+        errors.append(f"cli-tools/nddev_pi.py: switch no-op behavior check failed: {exc}")
+    finally:
+        sys.modules.pop(name, None)
+
+
 def main() -> int:
     errors: list[str] = []
     version = load_json("build/version.json", errors)
@@ -715,6 +971,7 @@ def main() -> int:
     validate_external_anchor_behavior(errors)
     validate_cleanup_metadata_behavior(errors)
     validate_launch_workspace_behavior(errors)
+    validate_switch_noop_behavior(errors)
 
     version_text = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if version is not None:
@@ -832,6 +1089,16 @@ def main() -> int:
             or cleanup_journal.get("mutation_drains_before_active_change") is not True
         ):
             errors.append("build/manifest.json: cleanup journal policy mismatch")
+        switch_noop = transaction.get("switch_noop") if isinstance(transaction, dict) else None
+        if switch_noop != {
+            "same_setup_profile_result": "success",
+            "changed": [],
+            "backup_slot": None,
+            "managed_transaction": False,
+            "backup_created": False,
+            "cleanup_pending_drains_before_result": True,
+        }:
+            errors.append("build/manifest.json: switch no-op policy mismatch")
         setup_rollback = (
             transaction.get("setup_rollback") if isinstance(transaction, dict) else None
         )
@@ -999,6 +1266,16 @@ def main() -> int:
             or cleanup.get("absolute_paths_in_documents") is not False
         ):
             errors.append("config/nddev-contract.json: cleanup journal policy mismatch")
+        switch_noop = contract.get("safety", {}).get("switch_noop")
+        if switch_noop != {
+            "same_setup_profile_result": "success",
+            "changed": [],
+            "backup_slot": None,
+            "managed_transaction": False,
+            "backup_created": False,
+            "cleanup_pending_drains_before_result": True,
+        }:
+            errors.append("config/nddev-contract.json: switch no-op policy mismatch")
         setup_rollback = contract.get("safety", {}).get("setup_rollback")
         if (
             not isinstance(setup_rollback, dict)

@@ -32,6 +32,13 @@ a clean managed target and create target-bound backups before replacing managed
 state. Unknown files and user-owned settings keys are preserved. Co-owned
 `skills` and `packages` arrays keep non-NDDev entries.
 
+`switch` is a success no-op when the requested setup and profile already match
+the clean managed target and no valid cleanup is pending: it returns
+`changed: []` and `backup_slot: null` without rewriting managed files or
+creating a backup. If valid cleanup is pending, `switch` may drain that cleanup
+first and reports `cleanup_drained: true`; malformed cleanup fails without
+adopting or repairing it.
+
 Mutating commands drain a valid manager-owned cleanup journal before active
 changes. Read-only commands expose `cleanup_pending` and do not repair, adopt,
 chmod, or delete cleanup state. If no product coordination anchor exists,

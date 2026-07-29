@@ -3608,7 +3608,7 @@ def command_plan(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]
             elif status.get("cleanup_pending"):
                 operation = "cleanup"
             elif status["setup_id"] == setup_id and status["profile_id"] == profile_id:
-                operation = "update"
+                operation = "noop"
             else:
                 operation = "switch"
                 backup_required = True
@@ -3671,9 +3671,26 @@ def command_install(target: Path, setup_id: str, profile_id: str) -> dict[str, A
 def command_switch(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
     with target_lock(target) as target:
         ensure_target_directory(target)
-        if drain_cleanup(target):
-            fail("cleanup is still pending")
         status = require_clean_managed(target)
+        cleanup_drained = False
+        if status.get("cleanup_pending"):
+            if drain_cleanup(target):
+                fail("cleanup is still pending")
+            cleanup_drained = True
+            status = require_clean_managed(target)
+        if status["setup_id"] == setup_id and status["profile_id"] == profile_id:
+            return {
+                "operation": "switch",
+                "setup_id": setup_id,
+                "profile_id": profile_id,
+                "target": str(target),
+                "changed": [],
+                "backup_slot": None,
+                "builder_projection": "skills+package",
+                "already_current": True,
+                "cleanup_drained": cleanup_drained,
+                "cleanup_pending": False,
+            }
         existing = read_current_settings(target)
         _, files = render_setup(setup_id, profile_id, target, existing)
         changed, backup_slot = write_rendered_files(
@@ -3691,6 +3708,9 @@ def command_switch(target: Path, setup_id: str, profile_id: str) -> dict[str, An
         "changed": changed,
         "backup_slot": backup_slot,
         "builder_projection": "skills+package",
+        "already_current": False,
+        "cleanup_drained": cleanup_drained,
+        "cleanup_pending": False,
     }
 
 

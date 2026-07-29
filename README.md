@@ -51,6 +51,9 @@ flag, so the manager does not inject one and rejects forwarded scope overrides.
 The only content setup id is `nddev-builder`. `full-auto` is the default
 runtime profile. `safe` is a reduced-tool future profile. These profiles are Pi
 permission/runtime settings, not content setups and not OS security boundaries.
+Switching to the already-current setup/profile succeeds as a no-op with
+`changed: []` and `backup_slot: null`; valid pending cleanup may be drained
+first and is reported separately.
 
 Pi does not document built-in permission prompts, sub-agents, or plan mode. The
 manager records that reality instead of inventing unsupported contracts.
