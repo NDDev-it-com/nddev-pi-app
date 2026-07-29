@@ -225,6 +225,7 @@ def validate_external_anchor_recovery(errors: list[str]) -> None:
         "anchor_stage_paths",
         "validate_anchor_stage",
         "validate_anchor_stage_binding",
+        "anchor_stage_destination",
         "external lock pre-publication stage exists without final anchor",
         "external lock pre-publication stage requires exclusive recovery",
         "lock.{expected['kind']}.stage.final.visible",
@@ -305,18 +306,83 @@ def validate_external_anchor_behavior(errors: list[str]) -> None:
                     errors.append("cli-tools/nddev_pi.py: exclusive recovery left stage residue")
             finally:
                 module.close_external_lock(lock)
-        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-anchor-mismatch.") as tmp:
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-anchor-bound.") as tmp:
             parent = Path(tmp) / "locks"
             parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
-            final = parent / "global.lock"
-            binding = module.anchor_binding("product")
-            target_binding = module.anchor_binding("target", Path(tmp) / "target")
-            stages = []
+            product_final = module.product_anchor_path(parent)
+            product_binding = module.anchor_binding("product")
+            canonical_target = (Path(tmp) / "target").resolve(strict=False)
+            target_final = module.target_anchor_path(parent, canonical_target)
+            target_binding = module.anchor_binding("target", canonical_target)
+            stages: list[tuple[Path, Path, bytes]] = []
             for suffix, stage_binding in (
-                ("000004.ddd", binding),
+                ("000004.ddd", product_binding),
                 ("000005.eee", target_binding),
             ):
                 stage = parent / f"{module.LOCK_TEMP_PREFIX}{suffix}.tmp"
+                stage_content = module.canonical_json(stage_binding)
+                descriptor = os.open(
+                    stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, module.OWNER_FILE_MODE
+                )
+                try:
+                    os.write(descriptor, stage_content)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                destination = module.anchor_stage_destination(parent, stage_binding)
+                stages.append((stage, destination, stage_content))
+            product_stage, _, product_content = stages[0]
+            target_stage, _, target_content = stages[1]
+            product_lock = module.ensure_anchor(
+                product_final,
+                product_binding,
+                exclusive=True,
+                create=True,
+                recover_alias=True,
+            )
+            module.close_external_lock(product_lock)
+            if (
+                product_stage.exists()
+                or not target_stage.exists()
+                or not product_final.exists()
+                or target_final.exists()
+                or product_final.read_bytes() != product_content
+                or target_stage.read_bytes() != target_content
+            ):
+                errors.append(
+                    "cli-tools/nddev_pi.py: product recovery crossed a bound stage destination"
+                )
+                return
+            target_lock = module.ensure_anchor(
+                target_final,
+                target_binding,
+                exclusive=True,
+                create=True,
+                recover_alias=True,
+            )
+            module.close_external_lock(target_lock)
+            if (
+                target_stage.exists()
+                or not target_final.exists()
+                or target_final.read_bytes() != target_content
+                or product_final.read_bytes() != product_content
+            ):
+                errors.append(
+                    "cli-tools/nddev_pi.py: target recovery crossed a bound stage destination"
+                )
+                return
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-anchor-malformed.") as tmp:
+            parent = Path(tmp) / "locks"
+            parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            final = module.product_anchor_path(parent)
+            binding = module.anchor_binding("product")
+            valid = parent / f"{module.LOCK_TEMP_PREFIX}000008.def.tmp"
+            malformed = parent / f"{module.LOCK_TEMP_PREFIX}000009.abc.tmp"
+            malformed_binding = module.anchor_binding(
+                "target", (Path(tmp) / "target").resolve(strict=False)
+            )
+            malformed_binding["target_digest"] = "0" * 64
+            for stage, stage_binding in ((valid, binding), (malformed, malformed_binding)):
                 descriptor = os.open(
                     stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, module.OWNER_FILE_MODE
                 )
@@ -325,26 +391,25 @@ def validate_external_anchor_behavior(errors: list[str]) -> None:
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
-                stages.append(stage)
             before = [
                 (stage.name, stage.lstat().st_ino, stage.lstat().st_mtime_ns, stage.read_bytes())
-                for stage in stages
+                for stage in (valid, malformed)
             ]
             try:
                 module.ensure_anchor(final, binding, exclusive=True, create=True, recover_alias=True)
             except module.PiSetupError as exc:
                 if "pre-publication stage binding mismatch" not in str(exc):
-                    errors.append(f"cli-tools/nddev_pi.py: unexpected mismatched stage error: {exc}")
+                    errors.append(f"cli-tools/nddev_pi.py: unexpected malformed stage error: {exc}")
                     return
             else:
-                errors.append("cli-tools/nddev_pi.py: mismatched pre-publication stage was skipped")
+                errors.append("cli-tools/nddev_pi.py: malformed pre-publication stage was skipped")
                 return
             after = [
                 (stage.name, stage.lstat().st_ino, stage.lstat().st_mtime_ns, stage.read_bytes())
-                for stage in stages
+                for stage in (valid, malformed)
             ]
             if before != after or final.exists():
-                errors.append("cli-tools/nddev_pi.py: mismatched stage failure mutated namespace")
+                errors.append("cli-tools/nddev_pi.py: malformed stage failure mutated namespace")
         with tempfile.TemporaryDirectory(prefix="nddev-pi-public-anchor-winner.") as tmp:
             parent = Path(tmp) / "locks"
             parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)

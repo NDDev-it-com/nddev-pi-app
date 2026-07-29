@@ -1267,24 +1267,35 @@ def validate_anchor_stage_binding(binding: dict[str, Any]) -> None:
         fail("external lock pre-publication stage binding mismatch")
 
 
+def anchor_stage_destination(parent: Path, binding: dict[str, Any]) -> Path:
+    validate_anchor_stage_binding(binding)
+    if binding["kind"] == "product":
+        return product_anchor_path(parent)
+    return target_anchor_path(parent, Path(binding["canonical_target"]))
+
+
 def validated_anchor_stages(
     parent: Path,
+    final: Path,
     expected_binding: dict[str, Any],
     *,
     allow_linked_final: bool,
 ) -> list[Path]:
-    stages = anchor_stage_paths(parent)
-    for stage in stages:
+    matching: list[Path] = []
+    for stage in anchor_stage_paths(parent):
         _, binding = validate_anchor_stage(stage, allow_linked_final=allow_linked_final)
+        if anchor_stage_destination(parent, binding) != final:
+            continue
         if binding != expected_binding:
             fail("external lock pre-publication stage binding mismatch")
-    return stages
+        matching.append(stage)
+    return matching
 
 
 def recover_anchor_publication_alias(path: Path, descriptor: int, expected: dict[str, Any]) -> None:
     opened = validate_anchor_descriptor(path, descriptor, expected, allow_publication_alias=True)
     stages = validated_anchor_stages(
-        path.parent, expected, allow_linked_final=True
+        path.parent, path, expected, allow_linked_final=True
     )
     if opened.st_nlink == 2:
         linked_aliases = []
@@ -1436,20 +1447,30 @@ def ensure_anchor(
         )
         if not recover_alias and anchor_stage_paths(path.parent):
             try:
-                validated_anchor_stages(path.parent, expected, allow_linked_final=False)
-            finally:
+                stages = validated_anchor_stages(
+                    path.parent, path, expected, allow_linked_final=False
+                )
+            except BaseException:
                 close_external_lock(lock)
-            fail("external lock pre-publication stage requires exclusive recovery")
+                raise
+            if stages:
+                close_external_lock(lock)
+                fail("external lock pre-publication stage requires exclusive recovery")
         return lock
     except FileNotFoundError:
         if not create:
             if anchor_stage_paths(path.parent):
-                validated_anchor_stages(path.parent, expected, allow_linked_final=False)
-                fail("external lock pre-publication stage exists without final anchor")
+                stages = validated_anchor_stages(
+                    path.parent, path, expected, allow_linked_final=False
+                )
+                if stages:
+                    fail("external lock pre-publication stage exists without final anchor")
             return None
     if not recover_alias:
         fail("external lock pre-publication stage requires exclusive recovery")
-    stages = validated_anchor_stages(path.parent, expected, allow_linked_final=False)
+    stages = validated_anchor_stages(
+        path.parent, path, expected, allow_linked_final=False
+    )
     if stages:
         selected = stages[0]
         try:
