@@ -43,7 +43,7 @@ REQUIRED_VERSION_KEYS = {
 SEMVER = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
 PACKAGE_ID_PATTERN = re.compile(r"@[A-Za-z0-9._-]+/pi-coding-agent")
 REPOSITORY_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9._-]+/pi\b")
-NDDEV_MODULE_PATTERN = re.compile(r"nddev-[a-z0-9-]+-app")
+MODULE_ID_PATTERN = re.compile(r"nddev-[a-z0-9-]+-app")
 SHARED_WORKFLOW_PIN = "2ccb80e96f5771b6a6b4eae63a4f47e232906dc7"
 
 
@@ -86,7 +86,7 @@ def validate_identity(errors: list[str]) -> None:
                 f"{relative}: unexpected Pi repository identity",
                 errors,
             )
-        for match in NDDEV_MODULE_PATTERN.finditer(content):
+        for match in MODULE_ID_PATTERN.finditer(content):
             require(
                 match.group(0) == CURRENT_MODULE_ID,
                 f"{relative}: cross-module id {match.group(0)!r}",
