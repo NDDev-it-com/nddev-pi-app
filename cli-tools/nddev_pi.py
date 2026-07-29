@@ -5,40 +5,67 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import contextlib
+import fcntl
 import hashlib
+import io
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from collections.abc import Iterator
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_ROOT = ROOT / "setups"
+PROFILES_ROOT = ROOT / "profiles"
 VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
 PRODUCT_NAME = "nddev-pi-app"
 PI_COMMAND = "pi"
+DEFAULT_SETUP_ID = "nddev-builder"
+DEFAULT_PROFILE_ID = "full-auto"
 SETTINGS_REL = Path("agent") / "settings.json"
 SETTINGS_NAME = SETTINGS_REL.as_posix()
+AGENTS_REL = Path("agent") / "AGENTS.md"
+AGENTS_NAME = AGENTS_REL.as_posix()
 STAMP_NAME = "NDDEV-PI-SETUP.json"
 BACKUP_NAME = "NDDEV-PI-BACKUP.json"
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 METADATA_MAX_BYTES = 256 * 1024
 MANAGED_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
-SETUP_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+LOCK_BINDING_MAX_BYTES = 16 * 1024
+LOCK_NAMESPACE_NAME = "nddev-pi-app-locks"
+LOCK_PRODUCT_ANCHOR_NAME = "global.lock"
+LOCK_TARGET_SUFFIX = ".target.lock"
+LOCK_TEMP_PREFIX = ".nddev-pi-publish."
+LOCK_NAMESPACE_SCAN_ENTRY_LIMIT = 1024
+CLEANUP_DIR_NAME = ".nddev-pi-cleanup"
+CLEANUP_INTENT_NAME = "prepare-intent.json"
+CLEANUP_JOURNAL_NAME = "pending.json"
+CLEANUP_TOMBSTONES_NAME = "tombstones"
+CLEANUP_MAX_ENTRIES = 4
+CLEANUP_MAX_OBJECTS = 25000
+CLEANUP_MAX_BYTES = 192 * 1024 * 1024
+IDENTIFIER_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+SETUP_ID_PATTERN = IDENTIFIER_PATTERN
+PROFILE_ID_PATTERN = IDENTIFIER_PATTERN
 BUILDER_SOURCE_ROOT = ROOT / "builder" / "nddev-builder"
 BUILDER_SKILL_DIR = Path("agent") / "skills" / "nddev-builder"
 BUILDER_PACKAGE_DIR = Path("agent") / "packages" / "nddev-builder"
 BUILDER_FILES = (
+    (BUILDER_SOURCE_ROOT / "AGENTS.md", AGENTS_REL),
     (
         BUILDER_SOURCE_ROOT / "skills" / "nddev-builder" / "SKILL.md",
         BUILDER_SKILL_DIR / "SKILL.md",
@@ -62,6 +89,7 @@ STAMP_KEYS = {
     "product_name",
     "build_version",
     "setup_id",
+    "profile_id",
     "canonical_target",
     "managed_files",
     "builder_projection",
@@ -73,9 +101,11 @@ BACKUP_KEYS = {
     "slot",
     "canonical_target",
     "source_setup_id",
+    "source_profile_id",
     "managed_files",
     "created_at",
     "files",
+    "file_metadata",
 }
 CHILD_ENV_ALLOWLIST = {
     "LANG",
@@ -83,6 +113,54 @@ CHILD_ENV_ALLOWLIST = {
     "TERM",
     "COLORTERM",
     "SYSTEMROOT",
+}
+PROVIDER_ENV_ALLOWLIST = {
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_OAUTH_TOKEN",
+    "ANT_LING_API_KEY",
+    "AI_GATEWAY_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_API_VERSION",
+    "AZURE_OPENAI_BASE_URL",
+    "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_RESOURCE_NAME",
+    "CEREBRAS_API_KEY",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_API_KEY",
+    "CLOUDFLARE_GATEWAY_ID",
+    "DEEPSEEK_API_KEY",
+    "FIREWORKS_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GROQ_API_KEY",
+    "KIMI_API_KEY",
+    "MINIMAX_API_KEY",
+    "MISTRAL_API_KEY",
+    "MOONSHOT_API_KEY",
+    "NVIDIA_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENROUTER_API_KEY",
+    "QWEN_TOKEN_PLAN_API_KEY",
+    "QWEN_TOKEN_PLAN_CN_API_KEY",
+    "TOGETHER_API_KEY",
+    "XIAOMI_API_KEY",
+    "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+    "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+    "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+    "XAI_API_KEY",
+    "ZAI_API_KEY",
+    "ZAI_CODING_CN_API_KEY",
 }
 SENSITIVE_ENVIRONMENT_SUFFIXES = (
     "_API_KEY",
@@ -101,17 +179,37 @@ PI_PACKAGE_VERSION = "0.82.1"
 PI_PACKAGE_BIN = "dist/cli.js"
 PI_CLI_VERSION_OUTPUT = "0.0.0"
 PI_NODE_REQUIREMENT = ">=22.19.0"
-PI_REGISTRY_INTEGRITY = (
-    "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/"
-    "XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
-)
+PI_REGISTRY_INTEGRITY = "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA=="
 PI_REGISTRY_SHASUM = "39c00809ff5531b6552b9ecb2c41f4c3529ec988"
-BUN_INSTALL_ARGV = [
-    "add",
-    "--global",
-    "--exact",
+PI_REGISTRY_TARBALL_URL = (
+    "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz"
+)
+NPM_VIEW_ARGV = [
+    "view",
+    f"{PI_PACKAGE_NAME}@{PI_PACKAGE_VERSION}",
+    "dist",
+    "--json",
+]
+NPM_PACK_ARGV = [
+    "pack",
+    "--json",
+    "--ignore-scripts",
+    "--pack-destination",
+    "<stage>/tarballs",
     f"{PI_PACKAGE_NAME}@{PI_PACKAGE_VERSION}",
 ]
+NPM_LOCAL_INSTALL_ARGV = [
+    "install",
+    "--global-style",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--package-lock=false",
+    "--prefix",
+    "<stage>/install",
+    "<verified-tarball>",
+]
+NPM_INSTALL_ARGV = NPM_LOCAL_INSTALL_ARGV
 SOFTWARE_STAMP_NAME = "NDDEV-PI-SOFTWARE.json"
 SOFTWARE_DIR_NAME = ".nddev-pi-software"
 SOFTWARE_CURRENT_NAME = "current"
@@ -120,8 +218,9 @@ SOFTWARE_FILE_MAX_BYTES = 192 * 1024 * 1024
 SOFTWARE_TREE_MAX_BYTES = 192 * 1024 * 1024
 SOFTWARE_TREE_MAX_PATHS = 25000
 PROCESS_OUTPUT_MAX_BYTES = 64 * 1024
+NPM_JSON_OUTPUT_MAX_BYTES = 1024 * 1024
 PROCESS_TIMEOUT_SECONDS = 120
-PI_PACKAGE_RELATIVE = "install/global/node_modules/@earendil-works/pi-coding-agent"
+PI_PACKAGE_RELATIVE = "install/node_modules/@earendil-works/pi-coding-agent"
 PI_PACKAGE_BINARY_RELATIVE = f"{PI_PACKAGE_RELATIVE}/{PI_PACKAGE_BIN}"
 SOFTWARE_STAMP_KEYS = {
     "schema_version",
@@ -149,7 +248,7 @@ SOFTWARE_STAMP_KEYS = {
     "official_package_scripts",
     "installer",
 }
-SOFTWARE_STAMP_REGISTRY_KEYS = {"integrity", "shasum"}
+SOFTWARE_STAMP_REGISTRY_KEYS = {"integrity", "shasum", "tarball"}
 SOFTWARE_STAMP_TREE_LIMIT_KEYS = {"max_paths", "max_bytes"}
 SOFTWARE_STAMP_NODE_KEYS = {"path", "version", "sha256", "requirement"}
 SOFTWARE_STAMP_PROBE_KEYS = {
@@ -160,12 +259,21 @@ SOFTWARE_STAMP_PROBE_KEYS = {
     "stdout_stderr_sha256",
 }
 SOFTWARE_STAMP_SCRIPT_KEYS = {"preinstall", "install", "postinstall", "prepublishOnly"}
-SOFTWARE_STAMP_INSTALLER_KEYS = {"tool", "argv", "trust_reason", "env"}
+SOFTWARE_STAMP_INSTALLER_KEYS = {
+    "tool",
+    "metadata_argv",
+    "pack_argv",
+    "local_install_argv",
+    "argv",
+    "trust_reason",
+    "env",
+    "byte_verification",
+}
 SOFTWARE_STAMP_INSTALLER_ENV_KEYS = {
-    "BUN_INSTALL_GLOBAL_DIR",
-    "BUN_INSTALL_BIN",
-    "BUN_INSTALL_CACHE_DIR",
     "HOME",
+    "npm_config_cache",
+    "npm_config_ignore_scripts",
+    "npm_config_userconfig",
     "XDG_CONFIG_HOME",
     "TMPDIR",
 }
@@ -181,6 +289,7 @@ LAUNCH_BLOCKED_BOOLEAN_FLAGS = {
     "-a": "project trust override",
     "--no-approve": "project trust override",
     "-na": "project trust override",
+    "--no-session": "session persistence override",
     "--no-tools": "tool selection override",
     "-nt": "tool selection override",
     "--no-builtin-tools": "tool selection override",
@@ -196,28 +305,32 @@ LAUNCH_BLOCKED_BOOLEAN_FLAGS = {
     "-nc": "work context override",
 }
 LAUNCH_BLOCKED_VALUE_FLAGS = {
-    "--provider": "model provider override",
-    "--model": "model override",
-    "--api-key": "provider credential override",
-    "--system-prompt": "prompt override",
-    "--append-system-prompt": "prompt override",
-    "--name": "session metadata override",
-    "-n": "session metadata override",
     "--session": "session file override",
     "--session-id": "session identity override",
     "--fork": "session fork override",
     "--session-dir": "session directory override",
-    "--models": "model cycling override",
+    "--workspace": "workspace override",
+    "--project": "project workspace override",
+    "--project-dir": "project workspace override",
+    "--project-directory": "project workspace override",
+    "--cwd": "working directory override",
+    "--workdir": "working directory override",
+    "--working-directory": "working directory override",
+    "--directory": "working directory override",
+    "--dir": "working directory override",
+    "-C": "working directory override",
     "--tools": "tool selection override",
     "-t": "tool selection override",
     "--exclude-tools": "tool selection override",
     "-xt": "tool selection override",
-    "--thinking": "model thinking override",
     "--extension": "extension resource override",
     "-e": "extension resource override",
     "--skill": "skill resource override",
     "--prompt-template": "prompt resource override",
     "--theme": "theme resource override",
+}
+LAUNCH_BLOCKED_ATTACHED_PREFIX_FLAGS = {
+    "-C": "working directory override",
 }
 
 
@@ -225,8 +338,40 @@ class PiSetupError(Exception):
     """A safe, user-facing lifecycle failure."""
 
 
+class RetryColdInspection(PiSetupError):
+    """Discard an uncoordinated cold-read result and recompute it safely."""
+
+
+@dataclass(frozen=True)
+class LaunchWorkspace:
+    path: Path
+    source: str
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    """argparse variant that honors --json for parse-time errors."""
+
+    current_argv: list[str] = []
+
+    def parse_args(
+        self, args: list[str] | None = None, namespace: argparse.Namespace | None = None
+    ) -> argparse.Namespace:
+        JsonArgumentParser.current_argv = list(sys.argv[1:] if args is None else args)
+        return super().parse_args(args, namespace)
+
+    def error(self, message: str) -> NoReturn:
+        if "--json" in JsonArgumentParser.current_argv:
+            sys.stdout.write(canonical_json({"error": message}).decode("utf-8"))
+            raise SystemExit(2)
+        super().error(message)
+
+
 def fail(message: str) -> NoReturn:
     raise PiSetupError(message)
+
+
+def lifecycle_hook(label: str) -> None:
+    _ = label
 
 
 def canonical_json(value: Any) -> bytes:
@@ -252,6 +397,64 @@ def require_current_user_owner(info: os.stat_result, label: str) -> None:
         fail(f"{label} must be owned by the current user")
 
 
+def normalize_machine(machine: str) -> str:
+    normalized = machine.lower()
+    if normalized in {"x86_64", "amd64"}:
+        return "x64"
+    if normalized in {"arm64", "aarch64"}:
+        return "arm64"
+    return normalized
+
+
+def parse_libc_version(version: str) -> tuple[int, ...]:
+    if not re.fullmatch(r"\d+(?:\.\d+)*", version):
+        fail(f"unsupported glibc version: {version!r}")
+    return tuple(int(part) for part in version.split("."))
+
+
+def detect_supported_host() -> dict[str, Any]:
+    arch = normalize_machine(platform.machine())
+    if arch not in {"x64", "arm64"}:
+        fail(f"unsupported architecture: {platform.machine()!r}")
+    if sys.platform == "darwin":
+        return {
+            "host_id": f"macos-{arch}",
+            "os": "macos",
+            "arch": arch,
+            "distro_id": None,
+            "glibc": None,
+        }
+    if sys.platform.startswith("linux"):
+        try:
+            os_release = platform.freedesktop_os_release()
+        except OSError as exc:
+            fail(f"cannot detect Linux distribution: {exc}")
+        distro_id = str(os_release.get("ID", "")).lower()
+        id_like = {
+            item.lower()
+            for item in str(os_release.get("ID_LIKE", "")).replace(",", " ").split()
+            if item
+        }
+        if distro_id != "ubuntu" and "ubuntu" not in id_like:
+            fail(f"unsupported Linux distribution: {distro_id or 'unknown'}")
+        libc_name, libc_version = platform.libc_ver()
+        if libc_name != "glibc" or not libc_version:
+            fail("Ubuntu hosts must use glibc")
+        parse_libc_version(libc_version)
+        return {
+            "host_id": f"ubuntu-glibc-{arch}",
+            "os": "ubuntu",
+            "arch": arch,
+            "distro_id": distro_id,
+            "glibc": libc_version,
+        }
+    fail(f"unsupported operating system: {sys.platform}")
+
+
+def require_supported_host() -> dict[str, Any]:
+    return detect_supported_host()
+
+
 def is_sensitive_environment_name(name: str) -> bool:
     upper = name.upper()
     lower = name.lower()
@@ -264,8 +467,13 @@ def is_sensitive_environment_name(name: str) -> bool:
     return upper.endswith(SENSITIVE_ENVIRONMENT_SUFFIXES)
 
 
-def assert_no_sensitive_environment(env: dict[str, str], label: str) -> None:
-    leaked = sorted(name for name in env if is_sensitive_environment_name(name))
+def assert_no_sensitive_environment(
+    env: dict[str, str], label: str, *, allowed_exact: set[str] | None = None
+) -> None:
+    allowed = allowed_exact or set()
+    leaked = sorted(
+        name for name in env if name not in allowed and is_sensitive_environment_name(name)
+    )
     if leaked:
         fail(f"{label} contains sensitive environment variables: {', '.join(leaked)}")
 
@@ -274,7 +482,8 @@ def child_base_environment() -> dict[str, str]:
     return {
         name: value
         for name, value in os.environ.items()
-        if name in CHILD_ENV_ALLOWLIST and not is_sensitive_environment_name(name)
+        if (name in CHILD_ENV_ALLOWLIST and not is_sensitive_environment_name(name))
+        or name in PROVIDER_ENV_ALLOWLIST
     }
 
 
@@ -283,6 +492,8 @@ def stat_optional(path: Path, label: str) -> os.stat_result | None:
         info = path.lstat()
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
     if stat.S_ISLNK(info.st_mode):
         fail(f"{label} must not be a symlink")
     return info
@@ -447,9 +658,7 @@ def load_json_object(path: Path, label: str) -> dict[str, Any]:
 
 
 def maybe_load_json_object(path: Path, label: str) -> dict[str, Any] | None:
-    try:
-        path.lstat()
-    except FileNotFoundError:
+    if stat_optional(path, label) is None:
         return None
     return load_json_object(path, label)
 
@@ -457,6 +666,11 @@ def maybe_load_json_object(path: Path, label: str) -> dict[str, Any] | None:
 def validate_setup_id(setup_id: str) -> None:
     if not SETUP_ID_PATTERN.fullmatch(setup_id):
         fail(f"invalid setup id: {setup_id!r}")
+
+
+def validate_profile_id(profile_id: str) -> None:
+    if not PROFILE_ID_PATTERN.fullmatch(profile_id):
+        fail(f"invalid profile id: {profile_id!r}")
 
 
 def validate_string_array(value: Any, label: str) -> list[str]:
@@ -479,20 +693,25 @@ def load_setup(setup_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
             "description",
             "managed_files",
             "builder_projection",
-            "permission_model",
-            "launch_args",
+            "native_surfaces",
         },
         f"setup {setup_id} metadata",
     )
-    if metadata["schema_version"] != 1:
+    if metadata["schema_version"] != 2:
         fail(f"setup {setup_id} metadata has unsupported schema")
     if metadata["id"] != setup_id:
         fail(f"setup {setup_id} metadata identity mismatch")
-    if metadata["managed_files"] != [SETTINGS_NAME]:
+    if metadata["managed_files"] != managed_file_relatives(include_stamp=False):
         fail(f"setup {setup_id} managed file declaration is invalid")
     if metadata["builder_projection"] != "default-on":
         fail(f"setup {setup_id} must enable the builder projection")
-    validate_string_array(metadata["launch_args"], f"setup {setup_id} launch_args")
+    if validate_string_array(metadata["native_surfaces"], f"setup {setup_id} native_surfaces") != [
+        "settings.skills",
+        "settings.packages",
+        "package.pi.skills",
+        "agent.AGENTS.md",
+    ]:
+        fail(f"setup {setup_id} native surface declaration is invalid")
 
     settings = load_json_object(setup_root / "settings.json", f"setup {setup_id}/settings.json")
     if settings.get("nddev", {}).get("setup_id") != setup_id:
@@ -504,6 +723,82 @@ def load_setup(setup_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     if settings.get("enableAnalytics") is not False:
         fail(f"setup {setup_id} must disable analytics")
     return metadata, settings
+
+
+def load_profile(profile_id: str) -> dict[str, Any]:
+    validate_profile_id(profile_id)
+    profile_root = PROFILES_ROOT / profile_id
+    if not profile_root.is_dir() or profile_root.is_symlink():
+        fail(f"unknown profile: {profile_id}")
+    metadata = load_json_object(profile_root / "profile.json", f"profile {profile_id} metadata")
+    require_exact_keys(
+        metadata,
+        {
+            "schema_version",
+            "id",
+            "description",
+            "default",
+            "settings",
+            "launch_args",
+            "tool_boundary",
+            "os_security_boundary",
+        },
+        f"profile {profile_id} metadata",
+    )
+    if metadata["schema_version"] != 1:
+        fail(f"profile {profile_id} metadata has unsupported schema")
+    if metadata["id"] != profile_id:
+        fail(f"profile {profile_id} metadata identity mismatch")
+    if not isinstance(metadata["default"], bool):
+        fail(f"profile {profile_id} default must be boolean")
+    settings = metadata["settings"]
+    if not isinstance(settings, dict):
+        fail(f"profile {profile_id} settings must be an object")
+    allowed_settings = {"defaultProjectTrust", "sessionDir"}
+    unknown = sorted(set(settings) - allowed_settings)
+    if unknown:
+        fail(f"profile {profile_id} has unsupported managed settings: {', '.join(unknown)}")
+    if "defaultProjectTrust" in settings and settings["defaultProjectTrust"] not in {
+        "always",
+        "ask",
+        "never",
+    }:
+        fail(f"profile {profile_id} defaultProjectTrust is invalid")
+    if "sessionDir" in settings and (
+        not isinstance(settings["sessionDir"], str) or settings["sessionDir"].startswith("/")
+    ):
+        fail(f"profile {profile_id} sessionDir must be a relative string")
+    validate_string_array(metadata["launch_args"], f"profile {profile_id} launch_args")
+    if not isinstance(metadata["tool_boundary"], str):
+        fail(f"profile {profile_id} tool_boundary must be a string")
+    if metadata["os_security_boundary"] is not False:
+        fail(f"profile {profile_id} must not claim an OS security boundary")
+    return metadata
+
+
+def list_profiles() -> list[dict[str, Any]]:
+    if not PROFILES_ROOT.is_dir() or PROFILES_ROOT.is_symlink():
+        fail("profile catalog is missing or unsafe")
+    entries: list[dict[str, Any]] = []
+    for candidate in sorted(PROFILES_ROOT.iterdir(), key=lambda path: path.name):
+        if not candidate.is_dir() or candidate.is_symlink():
+            fail(f"profile entry must be a real directory: {candidate.name}")
+        metadata = load_profile(candidate.name)
+        entries.append(
+            {
+                "id": metadata["id"],
+                "description": metadata["description"],
+                "default": metadata["default"],
+                "launch_args": metadata["launch_args"],
+                "tool_boundary": metadata["tool_boundary"],
+            }
+        )
+    if not entries:
+        fail("profile catalog is empty")
+    default_profiles = [entry["id"] for entry in entries if entry["default"]]
+    if default_profiles != [DEFAULT_PROFILE_ID]:
+        fail("profile catalog must declare exactly the full-auto default")
+    return entries
 
 
 def list_setups() -> list[dict[str, Any]]:
@@ -520,7 +815,7 @@ def list_setups() -> list[dict[str, Any]]:
                 "description": metadata["description"],
                 "managed_files": metadata["managed_files"],
                 "builder_default_on": metadata["builder_projection"] == "default-on",
-                "launch_args": metadata["launch_args"],
+                "native_surfaces": metadata["native_surfaces"],
             }
         )
     if not entries:
@@ -528,43 +823,802 @@ def list_setups() -> list[dict[str, Any]]:
     return entries
 
 
-def resolve_target(raw_target: str | None) -> Path:
+def lexical_target(raw_target: str | None) -> Path:
     if not raw_target:
         fail("--target is required")
     expanded = Path(raw_target).expanduser()
     if not expanded.is_absolute():
         fail("--target must be an absolute path")
+    return expanded
+
+
+def validate_launch_workspace(path: Path, label: str) -> Path:
+    if not path.is_absolute():
+        fail(f"{label} must be an absolute path")
     try:
-        raw_info = expanded.lstat()
+        before = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
+    if stat.S_ISLNK(before.st_mode):
+        fail(f"{label} must not be a symlink")
+    if not stat.S_ISDIR(before.st_mode):
+        fail(f"{label} must be a directory")
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    except OSError as exc:
+        fail(f"cannot resolve {label}: {exc}")
+    try:
+        after = resolved.lstat()
+    except FileNotFoundError:
+        fail(f"{label} disappeared while resolving")
+    except OSError as exc:
+        fail(f"cannot re-inspect {label}: {exc}")
+    if stat.S_ISLNK(after.st_mode) or not stat.S_ISDIR(after.st_mode):
+        fail(f"{label} resolved to an unsafe directory")
+    if identity_of(before) != identity_of(after):
+        fail(f"{label} changed while resolving")
+    if not os.access(resolved, os.R_OK | os.X_OK):
+        fail(f"{label} must be accessible")
+    return resolved
+
+
+def resolve_launch_workspace(raw_workspace: str | None) -> LaunchWorkspace:
+    if raw_workspace is None:
+        try:
+            captured = Path.cwd()
+        except OSError as exc:
+            fail(f"cannot capture current workspace: {exc}")
+        return LaunchWorkspace(
+            validate_launch_workspace(captured, "current working directory"),
+            "caller-cwd",
+        )
+    workspace = Path(raw_workspace)
+    return LaunchWorkspace(validate_launch_workspace(workspace, "--workspace"), "explicit")
+
+
+def canonical_target_under_lock(target: Path) -> Path:
+    try:
+        raw_info = target.lstat()
     except FileNotFoundError:
         raw_info = None
     if raw_info is not None and stat.S_ISLNK(raw_info.st_mode):
         fail("--target must not be a symlink")
     if raw_info is not None and not stat.S_ISDIR(raw_info.st_mode):
         fail("--target must be a directory")
-    return expanded.resolve(strict=False)
+    return target.resolve(strict=False)
+
+
+@dataclass(frozen=True)
+class ExternalLock:
+    descriptor: int
+    path: Path
+    exclusive: bool
+
+
+def write_complete_fd(descriptor: int, content: bytes, label: str) -> None:
+    view = memoryview(content)
+    total = 0
+    while total < len(view):
+        written = os.write(descriptor, view[total:])
+        if written <= 0:
+            fail(f"cannot write complete {label}")
+        total += written
+
+
+def open_directory_for_sync(path: Path, label: str) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open {label} for sync: {exc}")
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} must be a directory")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def fsync_directory(path: Path, label: str) -> None:
+    descriptor = open_directory_for_sync(path, label)
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        fail(f"cannot sync {label}: {exc}")
+    finally:
+        os.close(descriptor)
+
+
+def fsync_file_descriptor(descriptor: int, label: str) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        fail(f"cannot sync {label}: {exc}")
+
+
+def bootstrap_system_temp_root() -> Path:
+    if sys.platform == "darwin":
+        return Path("/private/tmp")
+    return Path("/tmp")
+
+
+def product_lock_root_path() -> Path:
+    uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    return bootstrap_system_temp_root() / f"{LOCK_NAMESPACE_NAME}-{uid}"
+
+
+def require_product_lock_root(*, create: bool) -> Path | None:
+    system_root = bootstrap_system_temp_root()
+    system_info = require_directory(system_root, "system temp root")
+    if not stat.S_IMODE(system_info.st_mode) & stat.S_ISVTX:
+        fail("system temp root must be sticky")
+    root = product_lock_root_path()
+    info = stat_optional(root, "product lock root")
+    if info is None:
+        if not create:
+            return None
+        system_root_metadata = directory_metadata(system_root, "system temp root")
+        try:
+            root.mkdir(mode=OWNER_DIRECTORY_MODE)
+            lifecycle_hook("lock.product.root.mkdir")
+            os.chmod(root, OWNER_DIRECTORY_MODE)
+            fsync_directory(system_root, "system temp root")
+        except BaseException:
+            removed_root = False
+            try:
+                root.rmdir()
+                removed_root = True
+                fsync_directory(system_root, "system temp root")
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            if removed_root:
+                restore_directory_metadata(
+                    system_root,
+                    system_root_metadata,
+                    "system temp root",
+                    require_nlink=False,
+                )
+                fsync_directory(system_root, "system temp root")
+            raise
+        info = require_directory(root, "product lock root")
+    if not stat.S_ISDIR(info.st_mode):
+        fail("product lock root must be a directory")
+    require_current_user_owner(info, "product lock root")
+    if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail("product lock root must be private")
+    return root
+
+
+def product_anchor_path(root: Path) -> Path:
+    return root / LOCK_PRODUCT_ANCHOR_NAME
+
+
+def target_anchor_digest(canonical_target: Path) -> str:
+    return sha256_bytes(f"{PRODUCT_NAME}\0{canonical_target}".encode("utf-8"))
+
+
+def target_anchor_path(root: Path, canonical_target: Path) -> Path:
+    return root / f"{target_anchor_digest(canonical_target)}{LOCK_TARGET_SUFFIX}"
+
+
+def lstat_no_follow(path: Path, label: str) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
+
+
+def cold_product_namespace_snapshot(root: Path | None) -> dict[str, Any]:
+    if root is None:
+        return {"state": "absent"}
+    root_info = require_directory(root, "product lock root")
+    require_current_user_owner(root_info, "product lock root")
+    if stat.S_IMODE(root_info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail("product lock root must be private")
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        fail(f"cannot inspect product lock root: {exc}")
+    if len(entries) > LOCK_NAMESPACE_SCAN_ENTRY_LIMIT:
+        fail("product lock namespace exceeds the bounded entry limit")
+    for entry in entries:
+        info = lstat_no_follow(entry, "product lock namespace entry")
+        if info is None:
+            continue
+        if entry.name == LOCK_PRODUCT_ANCHOR_NAME:
+            fail("product anchor appeared during cold inspection")
+        if re.fullmatch(re.escape(LOCK_TEMP_PREFIX) + r"[0-9]+\.[0-9a-f]+\.tmp", entry.name):
+            fail("product publication alias exists without product coordination anchor")
+        if entry.name.endswith(LOCK_TARGET_SUFFIX):
+            fail("target anchor exists without product coordination anchor")
+        fail(f"product lock namespace contains an unknown object: {entry.name}")
+    return {
+        "state": "present-empty",
+        "uid": root_info.st_uid,
+        "mode": stat.S_IMODE(root_info.st_mode),
+        "dev": root_info.st_dev,
+        "ino": root_info.st_ino,
+        "nlink": root_info.st_nlink,
+        "size": root_info.st_size,
+        "mtime_ns": root_info.st_mtime_ns,
+    }
+
+
+def product_anchor_present_no_follow(root: Path) -> bool:
+    return lstat_no_follow(product_anchor_path(root), "product anchor") is not None
+
+
+def cold_namespace_changed(before: dict[str, Any]) -> bool:
+    root = require_product_lock_root(create=False)
+    try:
+        after = cold_product_namespace_snapshot(root)
+    except PiSetupError:
+        if root is not None and product_anchor_present_no_follow(root):
+            return True
+        raise
+    return after != before
+
+
+def cold_namespace_should_retry(before: dict[str, Any]) -> bool:
+    if cold_namespace_changed(before):
+        lifecycle_hook("lock.cold.retry")
+        return True
+    return False
+
+
+def anchor_binding(kind: str, canonical_target: Path | None = None) -> dict[str, Any]:
+    binding: dict[str, Any] = {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "kind": kind,
+        "namespace": LOCK_NAMESPACE_NAME,
+    }
+    if kind == "product":
+        return binding
+    if kind == "target" and canonical_target is not None:
+        binding["canonical_target"] = str(canonical_target)
+        binding["target_digest"] = target_anchor_digest(canonical_target)
+        return binding
+    fail("invalid external lock binding request")
+
+
+def read_fd_bounded(descriptor: int, label: str, *, max_bytes: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            fail(f"{label} is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def validate_anchor_descriptor(
+    path: Path,
+    descriptor: int,
+    expected_binding: dict[str, Any],
+    *,
+    allow_publication_alias: bool,
+) -> os.stat_result:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        fail("external lock anchor must be a regular file")
+    require_current_user_owner(opened, "external lock anchor")
+    if stat.S_IMODE(opened.st_mode) != OWNER_FILE_MODE:
+        fail("external lock anchor must have mode 0600")
+    if opened.st_nlink != 1 and not (allow_publication_alias and opened.st_nlink == 2):
+        fail("external lock anchor has unsafe link count")
+    try:
+        final = path.lstat()
+    except FileNotFoundError:
+        fail("external lock anchor is missing")
+    if stat.S_ISLNK(final.st_mode) or not stat.S_ISREG(final.st_mode):
+        fail("external lock anchor must be a regular file")
+    require_current_user_owner(final, "external lock anchor")
+    if stat.S_IMODE(final.st_mode) != OWNER_FILE_MODE:
+        fail("external lock anchor must have mode 0600")
+    if final.st_size > LOCK_BINDING_MAX_BYTES:
+        fail("external lock anchor binding is too large")
+    if identity_of(opened) != identity_of(final):
+        fail("external lock anchor changed while opening")
+    if final.st_nlink != opened.st_nlink:
+        fail("external lock anchor link count changed while opening")
+    content = read_fd_bounded(descriptor, "external lock binding", max_bytes=LOCK_BINDING_MAX_BYTES)
+    if not content:
+        fail("external lock binding is empty")
+    binding = parse_json_object(content, "external lock binding")
+    if binding != expected_binding:
+        fail("external lock binding mismatch")
+    return opened
+
+
+def publication_aliases(parent: Path, final: Path, final_info: os.stat_result) -> list[Path]:
+    aliases: list[Path] = []
+    try:
+        entries = list(parent.iterdir())
+    except OSError as exc:
+        fail(f"cannot inspect external lock parent: {exc}")
+    pattern = re.compile(re.escape(LOCK_TEMP_PREFIX) + r"[0-9]+\.[0-9a-f]+\.tmp\Z")
+    for entry in entries:
+        if entry.name == final.name:
+            continue
+        if not pattern.fullmatch(entry.name):
+            continue
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if identity_of(info) == identity_of(final_info):
+            aliases.append(entry)
+        else:
+            fail("external lock publication alias state is ambiguous")
+    return aliases
+
+
+def anchor_stage_paths(parent: Path) -> list[Path]:
+    pattern = re.compile(re.escape(LOCK_TEMP_PREFIX) + r"[0-9]+\.[0-9a-f]+\.tmp\Z")
+    try:
+        entries = list(parent.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        fail(f"cannot inspect external lock parent: {exc}")
+    if len(entries) > LOCK_NAMESPACE_SCAN_ENTRY_LIMIT:
+        fail("external lock parent exceeds the bounded entry limit")
+    stages: list[Path] = []
+    for entry in entries:
+        if not entry.name.startswith(LOCK_TEMP_PREFIX):
+            continue
+        if not pattern.fullmatch(entry.name):
+            fail("external lock pre-publication stage name is unsafe")
+        stages.append(entry)
+    return sorted(stages)
+
+
+def validate_anchor_stage(
+    path: Path,
+    *,
+    allow_linked_final: bool,
+) -> tuple[os.stat_result, dict[str, Any]]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail("external lock pre-publication stage disappeared")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("external lock pre-publication stage must be a regular file")
+    require_current_user_owner(info, "external lock pre-publication stage")
+    if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail("external lock pre-publication stage must have mode 0600")
+    if info.st_nlink != 1 and not (allow_linked_final and info.st_nlink == 2):
+        fail("external lock pre-publication stage has unsafe link count")
+    if info.st_size > LOCK_BINDING_MAX_BYTES:
+        fail("external lock pre-publication stage binding is too large")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open external lock pre-publication stage: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            fail("external lock pre-publication stage changed while opening")
+        if opened.st_nlink != info.st_nlink:
+            fail("external lock pre-publication stage link count changed while opening")
+        content = read_fd_bounded(
+            descriptor,
+            "external lock pre-publication stage binding",
+            max_bytes=LOCK_BINDING_MAX_BYTES,
+        )
+    finally:
+        os.close(descriptor)
+    if not content:
+        fail("external lock pre-publication stage binding is empty")
+    binding = parse_json_object(content, "external lock pre-publication stage binding")
+    validate_anchor_stage_binding(binding)
+    return info, binding
+
+
+def validate_anchor_stage_binding(binding: dict[str, Any]) -> None:
+    common = {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "namespace": LOCK_NAMESPACE_NAME,
+    }
+    kind = binding.get("kind")
+    if kind == "product":
+        if binding != {**common, "kind": "product"}:
+            fail("external lock pre-publication stage binding mismatch")
+        return
+    if kind != "target":
+        fail("external lock pre-publication stage binding mismatch")
+    if set(binding) != {*common.keys(), "kind", "canonical_target", "target_digest"}:
+        fail("external lock pre-publication stage binding mismatch")
+    canonical = binding.get("canonical_target")
+    digest = binding.get("target_digest")
+    if not isinstance(canonical, str) or not canonical.startswith("/"):
+        fail("external lock pre-publication stage binding mismatch")
+    if not isinstance(digest, str) or digest != target_anchor_digest(Path(canonical)):
+        fail("external lock pre-publication stage binding mismatch")
+
+
+def validated_anchor_stages(
+    parent: Path,
+    expected_binding: dict[str, Any],
+    *,
+    allow_linked_final: bool,
+) -> list[Path]:
+    stages = anchor_stage_paths(parent)
+    for stage in stages:
+        _, binding = validate_anchor_stage(stage, allow_linked_final=allow_linked_final)
+        if binding != expected_binding:
+            fail("external lock pre-publication stage binding mismatch")
+    return stages
+
+
+def recover_anchor_publication_alias(path: Path, descriptor: int, expected: dict[str, Any]) -> None:
+    opened = validate_anchor_descriptor(path, descriptor, expected, allow_publication_alias=True)
+    stages = validated_anchor_stages(
+        path.parent, expected, allow_linked_final=True
+    )
+    if opened.st_nlink == 2:
+        linked_aliases = []
+        for stage in stages:
+            try:
+                stage_info = stage.lstat()
+            except FileNotFoundError:
+                continue
+            if identity_of(stage_info) == identity_of(opened):
+                linked_aliases.append(stage)
+        if len(linked_aliases) != 1:
+            fail("external lock publication alias state is ambiguous")
+    elif opened.st_nlink != 1:
+        fail("external lock anchor has unsafe link count")
+    if not stages:
+        return
+    parent_metadata = directory_metadata(path.parent, "external lock parent")
+    try:
+        for stage in stages:
+            with contextlib.suppress(FileNotFoundError):
+                stage.unlink()
+                lifecycle_hook(f"lock.{expected['kind']}.stage.unlink")
+        fsync_directory(path.parent, "external lock parent")
+        restore_directory_metadata(
+            path.parent,
+            parent_metadata,
+            "external lock parent",
+            require_nlink=False,
+        )
+        fsync_directory(path.parent, "external lock parent")
+    except OSError as exc:
+        fail(f"cannot recover external lock publication stage: {exc}")
+    validate_anchor_descriptor(path, descriptor, expected, allow_publication_alias=False)
+
+
+def open_anchor_no_create(
+    path: Path,
+    expected: dict[str, Any],
+    *,
+    exclusive: bool,
+    recover_alias: bool,
+) -> ExternalLock:
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        fail(f"cannot open external lock anchor: {exc}")
+    locked = False
+    try:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(descriptor, operation)
+        locked = True
+        if recover_alias:
+            recover_anchor_publication_alias(path, descriptor, expected)
+        else:
+            validate_anchor_descriptor(path, descriptor, expected, allow_publication_alias=False)
+        return ExternalLock(descriptor=descriptor, path=path, exclusive=exclusive)
+    except OSError as exc:
+        fail(f"cannot lock external anchor: {exc}")
+    except BaseException:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        raise
+
+
+def close_external_lock(lock: ExternalLock | None) -> None:
+    if lock is None:
+        return
+    with contextlib.suppress(OSError):
+        fcntl.flock(lock.descriptor, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(lock.descriptor)
+
+
+def publish_anchor_no_replace(parent: Path, final: Path, binding: dict[str, Any]) -> None:
+    content = canonical_json(binding)
+    if len(content) > LOCK_BINDING_MAX_BYTES:
+        fail("external lock binding is too large")
+    parent_metadata_before_temp = directory_metadata(parent, "external lock parent")
+    parent_metadata_after_final: dict[str, Any] | None = None
+    temp = parent / f"{LOCK_TEMP_PREFIX}{os.getpid()}.{time.monotonic_ns():x}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(temp, flags, OWNER_FILE_MODE)
+    final_visible = False
+    try:
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        lifecycle_hook(f"lock.{binding['kind']}.temp.chmod")
+        write_complete_fd(descriptor, content, "external lock binding")
+        lifecycle_hook(f"lock.{binding['kind']}.temp.write")
+        os.fsync(descriptor)
+        lifecycle_hook(f"lock.{binding['kind']}.temp.fsync")
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.link(temp, final)
+            final_visible = True
+            lifecycle_hook(f"lock.{binding['kind']}.final.visible")
+        except FileExistsError:
+            parent_metadata_after_final = directory_metadata(parent, "external lock parent")
+            return
+        parent_metadata_after_final = directory_metadata(parent, "external lock parent")
+        fsync_directory(parent, "external lock parent")
+        lifecycle_hook(f"lock.{binding['kind']}.parent.fsync")
+    finally:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        temp_removed = False
+        try:
+            temp.unlink()
+            temp_removed = True
+            lifecycle_hook(f"lock.{binding['kind']}.alias.cleanup")
+        except FileNotFoundError:
+            pass
+        if temp_removed:
+            fsync_directory(parent, "external lock parent")
+            restore_directory_metadata(
+                parent,
+                parent_metadata_after_final
+                if final_visible or parent_metadata_after_final is not None
+                else parent_metadata_before_temp,
+                "external lock parent",
+                require_nlink=False,
+            )
+            fsync_directory(parent, "external lock parent")
+
+
+def ensure_anchor(
+    path: Path,
+    expected: dict[str, Any],
+    *,
+    exclusive: bool,
+    create: bool,
+    recover_alias: bool,
+) -> ExternalLock | None:
+    try:
+        lock = open_anchor_no_create(
+            path, expected, exclusive=exclusive, recover_alias=recover_alias
+        )
+        if not recover_alias and anchor_stage_paths(path.parent):
+            try:
+                validated_anchor_stages(path.parent, expected, allow_linked_final=False)
+            finally:
+                close_external_lock(lock)
+            fail("external lock pre-publication stage requires exclusive recovery")
+        return lock
+    except FileNotFoundError:
+        if not create:
+            if anchor_stage_paths(path.parent):
+                validated_anchor_stages(path.parent, expected, allow_linked_final=False)
+                fail("external lock pre-publication stage exists without final anchor")
+            return None
+    if not recover_alias:
+        fail("external lock pre-publication stage requires exclusive recovery")
+    stages = validated_anchor_stages(path.parent, expected, allow_linked_final=False)
+    if stages:
+        selected = stages[0]
+        try:
+            os.link(selected, path)
+            lifecycle_hook(f"lock.{expected['kind']}.stage.final.visible")
+        except FileExistsError:
+            pass
+        except FileNotFoundError:
+            try:
+                return open_anchor_no_create(
+                    path, expected, exclusive=exclusive, recover_alias=recover_alias
+                )
+            except FileNotFoundError:
+                fail("external lock pre-publication stage disappeared without final anchor")
+        return open_anchor_no_create(
+            path, expected, exclusive=exclusive, recover_alias=recover_alias
+        )
+    publish_anchor_no_replace(path.parent, path, expected)
+    return open_anchor_no_create(path, expected, exclusive=exclusive, recover_alias=recover_alias)
+
+
+def acquire_product_coordination(
+    *, exclusive: bool, create: bool, recover_alias: bool
+) -> tuple[Path | None, ExternalLock | None]:
+    root_was_absent = False
+    system_root_metadata: dict[str, Any] | None = None
+    if create:
+        root_was_absent = stat_optional(product_lock_root_path(), "product lock root") is None
+        if root_was_absent:
+            system_root_metadata = directory_metadata(
+                bootstrap_system_temp_root(), "system temp root"
+            )
+    root = require_product_lock_root(create=create)
+    if root is None:
+        return None, None
+    try:
+        lock = ensure_anchor(
+            product_anchor_path(root),
+            anchor_binding("product"),
+            exclusive=exclusive,
+            create=create,
+            recover_alias=recover_alias,
+        )
+    except BaseException:
+        if create and root_was_absent:
+            if stat_optional(product_anchor_path(root), "product anchor") is None:
+                removed_root = False
+                with contextlib.suppress(OSError):
+                    root.rmdir()
+                    removed_root = True
+                    fsync_directory(bootstrap_system_temp_root(), "system temp root")
+                if removed_root and system_root_metadata is not None:
+                    restore_directory_metadata(
+                        bootstrap_system_temp_root(),
+                        system_root_metadata,
+                        "system temp root",
+                        require_nlink=False,
+                    )
+                    fsync_directory(bootstrap_system_temp_root(), "system temp root")
+        raise
+    return root, lock
+
+
+@contextlib.contextmanager
+def product_coordination(
+    *, exclusive: bool, create: bool, recover_alias: bool
+) -> Iterator[tuple[Path | None, ExternalLock | None]]:
+    root, lock = acquire_product_coordination(
+        exclusive=exclusive,
+        create=create,
+        recover_alias=recover_alias,
+    )
+    try:
+        yield root, lock
+    finally:
+        close_external_lock(lock)
+
+
+@contextlib.contextmanager
+def external_target_coordination(target: Path, *, mutation: bool) -> Iterator[tuple[Path, bool]]:
+    if mutation:
+        root, product_lock = acquire_product_coordination(
+            exclusive=True, create=True, recover_alias=True
+        )
+        target_lock_obj: ExternalLock | None = None
+        try:
+            canonical = canonical_target_under_lock(target)
+            if root is None:
+                fail("product lock root disappeared during mutation")
+            target_lock_obj = ensure_anchor(
+                target_anchor_path(root, canonical),
+                anchor_binding("target", canonical),
+                exclusive=True,
+                create=True,
+                recover_alias=True,
+            )
+            if target_lock_obj is None:
+                fail("target lock anchor was not created")
+            lifecycle_hook("lock.target.handoff")
+        finally:
+            close_external_lock(product_lock)
+        try:
+            yield canonical, True
+        finally:
+            close_external_lock(target_lock_obj)
+        return
+
+    root = require_product_lock_root(create=False)
+    if root is None or not product_anchor_present_no_follow(root):
+        before = cold_product_namespace_snapshot(root)
+        canonical = canonical_target_under_lock(target)
+        try:
+            yield canonical, False
+        except BaseException:
+            raise
+        if cold_namespace_should_retry(before):
+            raise RetryColdInspection("product coordination changed during cold read")
+        return
+    product_root, product_lock = acquire_product_coordination(
+        exclusive=False, create=False, recover_alias=False
+    )
+    target_lock_obj: ExternalLock | None = None
+    hold_product_during_read = True
+    try:
+        canonical = canonical_target_under_lock(target)
+        if product_root is None:
+            fail("product lock root disappeared during read")
+        target_anchor = target_anchor_path(product_root, canonical)
+        target_lock_obj = ensure_anchor(
+            target_anchor,
+            anchor_binding("target", canonical),
+            exclusive=False,
+            create=False,
+            recover_alias=False,
+        )
+        if target_lock_obj is not None:
+            hold_product_during_read = False
+            close_external_lock(product_lock)
+            product_lock = None
+    except BaseException:
+        close_external_lock(target_lock_obj)
+        close_external_lock(product_lock)
+        raise
+    try:
+        yield canonical, target_lock_obj is not None
+    finally:
+        close_external_lock(target_lock_obj)
+        if hold_product_during_read:
+            close_external_lock(product_lock)
 
 
 def backup_pool(target: Path) -> Path:
     return target.parent / f".{target.name}.nddev-pi-backups"
 
 
-def lock_dir(target: Path) -> Path:
-    return target.parent / f".{target.name}.nddev-pi.lock"
-
-
 @contextlib.contextmanager
-def target_lock(target: Path) -> Iterator[None]:
-    lock = lock_dir(target)
-    try:
-        os.mkdir(lock, OWNER_DIRECTORY_MODE)
-    except FileExistsError:
-        fail("target is already locked by another nddev-pi operation")
-    try:
-        yield
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            lock.rmdir()
+def target_lock(target: Path, *, mutation: bool = True) -> Iterator[Path]:
+    with external_target_coordination(target, mutation=mutation) as (canonical, _):
+        yield canonical
+
+
+def read_only_target(target: Path, callback: Any) -> Any:
+    for _ in range(3):
+        try:
+            with target_lock(target, mutation=False) as canonical:
+                return callback(canonical)
+        except RetryColdInspection:
+            continue
+    fail("product coordination changed repeatedly during read")
 
 
 def ensure_directory(path: Path) -> None:
@@ -588,28 +1642,62 @@ def ensure_target_directory(target: Path) -> bool:
     return False
 
 
-def safe_write_file(path: Path, content: bytes) -> None:
+def durable_replace_private_file(
+    path: Path,
+    content: bytes,
+    *,
+    mode: int,
+    label: str,
+) -> None:
     parent = path.parent
-    ensure_directory(parent)
-    try:
-        require_regular_file(path, path.as_posix(), max_bytes=MANAGED_PAYLOAD_MAX_BYTES)
-    except FileNotFoundError:
-        raise
-    except PiSetupError as exc:
-        if "is missing" not in str(exc):
-            raise
     temporary = parent / f".{path.name}.tmp-{os.getpid()}-{time.monotonic_ns()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    descriptor = os.open(temporary, flags, OWNER_FILE_MODE)
+    descriptor = os.open(temporary, flags, mode)
+    descriptor_open = True
     try:
-        os.write(descriptor, content)
-        os.fsync(descriptor)
-    finally:
+        os.fchmod(descriptor, mode)
+        lifecycle_hook(f"write.{label}.temp.chmod")
+        write_complete_fd(descriptor, content, label)
+        lifecycle_hook(f"write.{label}.temp.write")
+        fsync_file_descriptor(descriptor, label)
+        lifecycle_hook(f"write.{label}.temp.fsync")
         os.close(descriptor)
-    os.replace(temporary, path)
-    path.chmod(OWNER_FILE_MODE)
+        descriptor_open = False
+        os.replace(temporary, path)
+        lifecycle_hook(f"write.{label}.final.replace")
+        fsync_directory(parent, f"{label} parent")
+        lifecycle_hook(f"write.{label}.parent.fsync")
+    except BaseException:
+        if descriptor_open:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        removed = False
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+            removed = True
+        if removed:
+            with contextlib.suppress(PiSetupError):
+                fsync_directory(parent, f"{label} parent")
+        raise
+
+
+def safe_write_file(path: Path, content: bytes, *, label: str | None = None) -> None:
+    parent = path.parent
+    ensure_directory(parent)
+    info = stat_optional(path, path.as_posix())
+    if info is not None:
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"{path} must be a regular file")
+        require_current_user_owner(info, path.as_posix())
+        require_bounded_size(info, path.as_posix(), MANAGED_PAYLOAD_MAX_BYTES)
+    durable_replace_private_file(
+        path,
+        content,
+        mode=OWNER_FILE_MODE,
+        label=label or "managed-file",
+    )
 
 
 def read_existing_file(path: Path) -> bytes | None:
@@ -632,6 +1720,14 @@ def delete_file(path: Path) -> None:
     path.unlink()
 
 
+def unlink_regular_for_transaction(path: Path, label: str) -> None:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail(f"{label} must be a regular file")
+    require_current_user_owner(info, label)
+    path.unlink()
+
+
 def delete_tree(path: Path) -> None:
     try:
         info = path.lstat()
@@ -644,12 +1740,1371 @@ def delete_tree(path: Path) -> None:
     shutil.rmtree(path)
 
 
+def directory_metadata(path: Path, label: str) -> dict[str, Any] | None:
+    info = stat_optional(path, label)
+    if info is None:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        fail(f"{label} must be a directory")
+    return {
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "nlink": info.st_nlink,
+        "atime_ns": info.st_atime_ns,
+        "mtime_ns": info.st_mtime_ns,
+    }
+
+
+def restore_directory_metadata(
+    path: Path,
+    expected: dict[str, Any] | None,
+    label: str,
+    *,
+    require_nlink: bool = True,
+) -> None:
+    if expected is None:
+        with contextlib.suppress(OSError):
+            path.rmdir()
+        return
+    descriptor = open_directory_for_sync(path, label)
+    try:
+        info = os.fstat(descriptor)
+        checks = {
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+        }
+        if require_nlink:
+            checks["nlink"] = info.st_nlink
+        for key, value in checks.items():
+            if expected.get(key) != value:
+                fail(f"{label} identity changed")
+        if stat.S_IMODE(info.st_mode) != expected["mode"]:
+            os.fchmod(descriptor, expected["mode"])
+        if os.utime in os.supports_fd:
+            os.utime(descriptor, ns=(expected["atime_ns"], expected["mtime_ns"]))
+        else:
+            os.utime(path, ns=(expected["atime_ns"], expected["mtime_ns"]), follow_symlinks=False)
+    finally:
+        os.close(descriptor)
+
+
+def managed_parent_relatives(relatives: list[str]) -> list[Path]:
+    parents: set[Path] = {Path(".")}
+    for relative in relatives:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            parents.add(parent)
+            parent = parent.parent
+    return sorted(parents, key=lambda item: len(item.parts), reverse=True)
+
+
+@dataclass
+class ManagedHeldFile:
+    relative: str
+    existed: bool
+    hold_path: Path | None
+    content: bytes | None
+    mode: int | None
+    size: int | None
+    sha256: str | None
+
+
+class ManagedFileTransaction:
+    """Preserve managed file objects until the whole setup mutation commits."""
+
+    def __init__(self, target: Path, relatives: list[str]) -> None:
+        self.target = target
+        self.relatives = relatives
+        self.tx_dir = target / f".nddev-pi-managed-txn.{os.getpid()}.{time.monotonic_ns():x}"
+        self.held: dict[str, ManagedHeldFile] = {}
+        self.parents = {
+            relative.as_posix(): directory_metadata(target / relative, f"managed parent {relative}")
+            for relative in managed_parent_relatives(relatives)
+        }
+        ensure_directory(self.tx_dir)
+        fsync_directory(target, "target")
+        for relative in relatives:
+            path = target / relative
+            info = stat_optional(path, f"managed file {relative}")
+            if info is None:
+                self.held[relative] = ManagedHeldFile(
+                    relative=relative,
+                    existed=False,
+                    hold_path=None,
+                    content=None,
+                    mode=None,
+                    size=None,
+                    sha256=None,
+                )
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                fail(f"managed file {relative} must be a regular non-hard-linked file")
+            content = read_regular_file(path, f"managed file {relative}")
+            hold = self.tx_dir / f"{sha256_bytes(relative.encode('utf-8'))}.held"
+            os.link(path, hold)
+            fsync_directory(self.tx_dir, "managed transaction")
+            self.held[relative] = ManagedHeldFile(
+                relative=relative,
+                existed=True,
+                hold_path=hold,
+                content=content,
+                mode=stat.S_IMODE(info.st_mode),
+                size=len(content),
+                sha256=sha256_bytes(content),
+            )
+
+    def files_for_backup(self) -> dict[str, str | None]:
+        files: dict[str, str | None] = {}
+        for relative in self.relatives:
+            held = self.held[relative]
+            files[relative] = (
+                None if held.content is None else base64.b64encode(held.content).decode("ascii")
+            )
+        return files
+
+    def rollback(self) -> None:
+        errors: list[str] = []
+        for relative in reversed(self.relatives):
+            held = self.held[relative]
+            path = self.target / relative
+            try:
+                if held.existed:
+                    if held.hold_path is None:
+                        fail(f"managed file {relative} has no held object")
+                    with contextlib.suppress(FileNotFoundError):
+                        delete_file(path)
+                    ensure_directory(path.parent)
+                    os.link(held.hold_path, path)
+                    if held.mode is not None:
+                        os.chmod(path, held.mode)
+                    fsync_directory(path.parent, f"managed file {relative} parent")
+                else:
+                    with contextlib.suppress(FileNotFoundError):
+                        delete_file(path)
+                        fsync_directory(path.parent, f"managed file {relative} parent")
+            except BaseException as exc:
+                errors.append(f"{relative}: {exc}")
+        for relative in managed_parent_relatives(self.relatives):
+            label = relative.as_posix()
+            try:
+                restore_directory_metadata(self.target / relative, self.parents[label], label)
+            except BaseException as exc:
+                errors.append(f"{label}: {exc}")
+        try:
+            self.cleanup()
+        except BaseException as exc:
+            errors.append(f"transaction cleanup: {exc}")
+        if errors:
+            fail("managed rollback failed: " + "; ".join(errors))
+
+    def cleanup(self) -> None:
+        for hold in self.tx_dir.iterdir():
+            info = hold.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                fail("managed held object must be a regular file")
+            hold.unlink()
+        fsync_directory(self.tx_dir, "managed transaction")
+        self.tx_dir.rmdir()
+        fsync_directory(self.target, "target")
+
+
+def remove_builder_projection_dirs(target: Path) -> None:
+    for relative in (
+        BUILDER_SKILL_DIR / "SKILL.md",
+        BUILDER_PACKAGE_DIR / "skills" / "nddev-builder" / "SKILL.md",
+        BUILDER_PACKAGE_DIR / "package.json",
+    ):
+        delete_file(target / relative)
+    for relative in (
+        BUILDER_PACKAGE_DIR / "skills" / "nddev-builder",
+        BUILDER_PACKAGE_DIR / "skills",
+        BUILDER_PACKAGE_DIR,
+        BUILDER_SKILL_DIR,
+        BUILDER_SKILL_DIR.parent,
+    ):
+        path = target / relative
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            fail(f"{path} must be a managed directory")
+        path.rmdir()
+
+
+def cleanup_parent(target: Path) -> Path:
+    return target / CLEANUP_DIR_NAME
+
+
+def cleanup_tombstones(target: Path) -> Path:
+    return cleanup_parent(target) / CLEANUP_TOMBSTONES_NAME
+
+
+def cleanup_intent_path(target: Path) -> Path:
+    return cleanup_parent(target) / CLEANUP_INTENT_NAME
+
+
+def cleanup_journal_path(target: Path) -> Path:
+    return cleanup_parent(target) / CLEANUP_JOURNAL_NAME
+
+
+def bounded_relative(value: str, label: str) -> Path:
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        fail(f"{label} must be a relative path")
+    relative = Path(value)
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        fail(f"{label} must be bounded and normalized")
+    if len(relative.as_posix()) > 160:
+        fail(f"{label} is too long")
+    return relative
+
+
+def anchor_path(target: Path, anchor: str) -> Path:
+    if anchor == "target":
+        return target
+    if anchor == "backup_pool":
+        return backup_pool(target)
+    if anchor == "cleanup":
+        return cleanup_parent(target)
+    fail(f"unknown cleanup anchor: {anchor!r}")
+
+
+def anchored_path(target: Path, anchor: str, relative: str) -> Path:
+    return anchor_path(target, anchor) / bounded_relative(relative, "cleanup relative path")
+
+
+def snapshot_cleanup_tree(path: Path, label: str) -> dict[str, Any]:
+    try:
+        root_info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    if stat.S_ISLNK(root_info.st_mode):
+        fail(f"{label} must not be a symlink")
+    if not stat.S_ISDIR(root_info.st_mode) and not stat.S_ISREG(root_info.st_mode):
+        fail(f"{label} must be a regular file or directory")
+    require_current_user_owner(root_info, label)
+    entries: list[dict[str, Any]] = []
+    total = 0
+    if stat.S_ISDIR(root_info.st_mode):
+        paths = [path, *sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix())]
+    else:
+        paths = [path]
+    if len(paths) > CLEANUP_MAX_OBJECTS:
+        fail(f"{label} exceeds cleanup object bound")
+    for item in paths:
+        relative = "." if item == path else item.relative_to(path).as_posix()
+        info = item.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        record: dict[str, Any] = {
+            "relative": relative,
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "mode": mode,
+            "nlink": info.st_nlink,
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+        }
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"{label} contains a symlink: {relative}")
+        if stat.S_ISDIR(info.st_mode):
+            record["kind"] = "directory"
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                fail(f"{label} contains a hard-linked file: {relative}")
+            content = read_regular_file(
+                item, f"{label}:{relative}", max_bytes=SOFTWARE_FILE_MAX_BYTES
+            )
+            total += len(content)
+            if total > CLEANUP_MAX_BYTES:
+                fail(f"{label} exceeds cleanup byte bound")
+            record["kind"] = "file"
+            record["sha256"] = sha256_bytes(content)
+        else:
+            fail(f"{label} contains an unsupported object: {relative}")
+        entries.append(record)
+    return {"objects": entries, "object_count": len(entries), "byte_count": total}
+
+
+def validate_cleanup_tree(path: Path, expected: dict[str, Any], label: str) -> None:
+    if snapshot_cleanup_tree(path, label) != expected:
+        fail(f"{label} identity mismatch")
+
+
+def cleanup_snapshot_records(expected: dict[str, Any], label: str) -> dict[str, dict[str, Any]]:
+    objects = expected.get("objects")
+    if not isinstance(objects, list):
+        fail(f"{label} snapshot objects are invalid")
+    records: dict[str, dict[str, Any]] = {}
+    for item in objects:
+        if not isinstance(item, dict) or "relative" not in item:
+            fail(f"{label} snapshot object is invalid")
+        relative = item["relative"]
+        if not isinstance(relative, str):
+            fail(f"{label} snapshot relative path is invalid")
+        if relative != ".":
+            bounded_relative(relative, f"{label} snapshot relative path")
+        if relative in records:
+            fail(f"{label} snapshot contains duplicate object")
+        kind = item.get("kind")
+        if kind == "directory":
+            expected_keys = {
+                "relative",
+                "uid",
+                "gid",
+                "mode",
+                "nlink",
+                "dev",
+                "ino",
+                "size",
+                "mtime_ns",
+                "kind",
+            }
+        elif kind == "file":
+            expected_keys = {
+                "relative",
+                "uid",
+                "gid",
+                "mode",
+                "nlink",
+                "dev",
+                "ino",
+                "size",
+                "mtime_ns",
+                "kind",
+                "sha256",
+            }
+        else:
+            fail(f"{label} snapshot object kind is invalid")
+        if set(item) != expected_keys:
+            fail(f"{label} snapshot object schema is invalid")
+        records[relative] = item
+    if expected.get("object_count") != len(records):
+        fail(f"{label} snapshot object count mismatch")
+    if "." not in records:
+        fail(f"{label} snapshot root is missing")
+    return records
+
+
+def validate_cleanup_object(
+    path: Path,
+    expected: dict[str, Any],
+    label: str,
+    *,
+    exact_directory_metadata: bool = True,
+) -> None:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        fail(f"{label} must not be a symlink")
+    if expected["kind"] == "directory":
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} kind mismatch")
+        checks = {
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "mode": stat.S_IMODE(info.st_mode),
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+        }
+        if exact_directory_metadata:
+            checks.update(
+                {
+                    "nlink": info.st_nlink,
+                    "size": info.st_size,
+                    "mtime_ns": info.st_mtime_ns,
+                }
+            )
+        for key, value in checks.items():
+            if expected.get(key) != value:
+                fail(f"{label} identity mismatch")
+        return
+    if expected["kind"] == "file":
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"{label} kind mismatch")
+        content = read_regular_file(path, label, max_bytes=SOFTWARE_FILE_MAX_BYTES)
+        checks = {
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "mode": stat.S_IMODE(info.st_mode),
+            "nlink": info.st_nlink,
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+            "sha256": sha256_bytes(content),
+        }
+        for key, value in checks.items():
+            if expected.get(key) != value:
+                fail(f"{label} identity mismatch")
+        return
+    fail(f"{label} kind is unsupported")
+
+
+def validate_cleanup_tree_partial(path: Path, expected: dict[str, Any], label: str) -> None:
+    records = cleanup_snapshot_records(expected, label)
+    if stat_optional(path, label) is None:
+        return
+    root_info = path.lstat()
+    if stat.S_ISDIR(root_info.st_mode):
+        actual_paths = [
+            path,
+            *sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()),
+        ]
+    else:
+        actual_paths = [path]
+    actual_relatives = {"." if item == path else item.relative_to(path).as_posix() for item in actual_paths}
+    for item in actual_paths:
+        relative = "." if item == path else item.relative_to(path).as_posix()
+        if relative not in records:
+            fail(f"{label} contains an unknown object: {relative}")
+        record = records[relative]
+        if record.get("kind") == "directory":
+            expected_descendants = cleanup_descendant_relatives(records, relative)
+            actual_descendants = cleanup_descendant_relatives(
+                {candidate: records[candidate] for candidate in actual_relatives if candidate in records},
+                relative,
+            )
+            exact_directory = expected_descendants == actual_descendants
+            validate_cleanup_object(
+                item,
+                record,
+                f"{label}:{relative}",
+                exact_directory_metadata=exact_directory,
+            )
+            if not exact_directory:
+                actual_children = cleanup_actual_child_names(item, f"{label}:{relative}")
+                expected_children = cleanup_direct_child_names(records, relative) & {
+                    Path(candidate).name
+                    for candidate in actual_relatives
+                    if cleanup_parent_relative(candidate) == relative
+                }
+                if actual_children != expected_children:
+                    fail(f"{label}:{relative} child set mismatch")
+            continue
+        validate_cleanup_object(item, record, f"{label}:{relative}")
+
+
+def cleanup_parent_relative(relative: str) -> str:
+    if relative == ".":
+        return ""
+    parent = Path(relative).parent.as_posix()
+    return "." if parent == "." else parent
+
+
+def cleanup_direct_child_names(records: dict[str, dict[str, Any]], relative: str) -> set[str]:
+    return {
+        Path(candidate).name
+        for candidate in records
+        if cleanup_parent_relative(candidate) == relative
+    }
+
+
+def cleanup_descendant_relatives(
+    records: dict[str, dict[str, Any]], relative: str
+) -> set[str]:
+    if relative == ".":
+        return set(records)
+    prefix = f"{relative}/"
+    return {candidate for candidate in records if candidate == relative or candidate.startswith(prefix)}
+
+
+def cleanup_actual_child_names(path: Path, label: str) -> set[str]:
+    try:
+        return {child.name for child in path.iterdir()}
+    except OSError as exc:
+        fail(f"cannot inspect {label} children: {exc}")
+
+
+def cleanup_parent_identity(path: Path, label: str) -> dict[str, Any]:
+    info = require_directory(path, label)
+    require_current_user_owner(info, label)
+    return {
+        "kind": "directory",
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mode": stat.S_IMODE(info.st_mode),
+        "nlink": info.st_nlink,
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "atime_ns": info.st_atime_ns,
+        "mtime_ns": info.st_mtime_ns,
+    }
+
+
+def validate_cleanup_parent_identity(path: Path, expected: dict[str, Any], label: str) -> None:
+    if cleanup_parent_identity(path, label) != expected:
+        fail(f"{label} parent identity mismatch")
+
+
+def validate_cleanup_parent_stable_identity(
+    path: Path, expected: dict[str, Any], label: str
+) -> None:
+    current = cleanup_parent_identity(path, label)
+    for key in ("kind", "uid", "gid", "mode", "dev", "ino"):
+        if current.get(key) != expected.get(key):
+            fail(f"{label} parent identity mismatch")
+
+
+def validate_cleanup_source_policy(entry: dict[str, Any], label: str) -> None:
+    purpose = entry["purpose"]
+    source_anchor = entry["source_anchor"]
+    source_relative = entry["source_relative"]
+    source_kind = entry["source_kind"]
+    if purpose == "software-current":
+        if (
+            source_anchor != "target"
+            or source_relative != f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}"
+            or source_kind != "directory"
+        ):
+            fail(f"{label} software cleanup source mismatch")
+        if not entry["tombstone_relative"].startswith(f"{CLEANUP_TOMBSTONES_NAME}/{purpose}."):
+            fail(f"{label} software cleanup tombstone mismatch")
+        return
+    if purpose == "software-entrypoint":
+        if (
+            source_anchor != "target"
+            or source_relative != software_entrypoint_relative().as_posix()
+            or source_kind != "file"
+        ):
+            fail(f"{label} software entrypoint cleanup source mismatch")
+        if not entry["tombstone_relative"].startswith(f"{CLEANUP_TOMBSTONES_NAME}/{purpose}."):
+            fail(f"{label} software entrypoint cleanup tombstone mismatch")
+        return
+    if purpose == "software-stamp":
+        if (
+            source_anchor != "target"
+            or source_relative != SOFTWARE_STAMP_NAME
+            or source_kind != "file"
+        ):
+            fail(f"{label} software stamp cleanup source mismatch")
+        if not entry["tombstone_relative"].startswith(f"{CLEANUP_TOMBSTONES_NAME}/{purpose}."):
+            fail(f"{label} software stamp cleanup tombstone mismatch")
+        return
+    fail(f"{label} cleanup purpose is unsupported")
+
+
+def validate_cleanup_replacement_policy(replacement: dict[str, Any], label: str) -> None:
+    purpose = replacement["purpose"]
+    source_anchor = replacement["source_anchor"]
+    source_relative = replacement["source_relative"]
+    source_kind = replacement["source_kind"]
+    if purpose == "software-current":
+        if (
+            source_anchor != "target"
+            or source_relative != f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}"
+            or source_kind != "directory"
+        ):
+            fail(f"{label} software replacement source mismatch")
+        return
+    if purpose == "software-entrypoint":
+        if (
+            source_anchor != "target"
+            or source_relative != software_entrypoint_relative().as_posix()
+            or source_kind != "file"
+        ):
+            fail(f"{label} software entrypoint replacement source mismatch")
+        return
+    if purpose == "software-stamp":
+        if (
+            source_anchor != "target"
+            or source_relative != SOFTWARE_STAMP_NAME
+            or source_kind != "file"
+        ):
+            fail(f"{label} software stamp replacement source mismatch")
+        return
+    fail(f"{label} cleanup replacement purpose is unsupported")
+
+
+def cleanup_entry(
+    target: Path,
+    *,
+    purpose: str,
+    source_anchor: str,
+    source_relative: str,
+    tombstone_relative: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    root_kind = cleanup_snapshot_records(snapshot, f"cleanup source {purpose}")["."].get("kind")
+    if root_kind not in {"directory", "file"}:
+        fail(f"cleanup source {purpose} kind is unsupported")
+    entry = {
+        "purpose": purpose,
+        "source_anchor": source_anchor,
+        "source_relative": source_relative,
+        "source_kind": root_kind,
+        "source_parent": cleanup_parent_identity(
+            anchored_path(target, source_anchor, source_relative).parent,
+            "cleanup source parent",
+        ),
+        "tombstone_anchor": "cleanup",
+        "tombstone_relative": tombstone_relative,
+        "tombstone_parent": cleanup_parent_identity(
+            (cleanup_parent(target) / tombstone_relative).parent,
+            "cleanup tombstone parent",
+        ),
+        "snapshot": snapshot,
+    }
+    validate_cleanup_source_policy(entry, "cleanup source")
+    return entry
+
+
+def cleanup_entries_for_pending(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for entry in entries:
+        pending_entry = dict(entry)
+        pending_entry.pop("replacement", None)
+        result.append(pending_entry)
+    return result
+
+
+def cleanup_replacement(
+    target: Path,
+    *,
+    purpose: str,
+    source_anchor: str,
+    source_relative: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    root_kind = cleanup_snapshot_records(snapshot, f"cleanup replacement {purpose}")["."].get(
+        "kind"
+    )
+    if root_kind not in {"directory", "file"}:
+        fail(f"cleanup replacement {purpose} kind is unsupported")
+    source = anchored_path(target, source_anchor, source_relative)
+    replacement = {
+        "purpose": purpose,
+        "source_anchor": source_anchor,
+        "source_relative": source_relative,
+        "source_kind": root_kind,
+        "source_parent": cleanup_parent_identity(source.parent, "cleanup replacement parent"),
+        "snapshot": snapshot,
+    }
+    validate_cleanup_replacement_policy(replacement, "cleanup replacement")
+    return replacement
+
+
+def cleanup_document(
+    target: Path,
+    *,
+    state: str,
+    entries: list[dict[str, Any]],
+    replacements: list[dict[str, Any]] | None = None,
+    restore_parents: dict[str, dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
+    if len(entries) > CLEANUP_MAX_ENTRIES:
+        fail("cleanup journal has too many entries")
+    if replacements is not None and len(replacements) > CLEANUP_MAX_ENTRIES:
+        fail("cleanup intent has too many replacements")
+    document: dict[str, Any] = {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "canonical_target": str(target),
+        "state": state,
+        "cleanup_anchor": CLEANUP_DIR_NAME,
+        "entries": entries,
+    }
+    if state == "intent":
+        document["replacements"] = replacements or []
+        document["restore_parents"] = restore_parents or {}
+    return document
+
+
+def validate_cleanup_document(
+    target: Path, document: dict[str, Any], label: str
+) -> list[dict[str, Any]]:
+    state = document.get("state")
+    document_keys = {
+        "schema_version",
+        "product_name",
+        "build_version",
+        "canonical_target",
+        "state",
+        "cleanup_anchor",
+        "entries",
+    }
+    if state == "intent":
+        document_keys.update({"replacements", "restore_parents"})
+    require_exact_keys(document, document_keys, label)
+    if document["schema_version"] != 1 or document["product_name"] != PRODUCT_NAME:
+        fail(f"{label} identity mismatch")
+    if document["canonical_target"] != str(target):
+        fail(f"{label} target mismatch")
+    if document["cleanup_anchor"] != CLEANUP_DIR_NAME:
+        fail(f"{label} cleanup anchor mismatch")
+    if state not in {"intent", "pending"}:
+        fail(f"{label} state is invalid")
+    entries = document["entries"]
+    if not isinstance(entries, list) or len(entries) > CLEANUP_MAX_ENTRIES:
+        fail(f"{label} entries are invalid")
+    seen_tombstones: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            fail(f"{label} entry must be an object")
+        entry_keys = {
+            "purpose",
+            "source_anchor",
+            "source_relative",
+            "source_kind",
+            "source_parent",
+            "tombstone_anchor",
+            "tombstone_relative",
+            "tombstone_parent",
+            "snapshot",
+        }
+        require_exact_keys(entry, entry_keys, f"{label} entry")
+        if entry["source_kind"] not in {"directory", "file"}:
+            fail(f"{label} entry source kind is unsupported")
+        if entry["source_anchor"] not in {"target", "backup_pool"}:
+            fail(f"{label} entry source anchor is invalid")
+        if entry["tombstone_anchor"] != "cleanup":
+            fail(f"{label} entry tombstone anchor is invalid")
+        bounded_relative(entry["source_relative"], f"{label} source_relative")
+        bounded_relative(entry["tombstone_relative"], f"{label} tombstone_relative")
+        for key in ("source_parent", "tombstone_parent"):
+            parent = entry[key]
+            if not isinstance(parent, dict) or set(parent) != {
+                "kind",
+                "uid",
+                "gid",
+                "mode",
+                "nlink",
+                "dev",
+                "ino",
+                "atime_ns",
+                "mtime_ns",
+            }:
+                fail(f"{label} {key} schema is invalid")
+            if parent["kind"] != "directory":
+                fail(f"{label} {key} kind is invalid")
+        validate_cleanup_source_policy(entry, label)
+        if entry["tombstone_relative"] in seen_tombstones:
+            fail(f"{label} duplicate tombstone")
+        seen_tombstones.add(entry["tombstone_relative"])
+        snapshot = entry["snapshot"]
+        if not isinstance(snapshot, dict) or set(snapshot) != {
+            "objects",
+            "object_count",
+            "byte_count",
+        }:
+            fail(f"{label} entry snapshot schema is invalid")
+        if snapshot["object_count"] != len(snapshot["objects"]):
+            fail(f"{label} entry object count mismatch")
+        root_record = cleanup_snapshot_records(snapshot, f"{label} entry snapshot")["."]
+        if root_record.get("kind") != entry["source_kind"]:
+            fail(f"{label} entry source kind does not match snapshot")
+    replacements = document.get("replacements", [])
+    if state == "pending" and replacements:
+        fail(f"{label} pending document must not contain replacement metadata")
+    if not isinstance(replacements, list) or len(replacements) > CLEANUP_MAX_ENTRIES:
+        fail(f"{label} replacements are invalid")
+    for replacement in replacements:
+        if not isinstance(replacement, dict):
+            fail(f"{label} replacement must be an object")
+        require_exact_keys(
+            replacement,
+            {"purpose", "source_anchor", "source_relative", "source_kind", "source_parent", "snapshot"},
+            f"{label} replacement",
+        )
+        if replacement["source_kind"] not in {"directory", "file"}:
+            fail(f"{label} replacement source kind is unsupported")
+        if replacement["source_anchor"] != "target":
+            fail(f"{label} replacement source anchor is invalid")
+        bounded_relative(replacement["source_relative"], f"{label} replacement source_relative")
+        source_parent = replacement["source_parent"]
+        if not isinstance(source_parent, dict) or set(source_parent) != {
+            "kind",
+            "uid",
+            "gid",
+            "mode",
+            "nlink",
+            "dev",
+            "ino",
+            "atime_ns",
+            "mtime_ns",
+        }:
+            fail(f"{label} replacement source_parent schema is invalid")
+        replacement_snapshot = replacement["snapshot"]
+        if not isinstance(replacement_snapshot, dict) or set(replacement_snapshot) != {
+            "objects",
+            "object_count",
+            "byte_count",
+        }:
+            fail(f"{label} replacement snapshot schema is invalid")
+        replacement_root = cleanup_snapshot_records(
+            replacement_snapshot, f"{label} replacement snapshot"
+        )["."]
+        if replacement_root.get("kind") != replacement["source_kind"]:
+            fail(f"{label} replacement source kind does not match snapshot")
+        validate_cleanup_replacement_policy(replacement, label)
+    restore_parents = document.get("restore_parents", {})
+    if state == "pending" and restore_parents:
+        fail(f"{label} pending document must not contain restore parent metadata")
+    if not isinstance(restore_parents, dict) or len(restore_parents) > CLEANUP_MAX_ENTRIES + 4:
+        fail(f"{label} restore parent metadata is invalid")
+    for relative, metadata in restore_parents.items():
+        if not isinstance(relative, str):
+            fail(f"{label} restore parent path is invalid")
+        bounded_relative(relative, f"{label} restore parent path")
+        if metadata is None:
+            continue
+        if not isinstance(metadata, dict) or set(metadata) != {
+            "mode",
+            "uid",
+            "gid",
+            "dev",
+            "ino",
+            "nlink",
+            "atime_ns",
+            "mtime_ns",
+        }:
+            fail(f"{label} restore parent metadata schema is invalid")
+    return entries
+
+
+def publish_json_no_replace(path: Path, payload: dict[str, Any], label: str) -> None:
+    content = canonical_json(payload)
+    if len(content) > METADATA_MAX_BYTES:
+        fail(f"{label} is too large")
+    ensure_directory(path.parent)
+    parent_metadata_before_temp = directory_metadata(path.parent, f"{label} parent")
+    parent_metadata_after_final: dict[str, Any] | None = None
+    temp = path.parent / f"{LOCK_TEMP_PREFIX}{os.getpid()}.{time.monotonic_ns():x}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(temp, flags, OWNER_FILE_MODE)
+    final_visible = False
+    try:
+        os.fchmod(fd, OWNER_FILE_MODE)
+        write_complete_fd(fd, content, label)
+        lifecycle_hook(f"cleanup.{label}.temp.write")
+        os.fsync(fd)
+        lifecycle_hook(f"cleanup.{label}.temp.fsync")
+        os.close(fd)
+        fd = -1
+        try:
+            os.link(temp, path)
+            final_visible = True
+            lifecycle_hook(f"cleanup.{label}.final.visible")
+        except FileExistsError:
+            fail(f"{label} already exists")
+        parent_metadata_after_final = directory_metadata(path.parent, f"{label} parent")
+        fsync_directory(path.parent, f"{label} parent")
+        lifecycle_hook(f"cleanup.{label}.parent.fsync")
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        temp_removed = False
+        try:
+            temp.unlink()
+            temp_removed = True
+        except FileNotFoundError:
+            pass
+        if temp_removed:
+            fsync_directory(path.parent, f"{label} parent")
+            restore_directory_metadata(
+                path.parent,
+                parent_metadata_after_final if final_visible else parent_metadata_before_temp,
+                f"{label} parent",
+                require_nlink=False,
+            )
+            fsync_directory(path.parent, f"{label} parent")
+
+
+def cleanup_publication_aliases(path: Path, final_info: os.stat_result) -> list[Path]:
+    pattern = re.compile(re.escape(LOCK_TEMP_PREFIX) + r"[0-9]+\.[0-9a-f]+\.tmp\Z")
+    aliases: list[Path] = []
+    try:
+        entries = list(path.parent.iterdir())
+    except OSError as exc:
+        fail(f"cannot inspect cleanup publication parent: {exc}")
+    for entry in entries:
+        if entry.name == path.name:
+            continue
+        if not pattern.fullmatch(entry.name):
+            continue
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if identity_of(info) == identity_of(final_info):
+            aliases.append(entry)
+        else:
+            fail("cleanup publication alias state is ambiguous")
+    return aliases
+
+
+def validate_cleanup_document_file(
+    path: Path,
+    target: Path,
+    label: str,
+    *,
+    allow_publication_alias: bool,
+) -> tuple[dict[str, Any], os.stat_result]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail(f"{label} must be a regular non-symlink file")
+    require_bounded_size(info, label, METADATA_MAX_BYTES)
+    require_current_user_owner(info, label)
+    if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail(f"{label} must have mode 0600")
+    if info.st_nlink != 1 and not (allow_publication_alias and info.st_nlink == 2):
+        fail(f"{label} has unsafe link count")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open {label}: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        if identity_of(opened) != identity_of(info):
+            fail(f"{label} changed while it was being opened")
+        if not stat.S_ISREG(opened.st_mode):
+            fail(f"{label} changed to an unsafe file")
+        if opened.st_nlink != info.st_nlink:
+            fail(f"{label} link count changed while opening")
+        content = read_fd_bounded(descriptor, label, max_bytes=METADATA_MAX_BYTES)
+    finally:
+        os.close(descriptor)
+    document = parse_json_object(content, label)
+    validate_cleanup_document(target, document, label)
+    return document, info
+
+
+def recover_cleanup_publication_alias(path: Path, target: Path, label: str) -> None:
+    if stat_optional(path, label) is None:
+        return
+    document, info = validate_cleanup_document_file(
+        path, target, label, allow_publication_alias=True
+    )
+    if info.st_nlink == 1:
+        return
+    aliases = cleanup_publication_aliases(path, info)
+    if len(aliases) != 1:
+        fail(f"{label} publication alias state is ambiguous")
+    alias = aliases[0]
+    alias_document, alias_info = validate_cleanup_document_file(
+        alias, target, f"{label} publication alias", allow_publication_alias=True
+    )
+    if identity_of(alias_info) != identity_of(info) or alias_document != document:
+        fail(f"{label} publication alias mismatch")
+    parent_metadata = directory_metadata(path.parent, f"{label} parent")
+    try:
+        alias.unlink()
+        lifecycle_hook(f"cleanup.{label}.alias.unlink")
+        fsync_directory(path.parent, f"{label} parent")
+        restore_directory_metadata(
+            path.parent,
+            parent_metadata,
+            f"{label} parent",
+            require_nlink=False,
+        )
+        fsync_directory(path.parent, f"{label} parent")
+        lifecycle_hook(f"cleanup.{label}.alias.parent.fsync")
+    except OSError as exc:
+        fail(f"cannot recover {label} publication alias: {exc}")
+    validate_cleanup_document_file(path, target, label, allow_publication_alias=False)
+
+
+def read_cleanup_document(path: Path, target: Path, label: str) -> dict[str, Any] | None:
+    info = stat_optional(path, label)
+    if info is None:
+        return None
+    document, _ = validate_cleanup_document_file(path, target, label, allow_publication_alias=False)
+    return document
+
+
+def validate_cleanup_pending_readonly(target: Path, entries: list[dict[str, Any]]) -> None:
+    cleanup_root = cleanup_parent(target)
+    root_info = require_directory(cleanup_root, "cleanup parent")
+    require_current_user_owner(root_info, "cleanup parent")
+    if stat.S_IMODE(root_info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail("cleanup parent must be private")
+    expected_root_names = {CLEANUP_JOURNAL_NAME, CLEANUP_TOMBSTONES_NAME}
+    if cleanup_intent_path(target).exists():
+        expected_root_names.add(CLEANUP_INTENT_NAME)
+    try:
+        root_entries = list(cleanup_root.iterdir())
+    except OSError as exc:
+        fail(f"cannot inspect cleanup parent: {exc}")
+    for entry in root_entries:
+        if entry.name not in expected_root_names:
+            fail(f"cleanup parent contains an unknown object: {entry.name}")
+    expected_tombstones = {
+        Path(entry["tombstone_relative"]).parts[1]
+        for entry in entries
+        if len(Path(entry["tombstone_relative"]).parts) == 2
+    }
+    tombstones = cleanup_tombstones(target)
+    tombstone_info = stat_optional(tombstones, "cleanup tombstones")
+    if tombstone_info is not None:
+        if not stat.S_ISDIR(tombstone_info.st_mode):
+            fail("cleanup tombstones must be a directory")
+        require_current_user_owner(tombstone_info, "cleanup tombstones")
+        if stat.S_IMODE(tombstone_info.st_mode) != OWNER_DIRECTORY_MODE:
+            fail("cleanup tombstones must be private")
+        for child in tombstones.iterdir():
+            if child.name not in expected_tombstones:
+                fail(f"cleanup tombstones contain an unknown object: {child.name}")
+    for entry in entries:
+        tombstone = anchored_path(target, entry["tombstone_anchor"], entry["tombstone_relative"])
+        if stat_optional(tombstone, "cleanup tombstone") is None:
+            continue
+        validate_cleanup_parent_stable_identity(
+            tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+        )
+        validate_cleanup_tree_partial(tombstone, entry["snapshot"], entry["purpose"])
+
+
+def cleanup_state(target: Path) -> dict[str, Any]:
+    pending = read_cleanup_document(cleanup_journal_path(target), target, "cleanup journal")
+    intent = read_cleanup_document(cleanup_intent_path(target), target, "cleanup intent")
+    if pending is not None:
+        entries = validate_cleanup_document(target, pending, "cleanup journal")
+        validate_cleanup_pending_readonly(target, entries)
+        return {"cleanup_pending": True, "cleanup_entries": len(entries)}
+    if intent is not None:
+        fail("cleanup intent is incomplete and requires exclusive recovery")
+    return {"cleanup_pending": False, "cleanup_entries": 0}
+
+
+def move_directory_for_cleanup(
+    target: Path,
+    *,
+    purpose: str,
+    source_anchor: str,
+    source_relative: str,
+) -> dict[str, Any]:
+    entries = prepare_cleanup_intent(
+        target,
+        [
+            {
+                "purpose": purpose,
+                "source_anchor": source_anchor,
+                "source_relative": source_relative,
+            }
+        ],
+        replacements=[],
+        restore_parents={},
+    )
+    move_cleanup_sources_to_tombstones(target, entries)
+    return entries[0]
+
+
+def prepare_cleanup_intent(
+    target: Path,
+    source_specs: list[dict[str, str]],
+    *,
+    replacements: list[dict[str, Any]],
+    restore_parents: dict[str, dict[str, Any] | None],
+) -> list[dict[str, Any]]:
+    cleanup_root = cleanup_parent(target)
+    tombstones = cleanup_tombstones(target)
+    ensure_directory(cleanup_root)
+    ensure_directory(tombstones)
+    entries: list[dict[str, Any]] = []
+    for spec in source_specs:
+        purpose = spec["purpose"]
+        source_anchor = spec["source_anchor"]
+        source_relative = spec["source_relative"]
+        source = anchored_path(target, source_anchor, source_relative)
+        source_info = stat_optional(source, f"cleanup source {purpose}")
+        if source_info is None:
+            continue
+        if stat.S_ISLNK(source_info.st_mode):
+            fail(f"cleanup source {purpose} must not be a symlink")
+        snapshot = snapshot_cleanup_tree(source, f"cleanup source {purpose}")
+        tombstone_name = f"{purpose}.{os.getpid()}.{time.monotonic_ns():x}"
+        tombstone_relative = f"{CLEANUP_TOMBSTONES_NAME}/{tombstone_name}"
+        entry = cleanup_entry(
+            target,
+            purpose=purpose,
+            source_anchor=source_anchor,
+            source_relative=source_relative,
+            tombstone_relative=tombstone_relative,
+            snapshot=snapshot,
+        )
+        entries.append(entry)
+    if not entries and not replacements:
+        return []
+    publish_json_no_replace(
+        cleanup_intent_path(target),
+        cleanup_document(
+            target,
+            state="intent",
+            entries=entries,
+            replacements=replacements,
+            restore_parents=restore_parents,
+        ),
+        "intent",
+    )
+    return entries
+
+
+def move_cleanup_sources_to_tombstones(target: Path, entries: list[dict[str, Any]]) -> None:
+    for entry in entries:
+        purpose = entry["purpose"]
+        source = anchored_path(target, entry["source_anchor"], entry["source_relative"])
+        tombstone = anchored_path(target, entry["tombstone_anchor"], entry["tombstone_relative"])
+        validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
+        validate_cleanup_parent_identity(
+            tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+        )
+        source.rename(tombstone)
+        lifecycle_hook(f"cleanup.{purpose}.source.move.after")
+        fsync_directory(source.parent, "cleanup source parent")
+        lifecycle_hook(f"cleanup.{purpose}.source.parent.fsync")
+        fsync_directory(tombstone.parent, "cleanup tombstone parent")
+        lifecycle_hook(f"cleanup.{purpose}.tombstone.parent.fsync")
+        validate_cleanup_tree(tombstone, entry["snapshot"], f"cleanup tombstone {purpose}")
+
+
+def cleanup_path_matches(path: Path, expected: dict[str, Any], label: str) -> bool:
+    try:
+        validate_cleanup_tree(path, expected, label)
+    except PiSetupError:
+        return False
+    return True
+
+
+def cleanup_replacements_present(
+    target: Path, replacements: list[dict[str, Any]]
+) -> bool:
+    for replacement in replacements:
+        source = anchored_path(
+            target, replacement["source_anchor"], replacement["source_relative"]
+        )
+        if stat_optional(source, f"cleanup replacement {replacement['purpose']}") is None:
+            return False
+        validate_cleanup_parent_stable_identity(
+            source.parent, replacement["source_parent"], "cleanup replacement"
+        )
+        validate_cleanup_tree(
+            source, replacement["snapshot"], f"cleanup replacement {replacement['purpose']}"
+        )
+    return True
+
+
+def desired_software_state_is_current(
+    target: Path, replacements: list[dict[str, Any]]
+) -> bool:
+    if not replacements or not cleanup_replacements_present(target, replacements):
+        return False
+    try:
+        status = software_status_payload(target, validate_cleanup=False)
+    except PiSetupError:
+        return False
+    return bool(status.get("current"))
+
+
+def delete_cleanup_replacements(target: Path, replacements: list[dict[str, Any]]) -> None:
+    for replacement in reversed(replacements):
+        source = anchored_path(
+            target, replacement["source_anchor"], replacement["source_relative"]
+        )
+        if stat_optional(source, f"cleanup replacement {replacement['purpose']}") is None:
+            continue
+        validate_cleanup_parent_stable_identity(
+            source.parent, replacement["source_parent"], "cleanup replacement"
+        )
+        delete_cleanup_tree(
+            source,
+            replacement["snapshot"],
+            f"cleanup replacement {replacement['purpose']}",
+        )
+
+
+def restore_cleanup_entries_from_tombstones(target: Path, entries: list[dict[str, Any]]) -> None:
+    for entry in reversed(entries):
+        source = anchored_path(target, entry["source_anchor"], entry["source_relative"])
+        tombstone = anchored_path(target, entry["tombstone_anchor"], entry["tombstone_relative"])
+        source_info = stat_optional(source, "cleanup intent source")
+        tombstone_info = stat_optional(tombstone, "cleanup intent tombstone")
+        if tombstone_info is None:
+            if source_info is None:
+                fail("cleanup intent is incoherent")
+            validate_cleanup_parent_stable_identity(
+                source.parent, entry["source_parent"], "cleanup source"
+            )
+            validate_cleanup_tree(source, entry["snapshot"], "cleanup restored source")
+            continue
+        validate_cleanup_parent_stable_identity(
+            tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+        )
+        validate_cleanup_tree(tombstone, entry["snapshot"], "cleanup intent tombstone")
+        if source_info is not None:
+            if cleanup_path_matches(source, entry["snapshot"], "cleanup restored source"):
+                fail("cleanup intent contains duplicate restored source and tombstone")
+            fail("cleanup intent source is occupied by an unknown object")
+        validate_cleanup_parent_stable_identity(
+            source.parent, entry["source_parent"], "cleanup source"
+        )
+        tombstone.rename(source)
+        fsync_directory(source.parent, "cleanup source parent")
+        fsync_directory(tombstone.parent, "cleanup tombstone parent")
+        validate_cleanup_tree(source, entry["snapshot"], "cleanup restored source")
+
+
+def restore_cleanup_parents(
+    target: Path, restore_parents: dict[str, dict[str, Any] | None]
+) -> None:
+    for relative, metadata in sorted(
+        restore_parents.items(), key=lambda item: len(Path(item[0]).parts), reverse=True
+    ):
+        path = target / bounded_relative(relative, "cleanup restore parent path")
+        restore_directory_metadata(path, metadata, f"cleanup restore parent {relative}")
+
+
+def recover_cleanup_intent(target: Path) -> bool:
+    intent = read_cleanup_document(cleanup_intent_path(target), target, "cleanup intent")
+    if intent is None:
+        return False
+    entries = validate_cleanup_document(target, intent, "cleanup intent")
+    replacements = intent.get("replacements", [])
+    restore_parents = intent.get("restore_parents", {})
+    if desired_software_state_is_current(target, replacements):
+        if entries:
+            publish_cleanup_pending(target, cleanup_entries_for_pending(entries))
+        else:
+            delete_file(cleanup_intent_path(target))
+            fsync_directory(cleanup_parent(target), "cleanup parent")
+        return True
+    delete_cleanup_replacements(target, replacements)
+    restore_cleanup_entries_from_tombstones(target, entries)
+    restore_cleanup_parents(target, restore_parents)
+    try:
+        delete_file(cleanup_intent_path(target))
+        fsync_directory(cleanup_parent(target), "cleanup parent")
+        with contextlib.suppress(OSError):
+            cleanup_tombstones(target).rmdir()
+            fsync_directory(cleanup_parent(target), "cleanup parent")
+        with contextlib.suppress(OSError):
+            cleanup_parent(target).rmdir()
+            fsync_directory(target, "target")
+    except BaseException:
+        if stat_optional(cleanup_intent_path(target), "cleanup intent") is not None:
+            raise
+        fsync_directory(cleanup_parent(target), "cleanup parent")
+    return False
+
+
+def delete_cleanup_tree(path: Path, expected: dict[str, Any], label: str) -> None:
+    validate_cleanup_tree_partial(path, expected, label)
+    records = cleanup_snapshot_records(expected, label)
+    for relative, record in sorted(
+        records.items(), key=lambda item: len(Path(item[0]).parts), reverse=True
+    ):
+        item = path if relative == "." else path / relative
+        info = stat_optional(item, f"{label}:{relative}")
+        if info is None:
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            validate_cleanup_object(
+                item,
+                record,
+                f"{label}:{relative}",
+                exact_directory_metadata=False,
+            )
+            if cleanup_actual_child_names(item, f"{label}:{relative}"):
+                fail(f"{label}:{relative} child set mismatch")
+            lifecycle_hook(f"cleanup.{label}.object.rmdir.before")
+            item.rmdir()
+            lifecycle_hook(f"cleanup.{label}.object.rmdir.after")
+        else:
+            validate_cleanup_object(item, record, f"{label}:{relative}")
+            lifecycle_hook(f"cleanup.{label}.object.unlink.before")
+            delete_file(item)
+            lifecycle_hook(f"cleanup.{label}.object.unlink.after")
+        lifecycle_hook(f"cleanup.{label}.object.parent.fsync.before")
+        fsync_directory(item.parent, f"{label} parent")
+        lifecycle_hook(f"cleanup.{label}.object.parent.fsync.after")
+
+
+def drain_cleanup(target: Path) -> bool:
+    recover_cleanup_publication_alias(cleanup_journal_path(target), target, "cleanup journal")
+    recover_cleanup_publication_alias(cleanup_intent_path(target), target, "cleanup intent")
+    pending = read_cleanup_document(cleanup_journal_path(target), target, "cleanup journal")
+    if pending is None:
+        recover_cleanup_intent(target)
+        return False
+    entries = validate_cleanup_document(target, pending, "cleanup journal")
+    try:
+        for entry in entries:
+            tombstone = anchored_path(
+                target, entry["tombstone_anchor"], entry["tombstone_relative"]
+            )
+            info = stat_optional(tombstone, "cleanup tombstone")
+            if info is None:
+                continue
+            validate_cleanup_parent_stable_identity(
+                tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+            )
+            delete_cleanup_tree(tombstone, entry["snapshot"], entry["purpose"])
+        if cleanup_intent_path(target).exists():
+            lifecycle_hook("cleanup.intent.retire.unlink.before")
+            delete_file(cleanup_intent_path(target))
+            lifecycle_hook("cleanup.intent.retire.unlink.after")
+            fsync_directory(cleanup_parent(target), "cleanup parent")
+            lifecycle_hook("cleanup.intent.retire.parent.fsync")
+        with contextlib.suppress(OSError):
+            cleanup_tombstones(target).rmdir()
+            lifecycle_hook("cleanup.tombstones.rmdir")
+            fsync_directory(cleanup_parent(target), "cleanup parent")
+        lifecycle_hook("cleanup.drain.target.fsync.before")
+        fsync_directory(target, "target")
+    except BaseException:
+        return True
+    try:
+        lifecycle_hook("cleanup.journal.retire.unlink.before")
+        delete_file(cleanup_journal_path(target))
+        lifecycle_hook("cleanup.journal.retire.unlink.after")
+        fsync_directory(cleanup_parent(target), "cleanup parent")
+        lifecycle_hook("cleanup.journal.retire.parent.fsync")
+    except BaseException:
+        return stat_optional(cleanup_journal_path(target), "cleanup journal") is not None
+    with contextlib.suppress(OSError):
+        cleanup_parent(target).rmdir()
+    return False
+
+
+def publish_cleanup_pending(target: Path, entries: list[dict[str, Any]]) -> bool:
+    try:
+        publish_json_no_replace(
+            cleanup_journal_path(target),
+            cleanup_document(target, state="pending", entries=entries),
+            "journal",
+        )
+    except BaseException:
+        if stat_optional(cleanup_journal_path(target), "cleanup journal") is None:
+            raise
+        recover_cleanup_publication_alias(cleanup_journal_path(target), target, "cleanup journal")
+        read_cleanup_document(cleanup_journal_path(target), target, "cleanup journal")
+        return True
+    pending = drain_cleanup(target)
+    return pending
+
+
 def builder_skill_path(target: Path) -> str:
     return str((target / BUILDER_SKILL_DIR).resolve())
 
 
-def builder_package_entry(target: Path) -> dict[str, str]:
-    return {"source": str((target / BUILDER_PACKAGE_DIR).resolve()), "name": "nddev-builder"}
+def builder_package_entry(target: Path) -> str:
+    return str((target / BUILDER_PACKAGE_DIR).resolve())
 
 
 def dedupe_json_list(values: list[Any]) -> list[Any]:
@@ -664,7 +3119,10 @@ def dedupe_json_list(values: list[Any]) -> list[Any]:
 
 
 def merge_settings(
-    existing: dict[str, Any] | None, setup_settings: dict[str, Any], target: Path
+    existing: dict[str, Any] | None,
+    setup_settings: dict[str, Any],
+    profile: dict[str, Any],
+    target: Path,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     if existing is not None:
@@ -673,7 +3131,22 @@ def merge_settings(
                 result[key] = value
 
     for key in MANAGED_SETTING_KEYS:
-        result[key] = setup_settings[key]
+        if key in setup_settings:
+            result[key] = setup_settings[key]
+    profile_settings = profile["settings"]
+    if not isinstance(profile_settings, dict):
+        fail("profile settings must be an object")
+    for key, value in profile_settings.items():
+        result[key] = value
+    result["nddev"] = {
+        "schema_version": 2,
+        "setup_id": setup_settings["nddev"]["setup_id"],
+        "profile_id": profile["id"],
+        "builder_projection": "skills+package",
+        "launch_args": profile["launch_args"],
+        "tool_boundary": profile["tool_boundary"],
+        "os_security_boundary": False,
+    }
 
     existing_skills = []
     if existing is not None and "skills" in existing:
@@ -731,10 +3204,11 @@ def builder_projection_files() -> dict[str, bytes]:
 
 
 def render_setup(
-    setup_id: str, target: Path, existing: dict[str, Any] | None
+    setup_id: str, profile_id: str, target: Path, existing: dict[str, Any] | None
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
     metadata, settings = load_setup(setup_id)
-    merged_settings = merge_settings(existing, settings, target)
+    profile = load_profile(profile_id)
+    merged_settings = merge_settings(existing, settings, profile, target)
     files: dict[str, bytes] = {SETTINGS_NAME: canonical_json(merged_settings)}
     files.update(builder_projection_files())
     return metadata, files
@@ -755,6 +3229,7 @@ def compute_managed_digests(target: Path, settings: dict[str, Any] | None) -> di
             canonical_json(managed_settings_view(settings, target))
         )
     for relative in (
+        AGENTS_REL,
         BUILDER_SKILL_DIR / "SKILL.md",
         BUILDER_PACKAGE_DIR / "package.json",
         BUILDER_PACKAGE_DIR / "skills" / "nddev-builder" / "SKILL.md",
@@ -765,13 +3240,16 @@ def compute_managed_digests(target: Path, settings: dict[str, Any] | None) -> di
     return digests
 
 
-def make_stamp(target: Path, setup_id: str, final_settings: dict[str, Any]) -> dict[str, Any]:
+def make_stamp(
+    target: Path, setup_id: str, profile_id: str, final_settings: dict[str, Any]
+) -> dict[str, Any]:
     managed_files = compute_managed_digests(target, final_settings)
     return {
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "canonical_target": str(target),
         "managed_files": managed_files,
         "builder_projection": "skills+package",
@@ -780,14 +3258,32 @@ def make_stamp(target: Path, setup_id: str, final_settings: dict[str, Any]) -> d
 
 def status_for_target(target: Path) -> dict[str, Any]:
     if not target.exists():
-        return {"state": "missing", "setup_id": None, "drift": [], "target": str(target)}
+        return {
+            "state": "missing",
+            "setup_id": None,
+            "profile_id": None,
+            "drift": [],
+            "target": str(target),
+            "cleanup_pending": False,
+        }
+    cleanup = cleanup_state(target)
     stamp = load_stamp(target)
     if stamp is None:
-        return {"state": "unmanaged", "setup_id": None, "drift": [], "target": str(target)}
+        return {
+            "state": "unmanaged",
+            "setup_id": None,
+            "profile_id": None,
+            "drift": [],
+            "target": str(target),
+            "cleanup_pending": cleanup["cleanup_pending"],
+        }
     require_exact_keys(stamp, STAMP_KEYS, STAMP_NAME)
     setup_id = stamp.get("setup_id")
     if not isinstance(setup_id, str):
         fail("stamp setup_id must be a string")
+    profile_id = stamp.get("profile_id")
+    if not isinstance(profile_id, str):
+        fail("stamp profile_id must be a string")
     drift: list[str] = []
     if stamp.get("canonical_target") != str(target):
         drift.append(STAMP_NAME)
@@ -802,9 +3298,11 @@ def status_for_target(target: Path) -> dict[str, Any]:
     return {
         "state": "managed",
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "drift": sorted(set(drift)),
         "target": str(target),
         "builder_projection": stamp.get("builder_projection"),
+        "cleanup_pending": cleanup["cleanup_pending"],
     }
 
 
@@ -825,8 +3323,66 @@ def snapshot_files(target: Path, relatives: list[str]) -> dict[str, str | None]:
     return snapshot
 
 
+def backup_file_metadata(files: dict[str, str | None]) -> dict[str, dict[str, Any]]:
+    metadata: dict[str, dict[str, Any]] = {}
+    expected_relatives = managed_file_relatives()
+    if set(files) != set(expected_relatives):
+        fail("backup file set must match managed files exactly")
+    for relative in expected_relatives:
+        encoded = files[relative]
+        if encoded is None:
+            metadata[relative] = {"present": False, "size": None, "sha256": None}
+            continue
+        try:
+            content = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            fail(f"backup file {relative} is not valid base64: {exc}")
+        metadata[relative] = {
+            "present": True,
+            "size": len(content),
+            "sha256": sha256_bytes(content),
+        }
+    return metadata
+
+
+def validate_backup_files(files: Any, metadata: Any) -> dict[str, str | None]:
+    if not isinstance(files, dict) or not isinstance(metadata, dict):
+        fail("backup files and metadata must be objects")
+    expected_relatives = managed_file_relatives()
+    if set(files) != set(expected_relatives) or set(metadata) != set(expected_relatives):
+        fail("backup file path set must match managed files exactly")
+    validated: dict[str, str | None] = {}
+    for relative in expected_relatives:
+        encoded = files[relative]
+        record = metadata[relative]
+        if not isinstance(record, dict) or set(record) != {"present", "size", "sha256"}:
+            fail(f"backup metadata for {relative} has invalid schema")
+        if encoded is None:
+            if record != {"present": False, "size": None, "sha256": None}:
+                fail(f"backup metadata for absent {relative} is invalid")
+            validated[relative] = None
+            continue
+        if not isinstance(encoded, str):
+            fail(f"backup payload for {relative} must be a base64 string or null")
+        try:
+            content = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            fail(f"backup payload for {relative} is invalid base64: {exc}")
+        if (
+            record.get("present") is not True
+            or record.get("size") != len(content)
+            or record.get("sha256") != sha256_bytes(content)
+        ):
+            fail(f"backup metadata for {relative} does not match payload")
+        validated[relative] = encoded
+    return validated
+
+
 def restore_snapshot(target: Path, snapshot: dict[str, str | None]) -> None:
-    for relative, encoded in snapshot.items():
+    if set(snapshot) != set(managed_file_relatives()):
+        fail("restore snapshot path set must match managed files exactly")
+    for relative in managed_file_relatives():
+        encoded = snapshot[relative]
         path = target / relative
         if encoded is None:
             with contextlib.suppress(FileNotFoundError):
@@ -835,14 +3391,17 @@ def restore_snapshot(target: Path, snapshot: dict[str, str | None]) -> None:
             safe_write_file(path, base64.b64decode(encoded.encode("ascii")))
 
 
-def managed_file_relatives() -> list[str]:
-    return [
+def managed_file_relatives(*, include_stamp: bool = True) -> list[str]:
+    relatives = [
         SETTINGS_NAME,
-        STAMP_NAME,
+        AGENTS_NAME,
         (BUILDER_SKILL_DIR / "SKILL.md").as_posix(),
         (BUILDER_PACKAGE_DIR / "package.json").as_posix(),
         (BUILDER_PACKAGE_DIR / "skills" / "nddev-builder" / "SKILL.md").as_posix(),
     ]
+    if include_stamp:
+        return [*relatives, STAMP_NAME]
+    return relatives
 
 
 def next_backup_slot(pool: Path) -> int:
@@ -851,117 +3410,257 @@ def next_backup_slot(pool: Path) -> int:
     for slot in range(10):
         if slot not in existing:
             return slot
-    return min(
-        range(10),
-        key=lambda slot: (
-            (pool / str(slot) / BACKUP_NAME).stat().st_mtime
-            if (pool / str(slot) / BACKUP_NAME).exists()
-            else 0
-        ),
-    )
+    fail("backup pool is full; remove or archive a slot before creating another backup")
 
 
-def create_backup(target: Path, source_setup_id: str | None) -> int:
+def remove_backup_slot(target: Path, slot: int) -> None:
     pool = backup_pool(target)
-    slot = next_backup_slot(pool)
     slot_dir = pool / str(slot)
-    if slot_dir.exists():
+    with contextlib.suppress(FileNotFoundError):
         delete_tree(slot_dir)
-    slot_dir.mkdir(mode=OWNER_DIRECTORY_MODE)
-    files = snapshot_files(target, managed_file_relatives())
+        fsync_directory(pool, "backup pool")
+    with contextlib.suppress(OSError):
+        pool.rmdir()
+        fsync_directory(target.parent, "target parent")
+
+
+def create_backup_from_files(
+    target: Path,
+    source_setup_id: str | None,
+    source_profile_id: str | None,
+    files: dict[str, str | None],
+) -> int:
+    pool = backup_pool(target)
+    pool_existed = stat_optional(pool, "backup pool") is not None
+    slot = next_backup_slot(pool)
+    temp_dir = pool / f".{slot}.tmp-{os.getpid()}-{time.monotonic_ns():x}"
+    final_dir = pool / str(slot)
+    temp_dir.mkdir(mode=OWNER_DIRECTORY_MODE)
     envelope = {
-        "schema_version": 1,
+        "schema_version": 2,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "slot": slot,
         "canonical_target": str(target),
         "source_setup_id": source_setup_id,
+        "source_profile_id": source_profile_id,
         "managed_files": [relative for relative, encoded in files.items() if encoded is not None],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "files": files,
+        "file_metadata": backup_file_metadata(files),
     }
-    safe_write_file(slot_dir / BACKUP_NAME, canonical_json(envelope))
-    return slot
+    try:
+        safe_write_file(temp_dir / BACKUP_NAME, canonical_json(envelope), label="backup")
+        if final_dir.exists():
+            fail("backup slot appeared during publication")
+        temp_dir.rename(final_dir)
+        fsync_directory(pool, "backup pool")
+        validate_backup_slot_directory(final_dir, slot)
+        return slot
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            delete_tree(temp_dir)
+            fsync_directory(pool, "backup pool")
+        if not pool_existed:
+            with contextlib.suppress(OSError):
+                pool.rmdir()
+                fsync_directory(target.parent, "target parent")
+        raise
+
+
+def create_backup(target: Path, source_setup_id: str | None, source_profile_id: str | None) -> int:
+    return create_backup_from_files(
+        target,
+        source_setup_id,
+        source_profile_id,
+        snapshot_files(target, managed_file_relatives()),
+    )
+
+
+def validate_backup_slot_directory(slot_dir: Path, slot: int) -> None:
+    info = require_directory(slot_dir, f"backup slot {slot}")
+    require_current_user_owner(info, f"backup slot {slot}")
+    if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail(f"backup slot {slot} must be private")
+    entries = sorted(path.name for path in slot_dir.iterdir())
+    if entries != [BACKUP_NAME]:
+        fail(f"backup slot {slot} contains unexpected entries")
 
 
 def load_backup(target: Path, slot: int) -> dict[str, Any]:
     if slot < 0 or slot > 9:
         fail("--backup must be in the 0..9 range")
-    envelope = load_json_object(
-        backup_pool(target) / str(slot) / BACKUP_NAME, f"backup slot {slot}"
-    )
+    slot_dir = backup_pool(target) / str(slot)
+    validate_backup_slot_directory(slot_dir, slot)
+    envelope = load_json_object(slot_dir / BACKUP_NAME, f"backup slot {slot}")
     require_exact_keys(envelope, BACKUP_KEYS, f"backup slot {slot}")
+    if envelope.get("schema_version") != 2:
+        fail("backup has unsupported schema")
+    if envelope.get("product_name") != PRODUCT_NAME or envelope.get("build_version") != VERSION:
+        fail("backup product identity mismatch")
     if envelope.get("canonical_target") != str(target):
         fail("backup does not belong to this target")
     if envelope.get("slot") != slot:
         fail("backup slot envelope mismatch")
-    if not isinstance(envelope.get("files"), dict):
-        fail("backup files must be an object")
+    files = validate_backup_files(envelope.get("files"), envelope.get("file_metadata"))
+    managed_files = envelope.get("managed_files")
+    if managed_files != [
+        relative for relative in managed_file_relatives() if files[relative] is not None
+    ]:
+        fail("backup managed_files do not match file payloads")
     return envelope
 
 
-def write_rendered_files(target: Path, setup_id: str, files: dict[str, bytes]) -> list[str]:
-    previous = snapshot_files(target, managed_file_relatives())
-    changed: list[str] = []
-    try:
-        for relative, content in files.items():
-            before = previous.get(relative)
-            after = base64.b64encode(content).decode("ascii")
-            if before != after:
-                changed.append(relative)
-            safe_write_file(target / relative, content)
-        final_settings = parse_json_object(files[SETTINGS_NAME], SETTINGS_NAME)
-        stamp = make_stamp(target, setup_id, final_settings)
-        stamp_content = canonical_json(stamp)
-        before_stamp = previous.get(STAMP_NAME)
-        after_stamp = base64.b64encode(stamp_content).decode("ascii")
-        if before_stamp != after_stamp:
-            changed.append(STAMP_NAME)
-        safe_write_file(target / STAMP_NAME, stamp_content)
-    except BaseException:
-        restore_snapshot(target, previous)
-        raise
-    return changed
-
-
-def command_plan(target: Path, setup_id: str) -> dict[str, Any]:
-    status = status_for_target(target)
-    operation = "install"
-    backup_required = False
-    if status["state"] == "managed":
-        if status["drift"]:
-            operation = "blocked"
-        elif status["setup_id"] == setup_id:
-            operation = "update"
-        else:
-            operation = "switch"
-            backup_required = True
-    return {
-        "operation": operation,
-        "setup_id": setup_id,
-        "target": str(target),
-        "mutates": False,
-        "backup_required": backup_required,
-        "state": status["state"],
-        "drift": status["drift"],
+def desired_setup_files(
+    target: Path, setup_id: str, profile_id: str, files: dict[str, bytes]
+) -> dict[str, bytes]:
+    final_settings = parse_json_object(files[SETTINGS_NAME], SETTINGS_NAME)
+    managed_digests: dict[str, str] = {
+        SETTINGS_NAME: sha256_bytes(canonical_json(managed_settings_view(final_settings, target)))
     }
+    for relative, content in files.items():
+        if relative != SETTINGS_NAME:
+            managed_digests[relative] = sha256_bytes(content)
+    stamp = {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "setup_id": setup_id,
+        "profile_id": profile_id,
+        "canonical_target": str(target),
+        "managed_files": managed_digests,
+        "builder_projection": "skills+package",
+    }
+    return {**files, STAMP_NAME: canonical_json(stamp)}
 
 
-def command_install(target: Path, setup_id: str) -> dict[str, Any]:
-    with target_lock(target):
-        ensure_target_directory(target)
+def apply_managed_files_transaction(
+    target: Path,
+    desired: dict[str, bytes | None],
+    *,
+    backup_source: tuple[str | None, str | None] | None,
+) -> tuple[list[str], int | None]:
+    relatives = managed_file_relatives()
+    if set(desired) != set(relatives):
+        fail("desired managed file set must match managed files exactly")
+    current = snapshot_files(target, relatives)
+    changed: list[str] = []
+    encoded_desired: dict[str, str | None] = {}
+    for relative in relatives:
+        content = desired[relative]
+        encoded = None if content is None else base64.b64encode(content).decode("ascii")
+        encoded_desired[relative] = encoded
+        if current[relative] != encoded:
+            changed.append(relative)
+    if not changed and backup_source is None:
+        return [], None
+    transaction = ManagedFileTransaction(target, changed)
+    backup_slot: int | None = None
+    try:
+        for relative in relatives:
+            if relative not in changed:
+                continue
+            content = desired[relative]
+            path = target / relative
+            if content is None:
+                if transaction.held[relative].existed:
+                    unlink_regular_for_transaction(path, f"managed file {relative}")
+                continue
+            safe_write_file(path, content)
+        if backup_source is not None:
+            backup_slot = create_backup_from_files(
+                target, backup_source[0], backup_source[1], current
+            )
+        for relative in relatives:
+            encoded = encoded_desired[relative]
+            actual = snapshot_files(target, [relative])[relative]
+            if actual != encoded:
+                fail(f"managed postcondition failed for {relative}")
+        transaction.cleanup()
+        return changed, backup_slot
+    except BaseException:
+        if backup_slot is not None:
+            remove_backup_slot(target, backup_slot)
+        transaction.rollback()
+        raise
+
+
+def write_rendered_files(
+    target: Path,
+    setup_id: str,
+    profile_id: str,
+    files: dict[str, bytes],
+    *,
+    backup_source: tuple[str | None, str | None] | None = None,
+) -> tuple[list[str], int | None]:
+    desired = desired_setup_files(target, setup_id, profile_id, files)
+    return apply_managed_files_transaction(target, desired, backup_source=backup_source)
+
+
+def command_plan(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
+    def build(target: Path) -> dict[str, Any]:
         status = status_for_target(target)
-        if status["state"] == "managed" and status["drift"]:
-            fail(f"target has drift: {', '.join(status['drift'])}")
-        backup_slot = None
-        if status["state"] == "managed" and status["setup_id"] != setup_id:
-            backup_slot = create_backup(target, status["setup_id"])
-        existing = read_current_settings(target)
-        _, files = render_setup(setup_id, target, existing)
-        changed = write_rendered_files(target, setup_id, files)
+        operation = "install"
+        backup_required = False
+        if status["state"] == "managed":
+            if status["drift"]:
+                operation = "blocked"
+            elif status.get("cleanup_pending"):
+                operation = "cleanup"
+            elif status["setup_id"] == setup_id and status["profile_id"] == profile_id:
+                operation = "noop"
+            else:
+                operation = "switch"
+                backup_required = True
+        return {
+            "operation": operation,
+            "setup_id": setup_id,
+            "profile_id": profile_id,
+            "target": str(target),
+            "mutates": False,
+            "backup_required": backup_required,
+            "state": status["state"],
+            "drift": status["drift"],
+            "cleanup_pending": status.get("cleanup_pending", False),
+        }
+
+    return read_only_target(target, build)
+
+
+def command_install(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
+    with target_lock(target) as target:
+        target_parent_state = directory_metadata(target.parent, "target parent")
+        created_target = ensure_target_directory(target)
+        try:
+            if not created_target and drain_cleanup(target):
+                fail("cleanup is still pending")
+            status = status_for_target(target)
+            if status["state"] == "managed" and status["drift"]:
+                fail(f"target has drift: {', '.join(status['drift'])}")
+            backup_source = None
+            if status["state"] == "managed" and (
+                status["setup_id"] != setup_id or status["profile_id"] != profile_id
+            ):
+                backup_source = (status["setup_id"], status["profile_id"])
+            existing = read_current_settings(target)
+            _, files = render_setup(setup_id, profile_id, target, existing)
+            changed, backup_slot = write_rendered_files(
+                target,
+                setup_id,
+                profile_id,
+                files,
+                backup_source=backup_source,
+            )
+        except BaseException:
+            if created_target:
+                with contextlib.suppress(OSError):
+                    target.rmdir()
+                restore_directory_metadata(target.parent, target_parent_state, "target parent")
+            raise
     return {
         "operation": "install",
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "target": str(target),
         "changed": changed,
         "backup_slot": backup_slot,
@@ -969,48 +3668,82 @@ def command_install(target: Path, setup_id: str) -> dict[str, Any]:
     }
 
 
-def command_switch(target: Path, setup_id: str) -> dict[str, Any]:
-    with target_lock(target):
+def command_switch(target: Path, setup_id: str, profile_id: str) -> dict[str, Any]:
+    with target_lock(target) as target:
         ensure_target_directory(target)
         status = require_clean_managed(target)
-        backup_slot = create_backup(target, status["setup_id"])
+        cleanup_drained = False
+        if status.get("cleanup_pending"):
+            if drain_cleanup(target):
+                fail("cleanup is still pending")
+            cleanup_drained = True
+            status = require_clean_managed(target)
+        if status["setup_id"] == setup_id and status["profile_id"] == profile_id:
+            return {
+                "operation": "switch",
+                "setup_id": setup_id,
+                "profile_id": profile_id,
+                "target": str(target),
+                "changed": [],
+                "backup_slot": None,
+                "builder_projection": "skills+package",
+                "already_current": True,
+                "cleanup_drained": cleanup_drained,
+                "cleanup_pending": False,
+            }
         existing = read_current_settings(target)
-        _, files = render_setup(setup_id, target, existing)
-        changed = write_rendered_files(target, setup_id, files)
+        _, files = render_setup(setup_id, profile_id, target, existing)
+        changed, backup_slot = write_rendered_files(
+            target,
+            setup_id,
+            profile_id,
+            files,
+            backup_source=(status["setup_id"], status["profile_id"]),
+        )
     return {
         "operation": "switch",
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "target": str(target),
         "changed": changed,
         "backup_slot": backup_slot,
         "builder_projection": "skills+package",
+        "already_current": False,
+        "cleanup_drained": cleanup_drained,
+        "cleanup_pending": False,
     }
 
 
 def command_restore(target: Path, slot: int) -> dict[str, Any]:
-    with target_lock(target):
+    with target_lock(target) as target:
         ensure_target_directory(target)
+        if drain_cleanup(target):
+            fail("cleanup is still pending")
         status = require_clean_managed(target)
-        create_backup(target, status["setup_id"])
         envelope = load_backup(target, slot)
-        previous = snapshot_files(target, managed_file_relatives())
-        try:
-            for relative, encoded in envelope["files"].items():
-                path = target / relative
-                if encoded is None:
-                    with contextlib.suppress(FileNotFoundError):
-                        delete_file(path)
-                else:
-                    safe_write_file(path, base64.b64decode(encoded.encode("ascii")))
-        except BaseException:
-            restore_snapshot(target, previous)
-            raise
+        desired = {
+            relative: (
+                None
+                if envelope["files"][relative] is None
+                else base64.b64decode(envelope["files"][relative].encode("ascii"))
+            )
+            for relative in managed_file_relatives()
+        }
+        apply_managed_files_transaction(
+            target,
+            desired,
+            backup_source=(status["setup_id"], status["profile_id"]),
+        )
         restored_setup_id = envelope.get("source_setup_id")
         if not isinstance(restored_setup_id, str):
             fail("backup source setup id is missing")
+        restored_profile_id = envelope.get("source_profile_id")
+        if not isinstance(restored_profile_id, str):
+            fail("backup source profile id is missing")
     return {
         "operation": "restore",
         "setup_id": restored_setup_id,
+        "profile_id": restored_profile_id,
         "target": str(target),
         "backup_slot": slot,
         "builder_projection": "skills+package",
@@ -1018,28 +3751,31 @@ def command_restore(target: Path, slot: int) -> dict[str, Any]:
 
 
 def command_remove(target: Path) -> dict[str, Any]:
-    with target_lock(target):
+    with target_lock(target) as target:
         ensure_target_directory(target)
+        if drain_cleanup(target):
+            fail("cleanup is still pending")
         status = require_clean_managed(target)
-        create_backup(target, status["setup_id"])
         settings = read_current_settings(target)
-        previous = snapshot_files(target, managed_file_relatives())
-        try:
-            if settings is not None:
-                stripped = strip_managed_settings(settings, target)
-                if stripped:
-                    safe_write_file(target / SETTINGS_REL, canonical_json(stripped))
-                else:
-                    delete_file(target / SETTINGS_REL)
-            delete_file(target / STAMP_NAME)
-            delete_tree(target / BUILDER_SKILL_DIR)
-            delete_tree(target / BUILDER_PACKAGE_DIR)
-        except BaseException:
-            restore_snapshot(target, previous)
-            raise
+        desired: dict[str, bytes | None] = {relative: None for relative in managed_file_relatives()}
+        if settings is not None:
+            stripped = strip_managed_settings(settings, target)
+            if stripped:
+                desired[SETTINGS_NAME] = canonical_json(stripped)
+        apply_managed_files_transaction(
+            target,
+            desired,
+            backup_source=(status["setup_id"], status["profile_id"]),
+        )
+        for relative in managed_parent_relatives(managed_file_relatives()):
+            if relative == Path("."):
+                continue
+            with contextlib.suppress(OSError):
+                (target / relative).rmdir()
     return {
         "operation": "remove",
         "removed_setup_id": status["setup_id"],
+        "removed_profile_id": status["profile_id"],
         "target": str(target),
         "builder_projection": "removed",
     }
@@ -1057,8 +3793,12 @@ def software_stamp_path(target: Path) -> Path:
     return target / SOFTWARE_STAMP_NAME
 
 
+def software_entrypoint_relative() -> Path:
+    return Path("bin") / PI_COMMAND
+
+
 def software_entrypoint(target: Path) -> Path:
-    return target / "bin" / PI_COMMAND
+    return target / software_entrypoint_relative()
 
 
 def package_manifest_path(root: Path) -> Path:
@@ -1099,8 +3839,7 @@ def validate_pre_network_software_target(target: Path) -> None:
     )
 
 
-def load_package_manifest(root: Path) -> dict[str, Any]:
-    manifest = load_json_object(package_manifest_path(root), "Pi package manifest")
+def validate_package_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     if manifest.get("name") != PI_PACKAGE_NAME:
         fail("Pi package manifest has unexpected package name")
     if manifest.get("version") != PI_PACKAGE_VERSION:
@@ -1121,6 +3860,16 @@ def load_package_manifest(root: Path) -> dict[str, Any]:
     return manifest
 
 
+def load_package_manifest(root: Path) -> dict[str, Any]:
+    return validate_package_manifest(
+        load_json_object(package_manifest_path(root), "Pi package manifest")
+    )
+
+
+def load_extracted_package_manifest(root: Path) -> dict[str, Any]:
+    return validate_package_manifest(load_json_object(root / "package.json", "Pi package manifest"))
+
+
 def is_relative_to(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -1131,6 +3880,10 @@ def is_relative_to(path: Path, parent: Path) -> bool:
 
 def private_mode_for_source(info: os.stat_result) -> int:
     return 0o700 if stat.S_IMODE(info.st_mode) & 0o100 else OWNER_FILE_MODE
+
+
+def private_mode_for_tar_entry(member: tarfile.TarInfo) -> int:
+    return 0o700 if member.mode & 0o100 else OWNER_FILE_MODE
 
 
 def read_staged_file(source: Path, label: str) -> tuple[bytes, os.stat_result]:
@@ -1244,7 +3997,7 @@ def materialize_staged_entrypoint(
     allowed_roots: tuple[Path, ...],
     node_runtime: dict[str, str],
 ) -> None:
-    source_root = stage_workspace / "bin"
+    source_root = stage_workspace / "install" / "node_modules" / ".bin"
     require_directory(source_root, "staged bin tree")
     paths = sorted(
         source_root.rglob("*"),
@@ -1283,15 +4036,11 @@ def materialize_persisted_install(
     stage_current: Path,
     node_runtime: dict[str, str],
 ) -> None:
-    allowed_roots = (
-        (stage_workspace / "install" / "global").resolve(strict=False),
-        (stage_workspace / "bin").resolve(strict=False),
-    )
+    allowed_roots = ((stage_workspace / "install").resolve(strict=False),)
     stage_current.mkdir(mode=OWNER_DIRECTORY_MODE)
-    (stage_current / "install").mkdir(mode=OWNER_DIRECTORY_MODE)
     copy_tree_sanitized(
-        stage_workspace / "install" / "global",
-        stage_current / "install" / "global",
+        stage_workspace / "install",
+        stage_current / "install",
         allowed_roots,
     )
     materialize_staged_entrypoint(
@@ -1302,47 +4051,82 @@ def materialize_persisted_install(
     )
 
 
-def safe_bun_env(stage_workspace: Path) -> dict[str, str]:
+def safe_npm_env(stage_workspace: Path) -> dict[str, str]:
     home = stage_workspace / "home"
     xdg_config = stage_workspace / "xdg-config"
     cache = stage_workspace / "cache"
     tmp = stage_workspace / "tmp"
+    userconfig = stage_workspace / "npmrc"
     for directory in (
         home,
         xdg_config,
         cache,
         tmp,
-        stage_workspace / "install" / "global",
-        stage_workspace / "bin",
+        stage_workspace / "tarballs",
     ):
         directory.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
+    safe_write_file(
+        userconfig,
+        b"audit=false\nfund=false\nignore-scripts=true\n",
+        label="npm-userconfig",
+    )
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(xdg_config),
         "TMPDIR": str(tmp),
-        "BUN_INSTALL_GLOBAL_DIR": str(stage_workspace / "install" / "global"),
-        "BUN_INSTALL_BIN": str(stage_workspace / "bin"),
-        "BUN_INSTALL_CACHE_DIR": str(cache),
+        "npm_config_cache": str(cache),
+        "npm_config_ignore_scripts": "true",
+        "npm_config_userconfig": str(userconfig),
     }
-    assert_no_sensitive_environment(env, "bun installer environment")
+    assert_no_sensitive_environment(
+        env,
+        "npm installer environment",
+        allowed_exact={
+            "npm_config_cache",
+            "npm_config_ignore_scripts",
+            "npm_config_userconfig",
+        },
+    )
     return env
 
 
-def read_process_output(handle: Any, label: str) -> str:
+def read_process_output(
+    handle: Any,
+    label: str,
+    *,
+    max_bytes: int = PROCESS_OUTPUT_MAX_BYTES,
+    truncate: bool = True,
+) -> str:
     handle.seek(0, os.SEEK_END)
     size = handle.tell()
     handle.seek(0)
-    data = handle.read(PROCESS_OUTPUT_MAX_BYTES + 1)
+    data = handle.read(max_bytes + 1)
     text = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
-    if size > PROCESS_OUTPUT_MAX_BYTES:
-        return text[:PROCESS_OUTPUT_MAX_BYTES] + f"\n[{label} truncated]\n"
+    if size > max_bytes:
+        if not truncate:
+            fail(f"{label} output exceeds the {max_bytes}-byte bound")
+        return text[:max_bytes] + f"\n[{label} truncated]\n"
     return text
 
 
-def run_bun_install(stage_workspace: Path) -> None:
-    command = ["bun", *BUN_INSTALL_ARGV]
-    env = safe_bun_env(stage_workspace)
+def npm_pack_argv(stage_workspace: Path) -> list[str]:
+    return [
+        value.replace("<stage>/tarballs", str(stage_workspace / "tarballs"))
+        for value in NPM_PACK_ARGV
+    ]
+
+
+def npm_local_install_argv(stage_workspace: Path, tarball: Path) -> list[str]:
+    return [
+        value.replace("<stage>/install", str(stage_workspace / "install")).replace(
+            "<verified-tarball>", str(tarball)
+        )
+        for value in NPM_LOCAL_INSTALL_ARGV
+    ]
+
+
+def run_npm_json(command: list[str], env: dict[str, str], label: str) -> Any:
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
             completed = subprocess.run(
@@ -1355,14 +4139,150 @@ def run_bun_install(stage_workspace: Path) -> None:
                 timeout=PROCESS_TIMEOUT_SECONDS,
             )
         except FileNotFoundError:
-            fail("bun command was not found on PATH")
+            fail("npm command was not found on PATH")
         except subprocess.TimeoutExpired:
-            fail("bun install timed out")
+            fail(f"{label} timed out")
         if completed.returncode != 0:
             detail = (
                 read_process_output(stderr, "stderr") or read_process_output(stdout, "stdout")
             ).strip()
-            fail(f"bun install failed with exit code {completed.returncode}: {detail}")
+            fail(f"{label} failed with exit code {completed.returncode}: {detail}")
+        output = read_process_output(
+            stdout,
+            "stdout",
+            max_bytes=NPM_JSON_OUTPUT_MAX_BYTES,
+            truncate=False,
+        ).strip()
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError as exc:
+            fail(f"{label} returned invalid JSON: {exc}")
+
+
+def run_npm_command(command: list[str], env: dict[str, str], label: str) -> None:
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        try:
+            completed = subprocess.run(
+                command,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                check=False,
+                timeout=PROCESS_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            fail("npm command was not found on PATH")
+        except subprocess.TimeoutExpired:
+            fail(f"{label} timed out")
+        if completed.returncode != 0:
+            detail = (
+                read_process_output(stderr, "stderr") or read_process_output(stdout, "stdout")
+            ).strip()
+            fail(f"{label} failed with exit code {completed.returncode}: {detail}")
+
+
+def verify_registry_dist_metadata(value: Any, label: str) -> None:
+    if not isinstance(value, dict):
+        fail(f"{label} metadata must be an object")
+    if value.get("integrity") != PI_REGISTRY_INTEGRITY:
+        fail(f"{label} integrity mismatch")
+    if value.get("shasum") != PI_REGISTRY_SHASUM:
+        fail(f"{label} shasum mismatch")
+    if value.get("tarball") != PI_REGISTRY_TARBALL_URL:
+        fail(f"{label} tarball URL mismatch")
+
+
+def verify_npm_pack_metadata(value: Any) -> None:
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        fail("npm pack metadata must describe exactly one archive")
+    entry = value[0]
+    if entry.get("name") != PI_PACKAGE_NAME:
+        fail("npm pack package name mismatch")
+    if entry.get("version") != PI_PACKAGE_VERSION:
+        fail("npm pack package version mismatch")
+    if entry.get("integrity") not in {None, PI_REGISTRY_INTEGRITY}:
+        fail("npm pack integrity mismatch")
+    if entry.get("shasum") not in {None, PI_REGISTRY_SHASUM}:
+        fail("npm pack shasum mismatch")
+
+
+def verify_tarball_identity(path: Path) -> bytes:
+    content = read_regular_file(path, "Pi package tarball", max_bytes=SOFTWARE_TREE_MAX_BYTES)
+    integrity = "sha512-" + base64.b64encode(hashlib.sha512(content).digest()).decode("ascii")
+    if integrity != PI_REGISTRY_INTEGRITY:
+        fail("Pi package tarball integrity mismatch")
+    shasum = hashlib.sha1(content).hexdigest()
+    if shasum != PI_REGISTRY_SHASUM:
+        fail("Pi package tarball shasum mismatch")
+    return content
+
+
+def extract_verified_tarball(content: bytes, destination: Path) -> None:
+    destination.mkdir(mode=OWNER_DIRECTORY_MODE)
+    total = 0
+    count = 0
+    with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+        for member in archive.getmembers():
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or ".." in name.parts or not name.parts:
+                fail("Pi package tarball contains an unsafe path")
+            if name.parts[0] != "package":
+                fail("Pi package tarball root must be package/")
+            relative = PurePosixPath(*name.parts[1:])
+            if not relative.parts:
+                continue
+            count += 1
+            if count > SOFTWARE_TREE_MAX_PATHS:
+                fail("Pi package tarball exceeds the path bound")
+            target = destination.joinpath(*relative.parts)
+            if member.isdir():
+                target.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                fail("Pi package tarball contains a non-regular entry")
+            handle = archive.extractfile(member)
+            if handle is None:
+                fail("Pi package tarball entry is unreadable")
+            data = handle.read(SOFTWARE_FILE_MAX_BYTES + 1)
+            if len(data) > SOFTWARE_FILE_MAX_BYTES:
+                fail("Pi package tarball entry exceeds the file bound")
+            total += len(data)
+            if total > SOFTWARE_TREE_MAX_BYTES:
+                fail("Pi package tarball exceeds the byte bound")
+            target.parent.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
+            durable_replace_private_file(
+                target,
+                data,
+                mode=private_mode_for_tar_entry(member),
+                label="tarball-extract",
+            )
+
+
+def run_npm_install(stage_workspace: Path) -> None:
+    env = safe_npm_env(stage_workspace)
+    dist = run_npm_json(["npm", *NPM_VIEW_ARGV], env, "npm view")
+    verify_registry_dist_metadata(dist, "npm view")
+    pack_dir = stage_workspace / "tarballs"
+    before = {path.name for path in pack_dir.iterdir()}
+    pack_metadata = run_npm_json(["npm", *npm_pack_argv(stage_workspace)], env, "npm pack")
+    verify_npm_pack_metadata(pack_metadata)
+    archives = [
+        path
+        for path in pack_dir.glob("*.tgz")
+        if path.is_file() and not path.is_symlink() and path.name not in before
+    ]
+    if len(archives) != 1:
+        fail("npm pack did not produce exactly one new tarball")
+    content = verify_tarball_identity(archives[0])
+    extract_root = stage_workspace / "verified-package"
+    extract_verified_tarball(content, extract_root)
+    load_extracted_package_manifest(extract_root)
+    run_npm_command(
+        ["npm", *npm_local_install_argv(stage_workspace, archives[0])],
+        env,
+        "npm verified tarball install",
+    )
 
 
 def parse_node_version(raw: str) -> tuple[int, int, int]:
@@ -1493,19 +4413,20 @@ def ensure_software_parent(path: Path, target: Path) -> None:
             fail(f"software parent must be private: {current}")
 
 
-def atomic_write_private(path: Path, content: bytes, mode: int = OWNER_FILE_MODE) -> None:
+def atomic_write_private(
+    path: Path,
+    content: bytes,
+    mode: int = OWNER_FILE_MODE,
+    *,
+    label: str | None = None,
+) -> None:
     path.parent.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.nddev.tmp.{os.getpid()}.{time.time_ns()}")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(content)
-        os.replace(temporary, path)
-        path.chmod(mode)
-    except BaseException:
-        with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
-        raise
+    durable_replace_private_file(
+        path,
+        content,
+        mode=mode,
+        label=label or "private-file",
+    )
 
 
 def write_target_entrypoint(target: Path, node_runtime: dict[str, str]) -> str:
@@ -1515,7 +4436,7 @@ def write_target_entrypoint(target: Path, node_runtime: dict[str, str]) -> str:
     content = node_wrapper_content(
         node_runtime["path"], package_binary_path(software_current(target))
     )
-    atomic_write_private(destination, content, 0o700)
+    atomic_write_private(destination, content, 0o700, label="software-entrypoint")
     return file_sha256(destination, label="Pi entrypoint")
 
 
@@ -1555,6 +4476,7 @@ def software_stamp(
             "max_bytes": SOFTWARE_TREE_MAX_BYTES,
         },
         "registry": {
+            "tarball": PI_REGISTRY_TARBALL_URL,
             "integrity": PI_REGISTRY_INTEGRITY,
             "shasum": PI_REGISTRY_SHASUM,
         },
@@ -1583,16 +4505,26 @@ def software_stamp(
             "prepublishOnly": prepublish_only,
         },
         "installer": {
-            "tool": "bun",
-            "argv": BUN_INSTALL_ARGV,
+            "tool": "npm",
+            "metadata_argv": NPM_VIEW_ARGV,
+            "pack_argv": NPM_PACK_ARGV,
+            "local_install_argv": NPM_LOCAL_INSTALL_ARGV,
+            "argv": NPM_INSTALL_ARGV,
             "trust_reason": None,
             "env": {
-                "BUN_INSTALL_GLOBAL_DIR": "<stage>/install/global",
-                "BUN_INSTALL_BIN": "<stage>/bin",
-                "BUN_INSTALL_CACHE_DIR": "<stage>/cache",
                 "HOME": "<stage>/home",
+                "npm_config_cache": "<stage>/cache",
+                "npm_config_ignore_scripts": "true",
+                "npm_config_userconfig": "<stage>/npmrc",
                 "XDG_CONFIG_HOME": "<stage>/xdg-config",
                 "TMPDIR": "<stage>/tmp",
+            },
+            "byte_verification": {
+                "metadata_integrity": PI_REGISTRY_INTEGRITY,
+                "metadata_shasum": PI_REGISTRY_SHASUM,
+                "tarball_integrity": PI_REGISTRY_INTEGRITY,
+                "tarball_shasum": PI_REGISTRY_SHASUM,
+                "verified_before_extract": True,
             },
         },
     }
@@ -1643,10 +4575,10 @@ def read_software_stamp(target: Path) -> dict[str, Any] | None:
 
 def expected_installer_env() -> dict[str, str]:
     return {
-        "BUN_INSTALL_GLOBAL_DIR": "<stage>/install/global",
-        "BUN_INSTALL_BIN": "<stage>/bin",
-        "BUN_INSTALL_CACHE_DIR": "<stage>/cache",
         "HOME": "<stage>/home",
+        "npm_config_cache": "<stage>/cache",
+        "npm_config_ignore_scripts": "true",
+        "npm_config_userconfig": "<stage>/npmrc",
         "XDG_CONFIG_HOME": "<stage>/xdg-config",
         "TMPDIR": "<stage>/tmp",
     }
@@ -1666,7 +4598,7 @@ def expected_probe_env() -> dict[str, str]:
     }
 
 
-def software_status_payload(target: Path) -> dict[str, Any]:
+def software_status_payload(target: Path, *, validate_cleanup: bool = True) -> dict[str, Any]:
     canonical = canonical_target_readonly(target)
     payload: dict[str, Any] = {
         "installed": False,
@@ -1682,9 +4614,13 @@ def software_status_payload(target: Path) -> dict[str, Any]:
         "presence": [],
         "canonical_target": canonical,
         "live_check": False,
+        "cleanup_pending": False,
     }
     if not target.exists():
         return payload
+    if validate_cleanup:
+        cleanup = cleanup_state(target)
+        payload["cleanup_pending"] = cleanup["cleanup_pending"]
     target_info = require_directory(target, "target")
     require_current_user_owner(target_info, "target")
     if stat.S_IMODE(target_info.st_mode) != OWNER_DIRECTORY_MODE:
@@ -1788,6 +4724,7 @@ def software_status_payload(target: Path) -> dict[str, Any]:
         registry = stamp.get("registry")
         if (
             not isinstance(registry, dict)
+            or registry.get("tarball") != PI_REGISTRY_TARBALL_URL
             or registry.get("integrity") != PI_REGISTRY_INTEGRITY
             or registry.get("shasum") != PI_REGISTRY_SHASUM
         ):
@@ -1795,10 +4732,21 @@ def software_status_payload(target: Path) -> dict[str, Any]:
         installer = stamp.get("installer")
         if (
             not isinstance(installer, dict)
-            or installer.get("tool") != "bun"
-            or installer.get("argv") != BUN_INSTALL_ARGV
+            or installer.get("tool") != "npm"
+            or installer.get("metadata_argv") != NPM_VIEW_ARGV
+            or installer.get("pack_argv") != NPM_PACK_ARGV
+            or installer.get("local_install_argv") != NPM_LOCAL_INSTALL_ARGV
+            or installer.get("argv") != NPM_INSTALL_ARGV
             or installer.get("env") != expected_installer_env()
             or installer.get("trust_reason") is not None
+            or installer.get("byte_verification")
+            != {
+                "metadata_integrity": PI_REGISTRY_INTEGRITY,
+                "metadata_shasum": PI_REGISTRY_SHASUM,
+                "tarball_integrity": PI_REGISTRY_INTEGRITY,
+                "tarball_shasum": PI_REGISTRY_SHASUM,
+                "verified_before_extract": True,
+            }
         ):
             drift.append("installer")
         official_scripts = stamp.get("official_package_scripts")
@@ -1835,11 +4783,18 @@ def software_status_payload(target: Path) -> dict[str, Any]:
     return payload
 
 
+def is_cleanup_state_error(exc: PiSetupError) -> bool:
+    message = str(exc)
+    return message.startswith("cleanup ") or message.startswith("cannot inspect cleanup ")
+
+
 def software_precondition_state(target: Path) -> dict[str, Any]:
     validate_pre_network_software_target(target)
     try:
         return software_status_payload(target)
     except PiSetupError as exc:
+        if is_cleanup_state_error(exc):
+            raise
         info = stat_optional(target, "target")
         if info is None or not stat.S_ISDIR(info.st_mode):
             raise
@@ -1864,37 +4819,6 @@ def software_precondition_state(target: Path) -> dict[str, Any]:
         }
 
 
-def snapshot_software_file(
-    path: Path, label: str, max_bytes: int
-) -> tuple[bytes | None, int | None]:
-    info = stat_optional(path, label)
-    if info is None:
-        return None, None
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        fail(f"{label} must be a regular non-hardlinked file")
-    content = read_regular_file(path, label, max_bytes=max_bytes)
-    return content, stat.S_IMODE(info.st_mode)
-
-
-def restore_software_file(
-    path: Path,
-    target: Path,
-    data: bytes | None,
-    mode: int | None,
-    *,
-    remove_empty_parent: bool,
-) -> None:
-    if data is None:
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        if remove_empty_parent:
-            with contextlib.suppress(OSError):
-                path.parent.rmdir()
-        return
-    ensure_software_parent(path, target)
-    atomic_write_private(path, data, mode or OWNER_FILE_MODE)
-
-
 def remove_created_target_if_empty(target: Path) -> None:
     for candidate in (software_stamp_path(target), software_entrypoint(target)):
         with contextlib.suppress(FileNotFoundError):
@@ -1910,31 +4834,20 @@ def remove_created_target_if_empty(target: Path) -> None:
 
 
 def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
-    preflight = software_precondition_state(target)
-    if preflight["current"]:
-        return {
-            "changed": False,
-            "package": PI_PACKAGE_NAME,
-            "version": PI_PACKAGE_VERSION,
-            "command": PI_COMMAND,
-            "executable": str(software_entrypoint(target)),
-            "installed_tree": str(software_current(target)),
-            "target": canonical_target_readonly(target),
-        }
-    if update and not preflight["present"]:
-        fail("software-update requires existing target-owned Pi software presence")
-    if not update and preflight["present"]:
-        fail(
-            "software-install found partial or non-current target-owned Pi software; use software-update"
-        )
-
-    with target_lock(target):
+    with target_lock(target) as target:
+        target_parent_state = directory_metadata(target.parent, "target parent")
         created_target = stat_optional(target, "target") is None
+        target_state = directory_metadata(target, "target")
+        software_root_state = directory_metadata(software_root(target), "software root")
+        entrypoint_parent_state = directory_metadata(software_entrypoint(target).parent, "bin")
         try:
+            if not created_target and drain_cleanup(target):
+                fail("cleanup is still pending")
             status = software_precondition_state(target)
             if status["current"]:
                 return {
                     "changed": False,
+                    "cleanup_pending": False,
                     "package": PI_PACKAGE_NAME,
                     "version": PI_PACKAGE_VERSION,
                     "command": PI_COMMAND,
@@ -1955,17 +4868,12 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                     prefix=f".{target.name}{SOFTWARE_STAGE_FRAGMENT}.",
                     dir=str(parent),
                 ) as stage_raw,
-                tempfile.TemporaryDirectory(
-                    prefix=f".{target.name}.nddev-pi-software-rollback.",
-                    dir=str(parent),
-                ) as rollback_raw,
             ):
                 stage_root = Path(stage_raw)
-                rollback_root = Path(rollback_raw)
                 node_runtime = resolve_node_runtime(stage_root)
                 stage_install = stage_root / "install-output"
                 stage_current = stage_root / SOFTWARE_CURRENT_NAME
-                run_bun_install(stage_install)
+                run_npm_install(stage_install)
                 manifest = load_package_manifest(stage_install)
                 prepublish_only = manifest.get("scripts", {}).get("prepublishOnly")
                 materialize_persisted_install(
@@ -2002,82 +4910,156 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                     os.chmod(target, OWNER_DIRECTORY_MODE)
                 else:
                     require_safe_partial_directory(target, "target")
-                software_root_was_present = (
-                    stat_optional(software_root(target), "software root") is not None
-                )
-                entrypoint_parent_was_present = (
-                    stat_optional(software_entrypoint(target).parent, "bin") is not None
-                )
                 software_root(target).mkdir(mode=OWNER_DIRECTORY_MODE, exist_ok=True)
                 os.chmod(software_root(target), OWNER_DIRECTORY_MODE)
+                ensure_software_parent(software_entrypoint(target), target)
                 current = software_current(target)
-                rollback_current = rollback_root / SOFTWARE_CURRENT_NAME
-                previous_entrypoint, previous_entrypoint_mode = snapshot_software_file(
-                    software_entrypoint(target),
-                    "Pi entrypoint",
-                    SOFTWARE_FILE_MAX_BYTES,
+                entrypoint_content = node_wrapper_content(
+                    node_runtime["path"], package_binary_path(current)
                 )
-                previous_stamp, previous_stamp_mode = snapshot_software_file(
-                    software_stamp_path(target), SOFTWARE_STAMP_NAME, METADATA_MAX_BYTES
+                entrypoint_digest = sha256_bytes(entrypoint_content)
+                stamp = software_stamp(
+                    target,
+                    entrypoint_digest=entrypoint_digest,
+                    installed_tree_digest=installed_tree_digest,
+                    installed_tree_path_count=installed_tree_path_count,
+                    installed_tree_bytes=installed_tree_bytes,
+                    package_binary_digest=package_binary_digest,
+                    version_probe_digest=version_probe_digest,
+                    node_runtime=node_runtime,
+                    prepublish_only=prepublish_only,
                 )
-                current_moved = False
-                new_current_installed = False
-                try:
-                    current_info = stat_optional(current, "current software tree")
-                    if current_info is not None:
-                        if not stat.S_ISDIR(current_info.st_mode):
-                            fail("current software tree must be a directory")
-                        current.rename(rollback_current)
-                        current_moved = True
-                    stage_current.rename(current)
-                    new_current_installed = True
-                    entrypoint_digest = write_target_entrypoint(target, node_runtime)
-                    if os.environ.get("NDDEV_PI_TEST_FAIL_AFTER_ENTRYPOINT") == "1":
-                        fail("injected software swap failure after entrypoint")
-                    stamp = software_stamp(
+                staged_entrypoint_file = stage_root / "staged-entrypoint"
+                staged_stamp_file = stage_root / "staged-stamp"
+                atomic_write_private(
+                    staged_entrypoint_file,
+                    entrypoint_content,
+                    0o700,
+                    label="staged-software-entrypoint",
+                )
+                atomic_write_private(
+                    staged_stamp_file,
+                    canonical_json(stamp),
+                    OWNER_FILE_MODE,
+                    label="staged-software-stamp",
+                )
+                replacements = [
+                    cleanup_replacement(
                         target,
-                        entrypoint_digest=entrypoint_digest,
-                        installed_tree_digest=installed_tree_digest,
-                        installed_tree_path_count=installed_tree_path_count,
-                        installed_tree_bytes=installed_tree_bytes,
-                        package_binary_digest=package_binary_digest,
-                        version_probe_digest=version_probe_digest,
-                        node_runtime=node_runtime,
-                        prepublish_only=prepublish_only,
+                        purpose="software-current",
+                        source_anchor="target",
+                        source_relative=f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}",
+                        snapshot=snapshot_cleanup_tree(
+                            stage_current, "cleanup replacement software-current"
+                        ),
+                    ),
+                    cleanup_replacement(
+                        target,
+                        purpose="software-entrypoint",
+                        source_anchor="target",
+                        source_relative=software_entrypoint_relative().as_posix(),
+                        snapshot=snapshot_cleanup_tree(
+                            staged_entrypoint_file,
+                            "cleanup replacement software-entrypoint",
+                        ),
+                    ),
+                    cleanup_replacement(
+                        target,
+                        purpose="software-stamp",
+                        source_anchor="target",
+                        source_relative=SOFTWARE_STAMP_NAME,
+                        snapshot=snapshot_cleanup_tree(
+                            staged_stamp_file, "cleanup replacement software-stamp"
+                        ),
+                    ),
+                ]
+                restore_parents = {
+                    SOFTWARE_DIR_NAME: software_root_state,
+                    software_entrypoint_relative().parent.as_posix(): entrypoint_parent_state,
+                }
+                cleanup_entries: list[dict[str, Any]] = []
+                try:
+                    cleanup_entries = prepare_cleanup_intent(
+                        target,
+                        [
+                            {
+                                "purpose": "software-current",
+                                "source_anchor": "target",
+                                "source_relative": f"{SOFTWARE_DIR_NAME}/{SOFTWARE_CURRENT_NAME}",
+                            },
+                            {
+                                "purpose": "software-entrypoint",
+                                "source_anchor": "target",
+                                "source_relative": software_entrypoint_relative().as_posix(),
+                            },
+                            {
+                                "purpose": "software-stamp",
+                                "source_anchor": "target",
+                                "source_relative": SOFTWARE_STAMP_NAME,
+                            },
+                        ],
+                        replacements=replacements,
+                        restore_parents=restore_parents,
                     )
-                    atomic_write_private(
-                        software_stamp_path(target), canonical_json(stamp), OWNER_FILE_MODE
+                    move_cleanup_sources_to_tombstones(target, cleanup_entries)
+                    stage_current.rename(current)
+                    lifecycle_hook("software.current.rename.after")
+                    fsync_directory(current.parent, "current software parent")
+                    validate_cleanup_tree(
+                        current, replacements[0]["snapshot"], "software current replacement"
                     )
-                    verified = software_status_payload(target)
+                    staged_entrypoint_file.rename(software_entrypoint(target))
+                    lifecycle_hook("software.entrypoint.rename.after")
+                    fsync_directory(software_entrypoint(target).parent, "software entrypoint parent")
+                    validate_cleanup_tree(
+                        software_entrypoint(target),
+                        replacements[1]["snapshot"],
+                        "software entrypoint replacement",
+                    )
+                    staged_stamp_file.rename(software_stamp_path(target))
+                    lifecycle_hook("software.stamp.rename.after")
+                    fsync_directory(target, "software stamp parent")
+                    validate_cleanup_tree(
+                        software_stamp_path(target),
+                        replacements[2]["snapshot"],
+                        "software stamp replacement",
+                    )
+                    verified = software_status_payload(target, validate_cleanup=False)
                     if not verified["current"]:
                         fail(
                             f"installed software failed status verification: {', '.join(verified['drift'])}"
                         )
+                    cleanup_pending = False
+                    if cleanup_entries or replacements:
+                        cleanup_pending = publish_cleanup_pending(
+                            target, cleanup_entries_for_pending(cleanup_entries)
+                        )
                 except BaseException:
-                    if new_current_installed:
-                        shutil.rmtree(current, ignore_errors=True)
-                    if current_moved:
-                        rollback_current.rename(current)
-                    restore_software_file(
-                        software_entrypoint(target),
-                        target,
-                        previous_entrypoint,
-                        previous_entrypoint_mode,
-                        remove_empty_parent=not entrypoint_parent_was_present,
+                    completed = recover_cleanup_intent(target)
+                    if completed:
+                        cleanup = cleanup_state(target)
+                        return {
+                            "changed": True,
+                            "cleanup_pending": cleanup["cleanup_pending"],
+                            "package": PI_PACKAGE_NAME,
+                            "version": PI_PACKAGE_VERSION,
+                            "command": PI_COMMAND,
+                            "executable": str(software_entrypoint(target)),
+                            "installed_tree": str(software_current(target)),
+                            "target": canonical_target_readonly(target),
+                        }
+                    restore_directory_metadata(
+                        software_entrypoint(target).parent,
+                        entrypoint_parent_state,
+                        "bin",
                     )
-                    restore_software_file(
-                        software_stamp_path(target),
-                        target,
-                        previous_stamp,
-                        previous_stamp_mode,
-                        remove_empty_parent=False,
+                    restore_directory_metadata(
+                        software_root(target), software_root_state, "software root"
                     )
-                    if not software_root_was_present:
-                        with contextlib.suppress(OSError):
-                            software_root(target).rmdir()
                     raise
                 return {
                     "changed": True,
+                    "cleanup_pending": cleanup_pending,
                     "package": PI_PACKAGE_NAME,
                     "version": PI_PACKAGE_VERSION,
                     "command": PI_COMMAND,
@@ -2088,27 +5070,37 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
         except BaseException:
             if created_target:
                 remove_created_target_if_empty(target)
+                restore_directory_metadata(target.parent, target_parent_state, "target parent")
+            else:
+                restore_directory_metadata(target, target_state, "target")
+                restore_directory_metadata(target.parent, target_parent_state, "target parent")
             raise
 
 
 def software_plan(target: Path) -> dict[str, Any]:
-    status = software_precondition_state(target)
-    operation = "none"
-    if not status["present"]:
-        operation = "install"
-    elif not status["current"]:
-        operation = "repair-or-update"
-    return {
-        "operation": operation,
-        "target": canonical_target_readonly(target),
-        "mutates": False,
-        "package": PI_PACKAGE_NAME,
-        "version": PI_PACKAGE_VERSION,
-        "installed": status["installed"],
-        "current": status["current"],
-        "presence": status["presence"],
-        "drift": status["drift"],
-    }
+    def build(target: Path) -> dict[str, Any]:
+        status = software_precondition_state(target)
+        operation = "none"
+        if not status["present"]:
+            operation = "install"
+        elif not status["current"]:
+            operation = "repair-or-update"
+        if status.get("cleanup_pending"):
+            operation = "cleanup"
+        return {
+            "operation": operation,
+            "target": canonical_target_readonly(target),
+            "mutates": False,
+            "package": PI_PACKAGE_NAME,
+            "version": PI_PACKAGE_VERSION,
+            "installed": status["installed"],
+            "current": status["current"],
+            "presence": status["presence"],
+            "drift": status["drift"],
+            "cleanup_pending": status.get("cleanup_pending", False),
+        }
+
+    return read_only_target(target, build)
 
 
 def build_child_env(target: Path, node_runtime: dict[str, str]) -> dict[str, str]:
@@ -2156,7 +5148,9 @@ def build_child_env(target: Path, node_runtime: dict[str, str]) -> dict[str, str
             "PI_TELEMETRY": "0",
         }
     )
-    assert_no_sensitive_environment(child_env, "Pi child environment")
+    assert_no_sensitive_environment(
+        child_env, "Pi child environment", allowed_exact=PROVIDER_ENV_ALLOWLIST
+    )
     return child_env
 
 
@@ -2166,7 +5160,8 @@ def require_safe_launch_args(child_args: list[str]) -> None:
     while index < len(child_args):
         token = child_args[index]
         if token == "--":
-            return
+            index += 1
+            continue
         if (
             not first_non_option_checked
             and token
@@ -2181,6 +5176,9 @@ def require_safe_launch_args(child_args: list[str]) -> None:
         flag = token.split("=", 1)[0]
         if flag in LAUNCH_BLOCKED_VALUE_FLAGS:
             fail(f"launch argument {flag} is not allowed: {LAUNCH_BLOCKED_VALUE_FLAGS[flag]}")
+        for prefix, reason in LAUNCH_BLOCKED_ATTACHED_PREFIX_FLAGS.items():
+            if token.startswith(prefix) and token != prefix:
+                fail(f"launch argument {prefix} is not allowed: {reason}")
         index += 1
 
 
@@ -2190,46 +5188,50 @@ def prepare_launch_invocation(
     user_args = list(forwarded)
     if user_args and user_args[0] == "--":
         user_args = user_args[1:]
-    with target_lock(target):
-        require_clean_managed(target)
-        software = software_status_payload(target)
-        if not software["current"]:
-            drift = software.get("drift") or ["target-owned Pi package is not installed"]
-            fail(f"launch requires current target-owned Pi package: {', '.join(drift)}")
-        stamp = read_software_stamp(target)
-        if stamp is None:
-            fail("target-owned Pi software stamp is missing")
-        executable = software_entrypoint(target)
-        executable_info = require_regular_file(
-            executable,
-            "target-owned Pi executable",
-            max_bytes=SOFTWARE_FILE_MAX_BYTES,
-        )
-        require_current_user_owner(executable_info, "target-owned Pi executable")
-        if stat.S_IMODE(executable_info.st_mode) != 0o700:
-            fail("target-owned Pi executable must be private executable")
-        require_safe_launch_args(user_args)
-        settings = read_current_settings(target)
-        if settings is None:
-            fail("managed settings are missing")
-        nddev_settings = settings.get("nddev")
-        if not isinstance(nddev_settings, dict):
-            fail("managed nddev settings are missing")
-        launch_args = validate_string_array(
-            nddev_settings.get("launch_args"), "managed launch_args"
-        )
-        child_args = [*launch_args, "--skill", builder_skill_path(target), *user_args]
-        child_env = build_child_env(target, stamp["node_runtime"])
-        return [str(executable), *child_args], child_env
+    require_clean_managed(target)
+    software = software_status_payload(target)
+    if not software["current"]:
+        drift = software.get("drift") or ["target-owned Pi package is not installed"]
+        fail(f"launch requires current target-owned Pi package: {', '.join(drift)}")
+    stamp = read_software_stamp(target)
+    if stamp is None:
+        fail("target-owned Pi software stamp is missing")
+    executable = software_entrypoint(target)
+    executable_info = require_regular_file(
+        executable,
+        "target-owned Pi executable",
+        max_bytes=SOFTWARE_FILE_MAX_BYTES,
+    )
+    require_current_user_owner(executable_info, "target-owned Pi executable")
+    if stat.S_IMODE(executable_info.st_mode) != 0o700:
+        fail("target-owned Pi executable must be private executable")
+    require_safe_launch_args(user_args)
+    settings = read_current_settings(target)
+    if settings is None:
+        fail("managed settings are missing")
+    nddev_settings = settings.get("nddev")
+    if not isinstance(nddev_settings, dict):
+        fail("managed nddev settings are missing")
+    launch_args = validate_string_array(nddev_settings.get("launch_args"), "managed launch_args")
+    child_args = [*launch_args, "--skill", builder_skill_path(target), *user_args]
+    child_env = build_child_env(target, stamp["node_runtime"])
+    return [str(executable), *child_args], child_env
 
 
-def command_launch(target: Path, forwarded: list[str]) -> int:
-    command, child_env = prepare_launch_invocation(target, forwarded)
-    try:
-        completed = subprocess.run(command, env=child_env, check=False)
-    except FileNotFoundError:
-        fail("target-owned pi executable is missing")
-    return completed.returncode
+def command_launch(target: Path, raw_workspace: str | None, forwarded: list[str]) -> int:
+    workspace = resolve_launch_workspace(raw_workspace)
+    with target_lock(target) as target:
+        if drain_cleanup(target):
+            fail("cleanup is still pending")
+        command, child_env = prepare_launch_invocation(target, forwarded)
+        lifecycle_hook("launch.before_spawn")
+        try:
+            completed = subprocess.run(
+                command, env=child_env, cwd=str(workspace.path), check=False
+            )
+        except FileNotFoundError:
+            fail("target-owned pi executable is missing")
+        return completed.returncode
 
 
 def emit(payload: dict[str, Any], json_enabled: bool) -> None:
@@ -2240,7 +5242,7 @@ def emit(payload: dict[str, Any], json_enabled: bool) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = JsonArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser("list")
@@ -2252,11 +5254,13 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--json", action="store_true")
         if command in {"plan", "install", "switch"}:
             command_parser.add_argument("--setup")
+            command_parser.add_argument("--profile")
         if command == "restore":
-            command_parser.add_argument("--backup", type=int)
+            command_parser.add_argument("--backup")
 
     launch_parser = subparsers.add_parser("launch")
     launch_parser.add_argument("--target")
+    launch_parser.add_argument("--workspace")
     launch_parser.add_argument("--json", action="store_true")
     launch_parser.add_argument("forwarded", nargs=argparse.REMAINDER)
 
@@ -2270,10 +5274,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 def require_setup_argument(setup_id: str | None) -> str:
     if not setup_id:
-        fail("--setup is required")
+        setup_id = DEFAULT_SETUP_ID
     validate_setup_id(setup_id)
     load_setup(setup_id)
     return setup_id
+
+
+def require_profile_argument(profile_id: str | None) -> str:
+    if not profile_id:
+        profile_id = DEFAULT_PROFILE_ID
+    validate_profile_id(profile_id)
+    load_profile(profile_id)
+    return profile_id
+
+
+def require_backup_slot(raw_slot: str | None) -> int:
+    if raw_slot is None:
+        fail("--backup is required")
+    if not re.fullmatch(r"\d+", raw_slot):
+        fail("--backup must be a decimal integer in the 0..9 range")
+    slot = int(raw_slot)
+    if slot < 0 or slot > 9:
+        fail("--backup must be in the 0..9 range")
+    return slot
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2281,53 +5304,73 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     json_enabled = bool(getattr(args, "json", False))
     try:
+        host = require_supported_host()
         if args.command == "list":
-            emit({"setups": list_setups()}, json_enabled)
+            emit({"setups": list_setups(), "profiles": list_profiles(), "host": host}, json_enabled)
             return 0
         if args.command == "status":
-            emit(status_for_target(resolve_target(args.target)), json_enabled)
+            emit(
+                read_only_target(lexical_target(args.target), status_for_target),
+                json_enabled,
+            )
             return 0
         if args.command == "plan":
             emit(
-                command_plan(resolve_target(args.target), require_setup_argument(args.setup)),
+                command_plan(
+                    lexical_target(args.target),
+                    require_setup_argument(args.setup),
+                    require_profile_argument(args.profile),
+                ),
                 json_enabled,
             )
             return 0
         if args.command == "install":
             emit(
-                command_install(resolve_target(args.target), require_setup_argument(args.setup)),
+                command_install(
+                    lexical_target(args.target),
+                    require_setup_argument(args.setup),
+                    require_profile_argument(args.profile),
+                ),
                 json_enabled,
             )
             return 0
         if args.command == "switch":
             emit(
-                command_switch(resolve_target(args.target), require_setup_argument(args.setup)),
+                command_switch(
+                    lexical_target(args.target),
+                    require_setup_argument(args.setup),
+                    require_profile_argument(args.profile),
+                ),
                 json_enabled,
             )
             return 0
         if args.command == "restore":
-            if args.backup is None:
-                fail("--backup is required")
-            emit(command_restore(resolve_target(args.target), args.backup), json_enabled)
+            emit(
+                command_restore(lexical_target(args.target), require_backup_slot(args.backup)),
+                json_enabled,
+            )
             return 0
         if args.command == "remove":
-            emit(command_remove(resolve_target(args.target)), json_enabled)
+            emit(command_remove(lexical_target(args.target)), json_enabled)
             return 0
         if args.command == "launch":
-            return command_launch(resolve_target(args.target), args.forwarded)
+            return command_launch(lexical_target(args.target), args.workspace, args.forwarded)
         if args.command == "software-plan":
-            emit(software_plan(resolve_target(args.target)), json_enabled)
+            emit(software_plan(lexical_target(args.target)), json_enabled)
             return 0
         if args.command == "software-status":
-            emit(software_status_payload(resolve_target(args.target)), json_enabled)
+            emit(
+                read_only_target(lexical_target(args.target), software_status_payload),
+                json_enabled,
+            )
             return 0
         if args.command == "software-install":
             emit(
-                install_or_update_software(resolve_target(args.target), update=False), json_enabled
+                install_or_update_software(lexical_target(args.target), update=False), json_enabled
             )
             return 0
         if args.command == "software-update":
-            emit(install_or_update_software(resolve_target(args.target), update=True), json_enabled)
+            emit(install_or_update_software(lexical_target(args.target), update=True), json_enabled)
             return 0
     except PiSetupError as exc:
         if json_enabled:

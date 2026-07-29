@@ -12,10 +12,18 @@ absolute target. The target becomes the Pi runtime root for managed launches:
 - `TMPDIR=<target>/.nddev-pi-runtime/tmp`
 - `PATH=<target>/bin:<recorded-node-dir>:/usr/bin:/bin`
 
+The target is a configuration/runtime home, not the project workspace. Managed
+launch selects the workspace independently: `--workspace` must name an absolute
+existing directory whose final component is not a symlink, and omitting it
+captures the caller's current working directory once. The resolved workspace is
+passed as the child process `cwd`. Official Pi `0.82.1` CLI grammar does not
+provide a native workspace, project, or cwd flag, so the manager uses process
+`cwd` only and blocks forwarded scope overrides.
+
 The manager rejects relative targets, target symlinks, symlinked managed files,
 hard-linked managed files, and oversized managed metadata. Backups are stored in
-the target-bound sibling directory `.<target-name>.nddev-pi-backups` and rotate
-across ten slots.
+the target-bound sibling directory `.<target-name>.nddev-pi-backups` and are
+bounded to the slot policy declared in `build/manifest.json`.
 
 ## Lifecycle
 
@@ -24,43 +32,41 @@ a clean managed target and create target-bound backups before replacing managed
 state. Unknown files and user-owned settings keys are preserved. Co-owned
 `skills` and `packages` arrays keep non-NDDev entries.
 
+`switch` is a success no-op when the requested setup and profile already match
+the clean managed target and no valid cleanup is pending: it returns
+`changed: []` and `backup_slot: null` without rewriting managed files or
+creating a backup. If valid cleanup is pending, `switch` may drain that cleanup
+first and reports `cleanup_drained: true`; malformed cleanup fails without
+adopting or repairing it.
+
+Mutating commands drain a valid manager-owned cleanup journal before active
+changes. Read-only commands expose `cleanup_pending` and do not repair, adopt,
+chmod, or delete cleanup state. If no product coordination anchor exists,
+read-only commands accept only a bounded empty coordination namespace; any
+namespace change discards and recomputes the observation. The journal schema and
+lock policy are owned by `config/nddev-contract.json`.
+
 ## Pi Capability Model
 
 Official Pi documentation confirms settings, skills, packages, extensions, and
 project trust controls. It does not document native permission popups, sub-agent
 configuration, or a built-in plugin marketplace for this manager. The
-`full-auto` setup therefore uses Pi project trust approval and isolated process
-environment only; it is not represented as a sandbox.
+`full-auto` profile therefore uses Pi project trust approval and isolated
+process environment only; it is not represented as a sandbox.
 
 ## Software Commands
 
 `software-plan` and `software-status` are side-effect free and never execute the
-target-owned Pi binary. `software-install` and `software-update` install
-`@earendil-works/pi-coding-agent@0.82.1` with:
+target-owned Pi binary. `software-install` and `software-update` install the
+pinned Pi npm package in isolated stage-owned install/cache/home/tmp paths. The
+exact npm argv, package identity, layout checks, Node runtime recording, and
+version-probe contract are owned by `references/pi-baseline.json`,
+`build/version.json`, and `config/nddev-contract.json`.
 
-```bash
-bun add --global --exact @earendil-works/pi-coding-agent@0.82.1
-```
-
-The Bun process receives only stage-owned install/cache/home/tmp paths. The
-manager persists the staged `install/global` and `bin` trees, verifies the
-official package layout, checks the staged binary with isolated Pi runtime
-environment, records the external Node path/version/digest, then atomically
-swaps `<target>/.nddev-pi-software/current`, `<target>/bin/pi`, and
-`NDDEV-PI-SOFTWARE.json`. Fresh failures remove transaction-created target
-state; updates roll back byte-for-byte including stamp modes.
-
-The Bun-created `bin/pi` symlink must resolve inside staging to the declared
-package entrypoint. The manager does not persist that symlink or detach its ESM
-file from neighboring imports; it replaces it with a private relative Node
-wrapper inside the sanitized software tree. The target-visible wrapper remains
-separate and points at the package entrypoint in the atomically swapped tree.
-
-The published package identity is `0.82.1`, while its current `pi --version`
-stdout is `0.0.0`. These are independent fail-closed checks: the manager
-requires the exact package name/version/bin from package metadata and the exact
-CLI probe output recorded by `references/pi-baseline.json`. Probe stdout never
-substitutes for package identity.
+The manager does not persist npm-created symlinks or detach Pi's ESM entrypoint
+from neighboring imports. It materializes a private Node wrapper inside the
+sanitized software tree and a target-visible wrapper that points at that
+package entrypoint.
 
 Staged and persisted trees remain bounded by independently enforced path-count
 and logical-byte limits. The measured exact-package calibration is owned by
@@ -69,6 +75,10 @@ protective limits and preserved path, symlink, mode, and digest checks. The
 software stamp records the installed tree metrics and limits for status
 revalidation.
 
+Software install/update publishes a bounded cleanup intent before any visible
+replacement move. Failures before the pending cleanup journal restore exact
+prior software objects; once the desired state is verified, cleanup failures
+return success with `cleanup_pending`.
+
 The pinned package has no consumer `preinstall`, `install`, or `postinstall`
-script, so Bun `--trust` is not used. The published `prepublishOnly` script is
-recorded as package evidence but is not run by consumers.
+script in the recorded baseline. npm is invoked with consumer scripts disabled.

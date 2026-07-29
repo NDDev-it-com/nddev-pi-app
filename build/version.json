@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "build_version": "0.1.0",
-  "python_requires": ">=3.10",
+  "python_requires": ">=3.9",
   "pi_product_name": "Pi Coding Agent",
   "pi_package_name": "@earendil-works/pi-coding-agent",
   "pi_coding_agent_tested": "0.82.1",
@@ -11,5 +11,6 @@
   "pi_registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
   "pi_registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
   "runtime_baseline_ref": "references/pi-baseline.json",
-  "nddev_builder_package_version": "0.1.0"
+  "nddev_builder_package_version": "0.1.0",
+  "pi_registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz"
 }

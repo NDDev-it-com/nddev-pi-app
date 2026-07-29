@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "id": "nddev-builder",
+  "description": "NDDev builder content setup for Pi: target-local instructions, skill projection, and package manifest through documented Pi resource surfaces.",
+  "managed_files": [
+    "agent/settings.json",
+    "agent/AGENTS.md",
+    "agent/skills/nddev-builder/SKILL.md",
+    "agent/packages/nddev-builder/package.json",
+    "agent/packages/nddev-builder/skills/nddev-builder/SKILL.md"
+  ],
+  "builder_projection": "default-on",
+  "native_surfaces": [
+    "settings.skills",
+    "settings.packages",
+    "package.pi.skills",
+    "agent.AGENTS.md"
+  ]
+}

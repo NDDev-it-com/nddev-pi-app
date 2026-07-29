@@ -4,9 +4,21 @@
   "build_version": "0.1.0",
   "entrypoint": "python3 cli-tools/nddev_pi.py",
   "source_root": "setups",
-  "setup_ids": ["balanced", "full-auto", "safe"],
+  "setup_ids": [
+    "nddev-builder"
+  ],
+  "profile_ids": [
+    "full-auto",
+    "safe"
+  ],
+  "default_setup_id": "nddev-builder",
+  "default_profile_id": "full-auto",
   "managed_files": [
     "agent/settings.json",
+    "agent/AGENTS.md",
+    "agent/skills/nddev-builder/SKILL.md",
+    "agent/packages/nddev-builder/package.json",
+    "agent/packages/nddev-builder/skills/nddev-builder/SKILL.md",
     "NDDEV-PI-SETUP.json"
   ],
   "command_policy": {
@@ -25,17 +37,38 @@
     ],
     "plan_mutates": false,
     "restore_backup_option": "--backup <0..9>",
-    "target_required": ["status", "plan", "install", "switch", "restore", "remove", "launch"]
+    "target_required": [
+      "status",
+      "plan",
+      "install",
+      "switch",
+      "restore",
+      "remove",
+      "launch"
+    ]
   },
   "backup_policy": {
     "canonical_target_bound": true,
     "envelope": "NDDEV-PI-BACKUP.json",
+    "envelope_schema": 2,
+    "file_metadata": [
+      "size",
+      "sha256"
+    ],
+    "exact_managed_path_set": true,
     "location": "sibling .<target-name>.nddev-pi-backups",
-    "slots": 10
+    "slots": 10,
+    "full_pool_behavior": "fail-closed"
   },
   "runtime_compatibility": {
     "baseline_ref": "references/pi-baseline.json",
-    "version_ref": "build/version.json"
+    "version_ref": "build/version.json",
+    "supported_hosts": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ]
   },
   "runtime_launch": {
     "command": "pi",
@@ -58,8 +91,33 @@
     "forwards_arguments": true,
     "forwards_child_exit_code": true,
     "json_manager_errors_supported": true,
-    "manager_command": "python3 cli-tools/nddev_pi.py launch --target <absolute-target> -- [args...]",
-    "provider_secret_inheritance": false,
+    "manager_command": "python3 cli-tools/nddev_pi.py launch --target <absolute-target> [--workspace <absolute-project-workspace>] -- [args...]",
+    "target_role": "configuration-runtime-home",
+    "workspace_option": "--workspace <absolute-existing-dir>",
+    "default_workspace_source": "caller-cwd-captured-once",
+    "explicit_workspace_requirements": [
+      "absolute",
+      "existing-directory",
+      "final-component-not-symlink",
+      "accessible"
+    ],
+    "child_cwd": "resolved-workspace",
+    "native_workspace_argument_supported": false,
+    "native_workspace_argument": null,
+    "native_workspace_source": "@earendil-works/pi-coding-agent@0.82.1 dist/cli/args.js and official CLI reference do not expose a workspace/project/cwd option",
+    "blocked_forwarded_scope_overrides": [
+      "--workspace",
+      "--project",
+      "--project-dir",
+      "--project-directory",
+      "--cwd",
+      "--workdir",
+      "--working-directory",
+      "--directory",
+      "--dir",
+      "-C"
+    ],
+    "provider_secret_inheritance": "child-process-allowlist-only",
     "requires_clean_managed_target": true,
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
@@ -74,10 +132,52 @@
     "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
     "registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
     "installer": {
-      "tool": "bun",
-      "argv": ["add", "--global", "--exact", "@earendil-works/pi-coding-agent@0.82.1"],
+      "tool": "npm",
+      "metadata_argv": [
+        "view",
+        "@earendil-works/pi-coding-agent@0.82.1",
+        "dist",
+        "--json"
+      ],
+      "pack_argv": [
+        "pack",
+        "--json",
+        "--ignore-scripts",
+        "--pack-destination",
+        "<stage>/tarballs",
+        "@earendil-works/pi-coding-agent@0.82.1"
+      ],
+      "argv": [
+        "install",
+        "--global-style",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--package-lock=false",
+        "--prefix",
+        "<stage>/install",
+        "<verified-tarball>"
+      ],
       "trust": false,
-      "consumer_lifecycle_scripts": false
+      "byte_verification": {
+        "metadata_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+        "metadata_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+        "tarball_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+        "tarball_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+        "verified_before_extract": true
+      },
+      "consumer_lifecycle_scripts": false,
+      "local_install_argv": [
+        "install",
+        "--global-style",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--package-lock=false",
+        "--prefix",
+        "<stage>/install",
+        "<verified-tarball>"
+      ]
     },
     "target_owned": {
       "software_root": ".nddev-pi-software/current",
@@ -85,14 +185,21 @@
       "stamp_file": "NDDEV-PI-SOFTWARE.json",
       "status_executes_target_binary": false,
       "launch_uses_target_entrypoint": true
-    }
+    },
+    "install_execution": "npm view + npm pack with pinned tarball verification",
+    "registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz"
   },
   "builder_projection": {
     "status": "native-settings-skill-and-local-package-projection",
     "default_on": true,
     "target_skill_path": "agent/skills/nddev-builder",
     "target_package_path": "agent/packages/nddev-builder",
-    "surfaces": ["settings.skills", "package.skills"],
+    "surfaces": [
+      "settings.skills",
+      "settings.packages",
+      "package.pi.skills",
+      "agent.AGENTS.md"
+    ],
     "official_documentation": {
       "settings": "https://pi.dev/docs/latest/settings",
       "packages": "https://pi.dev/docs/latest/packages",
@@ -115,6 +222,65 @@
     "reject_symlink_managed_files": true,
     "rollback_on_failure": true,
     "staging": "same-parent temporary directory",
-    "lock": "exclusive sibling directory"
+    "lock": "monotonic product and canonical target anchors",
+    "read_only_lock_creation": false,
+    "cold_no_anchor_namespace": "bounded-empty-or-fail-closed-retry-whole-read",
+    "anchor_publication": "complete fsynced temp plus atomic no-replace hardlink",
+    "external_coordination_root": "private sticky-temp namespace declared by cli-tools/nddev_pi.py",
+    "cleanup_journal": {
+      "pending_flag": "cleanup_pending",
+      "prepare_intent": "durable before first source-to-tombstone move",
+      "journal": "complete immutable no-replace pending.json",
+      "read_only_repairs": false,
+      "mutation_drains_before_active_change": true
+    },
+    "switch_noop": {
+      "same_setup_profile_result": "success",
+      "changed": [],
+      "backup_slot": null,
+      "managed_transaction": false,
+      "backup_created": false,
+      "cleanup_pending_drains_before_result": true
+    },
+    "setup_rollback": {
+      "strategy": "object-preserving held managed files",
+      "restores_original_file_identity": true,
+      "backup_commit_after_desired_postcondition": true
+    },
+    "software_rollback": {
+      "strategy": "object-preserving cleanup intent replacements",
+      "restores_original_file_identity": true,
+      "prepare_intent_before_visible_replacement": true,
+      "committed_success_cleanup_pending": true
+    }
+  },
+  "profiles": {
+    "default": "full-auto",
+    "available": [
+      "full-auto",
+      "safe"
+    ],
+    "full-auto": {
+      "project_trust": "always",
+      "managed_launch_args": [
+        "--offline",
+        "--approve"
+      ],
+      "tool_boundary": "normal-pi-tools",
+      "os_security_boundary": false
+    },
+    "safe": {
+      "project_trust": "never",
+      "managed_launch_args": [
+        "--offline",
+        "--no-session",
+        "--no-approve",
+        "--tools",
+        "read,grep,find,ls"
+      ],
+      "tool_boundary": "pi-read-only-builtins",
+      "os_security_boundary": false,
+      "status": "future-switch-profile"
+    }
   }
 }

@@ -9,7 +9,13 @@
   "version_ref": "build/version.json",
   "source_root": "setups",
   "managed_state": {
-    "managed_files": ["agent/settings.json"],
+    "managed_files": [
+      "agent/settings.json",
+      "agent/AGENTS.md",
+      "agent/skills/nddev-builder/SKILL.md",
+      "agent/packages/nddev-builder/package.json",
+      "agent/packages/nddev-builder/skills/nddev-builder/SKILL.md"
+    ],
     "managed_file_mode": "0600",
     "preserve_other_state": true,
     "preserve_unmanaged_config_keys": true,
@@ -22,18 +28,41 @@
     "identity_source": "<setup>/setup.json:id",
     "list_command": "python3 cli-tools/nddev_pi.py list [--json]",
     "selection_option": "--setup <id>",
-    "setup_ids": ["balanced", "full-auto", "safe"],
+    "setup_ids": [
+      "nddev-builder"
+    ],
+    "default_setup_id": "nddev-builder",
+    "profiles_root": "profiles",
+    "profile_selection_option": "--profile <id>",
+    "profile_ids": [
+      "full-auto",
+      "safe"
+    ],
+    "default_profile_id": "full-auto",
     "status_command": "python3 cli-tools/nddev_pi.py status --target <absolute-dir> [--json]"
   },
   "runtime_compatibility": {
     "baseline_ref": "references/pi-baseline.json",
-    "version_ref": "build/version.json"
+    "version_ref": "build/version.json",
+    "supported_hosts": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ],
+    "ubuntu_version_floor": null
   },
   "runtime_launch": {
     "command": "pi",
-    "direct_command": "PI_CODING_AGENT_DIR=<absolute-target>/agent pi [managed args...]",
+    "direct_command": "<absolute-target>/bin/pi [managed args...]",
     "environment_overrides": [
       "HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+      "XDG_STATE_HOME",
+      "XDG_CACHE_HOME",
+      "TMPDIR",
+      "PATH",
       "PI_CODING_AGENT_DIR",
       "PI_CODING_AGENT_SESSION_DIR",
       "PI_PACKAGE_DIR",
@@ -44,8 +73,33 @@
     "forwards_arguments": true,
     "forwards_child_exit_code": true,
     "json_manager_errors_supported": true,
-    "manager_command": "python3 cli-tools/nddev_pi.py launch --target <absolute-target> -- [args...]",
-    "provider_secret_inheritance": false,
+    "manager_command": "python3 cli-tools/nddev_pi.py launch --target <absolute-target> [--workspace <absolute-project-workspace>] -- [args...]",
+    "target_role": "configuration-runtime-home",
+    "workspace_option": "--workspace <absolute-existing-dir>",
+    "default_workspace_source": "caller-cwd-captured-once",
+    "explicit_workspace_requirements": [
+      "absolute",
+      "existing-directory",
+      "final-component-not-symlink",
+      "accessible"
+    ],
+    "child_cwd": "resolved-workspace",
+    "native_workspace_argument_supported": false,
+    "native_workspace_argument": null,
+    "native_workspace_source": "@earendil-works/pi-coding-agent@0.82.1 dist/cli/args.js and official CLI reference do not expose a workspace/project/cwd option",
+    "blocked_forwarded_scope_overrides": [
+      "--workspace",
+      "--project",
+      "--project-dir",
+      "--project-directory",
+      "--cwd",
+      "--workdir",
+      "--working-directory",
+      "--directory",
+      "--dir",
+      "-C"
+    ],
+    "provider_secret_inheritance": "child-process-allowlist-only",
     "requires_clean_managed_target": true,
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
@@ -64,20 +118,62 @@
     "status_command": "python3 cli-tools/nddev_pi.py software-status --target <absolute-dir> [--json]",
     "install_command": "python3 cli-tools/nddev_pi.py software-install --target <absolute-dir> [--json]",
     "update_command": "python3 cli-tools/nddev_pi.py software-update --target <absolute-dir> [--json]",
-    "install_execution": "bun add --global --exact in isolated target-owned staging, then atomic swap",
+    "install_execution": "npm view + npm pack in isolated staging, pinned SRI/sha1 tarball verification, local extraction with scripts disabled, then atomic swap",
     "update_execution": "safe partial repair/update through isolated staging and rollback",
     "installer": {
-      "tool": "bun",
-      "argv": ["add", "--global", "--exact", "@earendil-works/pi-coding-agent@0.82.1"],
+      "tool": "npm",
+      "metadata_argv": [
+        "view",
+        "@earendil-works/pi-coding-agent@0.82.1",
+        "dist",
+        "--json"
+      ],
+      "pack_argv": [
+        "pack",
+        "--json",
+        "--ignore-scripts",
+        "--pack-destination",
+        "<stage>/tarballs",
+        "@earendil-works/pi-coding-agent@0.82.1"
+      ],
+      "argv": [
+        "install",
+        "--global-style",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--package-lock=false",
+        "--prefix",
+        "<stage>/install",
+        "<verified-tarball>"
+      ],
       "trust": false,
+      "byte_verification": {
+        "metadata_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+        "metadata_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+        "tarball_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
+        "tarball_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+        "verified_before_extract": true
+      },
       "env": {
-        "BUN_INSTALL_GLOBAL_DIR": "<stage>/install/global",
-        "BUN_INSTALL_BIN": "<stage>/bin",
-        "BUN_INSTALL_CACHE_DIR": "<stage>/cache",
         "HOME": "<stage>/home",
+        "npm_config_cache": "<stage>/cache",
+        "npm_config_ignore_scripts": "true",
+        "npm_config_userconfig": "<stage>/npmrc",
         "XDG_CONFIG_HOME": "<stage>/xdg-config",
         "TMPDIR": "<stage>/tmp"
-      }
+      },
+      "local_install_argv": [
+        "install",
+        "--global-style",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--package-lock=false",
+        "--prefix",
+        "<stage>/install",
+        "<verified-tarball>"
+      ]
     },
     "staged_tree_policy": {
       "verified_calibration": "references/pi-baseline.json:manager_installation.verified_tree_calibration",
@@ -103,8 +199,8 @@
       ]
     },
     "entrypoint_materialization": {
-      "bun_source": "<stage>/bin/pi",
-      "required_package_target": "<stage>/install/global/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+    "npm_source": "<stage>/install/node_modules/.bin/pi",
+      "required_package_target": "<stage>/install/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
       "persisted_kind": "private-relative-node-wrapper",
       "persisted_path": ".nddev-pi-software/current/bin/pi",
       "persisted_mode": "0700",
@@ -112,8 +208,11 @@
     },
     "version_identity": {
       "required_package_version": "0.82.1",
-      "package_version_source": ".nddev-pi-software/current/install/global/node_modules/@earendil-works/pi-coding-agent/package.json",
-      "probe_argv": ["bin/pi", "--version"],
+    "package_version_source": ".nddev-pi-software/current/install/node_modules/@earendil-works/pi-coding-agent/package.json",
+      "probe_argv": [
+        "bin/pi",
+        "--version"
+      ],
       "expected_probe_output": "0.0.0",
       "package_and_probe_must_both_match": true
     },
@@ -123,13 +222,18 @@
       "stamp_file": "NDDEV-PI-SOFTWARE.json",
       "status_executes_target_binary": false,
       "launch_uses_target_entrypoint": true
-    }
+    },
+    "registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz"
   },
   "builder_projection": {
     "default_on": true,
     "installation": {
-      "install_command": "python3 cli-tools/nddev_pi.py install --setup <id> --target <absolute-target> [--json]",
-      "native_settings_keys": ["skills", "packages", "enableSkillCommands"],
+      "install_command": "python3 cli-tools/nddev_pi.py install --setup nddev-builder --profile <id> --target <absolute-target> [--json]",
+      "native_settings_keys": [
+        "skills",
+        "packages",
+        "enableSkillCommands"
+      ],
       "native_package_path": "builder/nddev-builder/package.json",
       "preserved_on_switch_restore": true,
       "status_command": "python3 cli-tools/nddev_pi.py status --target <absolute-target> [--json]"
@@ -145,9 +249,13 @@
       "external_marketplace_published": null,
       "status": "unsupported-by-this-manager"
     },
-    "surfaces": ["settings.skills", "package.skills"],
+    "surfaces": [
+      "settings.skills",
+      "settings.packages",
+      "package.pi.skills",
+      "agent.AGENTS.md"
+    ],
     "unsupported_surfaces": {
-      "agents": "not documented as a native Pi coding-agent surface",
       "mcp": "available through third-party Pi extensions/packages, not projected by this manager",
       "plugin_marketplace": null
     }
@@ -156,13 +264,61 @@
     "absolute_target_required": true,
     "canonical_target_binding": true,
     "default_target": null,
-    "explicit_target_required": ["status", "plan", "install", "switch", "restore", "remove", "launch"],
+    "explicit_target_required": [
+      "status",
+      "plan",
+      "install",
+      "switch",
+      "restore",
+      "remove",
+      "launch"
+    ],
     "max_backups": 10,
+    "backup_envelope_schema": 2,
+    "backup_records_sizes_and_digests": true,
+    "backup_exact_managed_path_set": true,
+    "backup_full_pool_behavior": "fail-closed",
     "missing_target_argument_rejected": true,
     "new_target_mode": "0700",
     "preserve_existing_target_mode": true,
     "relative_target_rejected": true,
     "rollback_on_failure": true,
-    "target_symlinks_rejected": true
+    "target_symlinks_rejected": true,
+    "external_lifecycle_coordination": {
+      "product_anchor": "global.lock",
+      "canonical_target_anchor": "<sha256>.target.lock",
+      "read_only_creates_anchors": false,
+      "cold_no_anchor_namespace": "bounded-empty-or-fail-closed-retry-whole-read",
+      "mutation_publishes_missing_target_anchor": true,
+      "publication": "atomic no-replace hardlink of complete fsynced binding",
+      "published_anchors_unlinked_by_lifecycle": false
+    },
+    "cleanup_journal": {
+      "cleanup_parent": ".nddev-pi-cleanup",
+      "prepare_intent": "durable before first source-to-tombstone move",
+      "pending_flag": "cleanup_pending",
+      "read_only_repairs": false,
+      "mutation_drains_before_active_change": true,
+      "absolute_paths_in_documents": false
+    },
+    "switch_noop": {
+      "same_setup_profile_result": "success",
+      "changed": [],
+      "backup_slot": null,
+      "managed_transaction": false,
+      "backup_created": false,
+      "cleanup_pending_drains_before_result": true
+    },
+    "setup_rollback": {
+      "strategy": "object-preserving held managed files",
+      "restores_original_file_identity": true,
+      "backup_commit_after_desired_postcondition": true
+    },
+    "software_rollback": {
+      "strategy": "object-preserving cleanup intent replacements",
+      "restores_original_file_identity": true,
+      "prepare_intent_before_visible_replacement": true,
+      "committed_success_cleanup_pending": true
+    }
   }
 }
