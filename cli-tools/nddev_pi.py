@@ -1294,9 +1294,7 @@ def validated_anchor_stages(
 
 def recover_anchor_publication_alias(path: Path, descriptor: int, expected: dict[str, Any]) -> None:
     opened = validate_anchor_descriptor(path, descriptor, expected, allow_publication_alias=True)
-    stages = validated_anchor_stages(
-        path.parent, path, expected, allow_linked_final=True
-    )
+    stages = validated_anchor_stages(path.parent, path, expected, allow_linked_final=True)
     if opened.st_nlink == 2:
         linked_aliases = []
         for stage in stages:
@@ -1468,9 +1466,7 @@ def ensure_anchor(
             return None
     if not recover_alias:
         fail("external lock pre-publication stage requires exclusive recovery")
-    stages = validated_anchor_stages(
-        path.parent, path, expected, allow_linked_final=False
-    )
+    stages = validated_anchor_stages(path.parent, path, expected, allow_linked_final=False)
     if stages:
         selected = stages[0]
         try:
@@ -1910,16 +1906,16 @@ class ManagedFileTransaction:
                         fsync_directory(path.parent, f"managed file {relative} parent")
             except BaseException as exc:
                 errors.append(f"{relative}: {exc}")
+        try:
+            self.cleanup()
+        except BaseException as exc:
+            errors.append(f"transaction cleanup: {exc}")
         for relative in managed_parent_relatives(self.relatives):
             label = relative.as_posix()
             try:
                 restore_directory_metadata(self.target / relative, self.parents[label], label)
             except BaseException as exc:
                 errors.append(f"{label}: {exc}")
-        try:
-            self.cleanup()
-        except BaseException as exc:
-            errors.append(f"transaction cleanup: {exc}")
         if errors:
             fail("managed rollback failed: " + "; ".join(errors))
 
@@ -2179,7 +2175,9 @@ def validate_cleanup_tree_partial(path: Path, expected: dict[str, Any], label: s
         ]
     else:
         actual_paths = [path]
-    actual_relatives = {"." if item == path else item.relative_to(path).as_posix() for item in actual_paths}
+    actual_relatives = {
+        "." if item == path else item.relative_to(path).as_posix() for item in actual_paths
+    }
     for item in actual_paths:
         relative = "." if item == path else item.relative_to(path).as_posix()
         if relative not in records:
@@ -2188,7 +2186,11 @@ def validate_cleanup_tree_partial(path: Path, expected: dict[str, Any], label: s
         if record.get("kind") == "directory":
             expected_descendants = cleanup_descendant_relatives(records, relative)
             actual_descendants = cleanup_descendant_relatives(
-                {candidate: records[candidate] for candidate in actual_relatives if candidate in records},
+                {
+                    candidate: records[candidate]
+                    for candidate in actual_relatives
+                    if candidate in records
+                },
                 relative,
             )
             exact_directory = expected_descendants == actual_descendants
@@ -2226,13 +2228,13 @@ def cleanup_direct_child_names(records: dict[str, dict[str, Any]], relative: str
     }
 
 
-def cleanup_descendant_relatives(
-    records: dict[str, dict[str, Any]], relative: str
-) -> set[str]:
+def cleanup_descendant_relatives(records: dict[str, dict[str, Any]], relative: str) -> set[str]:
     if relative == ".":
         return set(records)
     prefix = f"{relative}/"
-    return {candidate for candidate in records if candidate == relative or candidate.startswith(prefix)}
+    return {
+        candidate for candidate in records if candidate == relative or candidate.startswith(prefix)
+    }
 
 
 def cleanup_actual_child_names(path: Path, label: str) -> set[str]:
@@ -2530,7 +2532,14 @@ def validate_cleanup_document(
             fail(f"{label} replacement must be an object")
         require_exact_keys(
             replacement,
-            {"purpose", "source_anchor", "source_relative", "source_kind", "source_parent", "snapshot"},
+            {
+                "purpose",
+                "source_anchor",
+                "source_relative",
+                "source_kind",
+                "source_parent",
+                "snapshot",
+            },
             f"{label} replacement",
         )
         if replacement["source_kind"] not in {"directory", "file"}:
@@ -2878,13 +2887,18 @@ def prepare_cleanup_intent(
 
 
 def move_cleanup_sources_to_tombstones(target: Path, entries: list[dict[str, Any]]) -> None:
+    expected_tombstone_parent: dict[str, Any] | None = None
     for entry in entries:
         purpose = entry["purpose"]
         source = anchored_path(target, entry["source_anchor"], entry["source_relative"])
         tombstone = anchored_path(target, entry["tombstone_anchor"], entry["tombstone_relative"])
         validate_cleanup_parent_identity(source.parent, entry["source_parent"], "cleanup source")
+        if expected_tombstone_parent is None:
+            expected_tombstone_parent = entry["tombstone_parent"]
+        elif entry["tombstone_parent"] != entries[0]["tombstone_parent"]:
+            fail("cleanup tombstone parent binding mismatch")
         validate_cleanup_parent_identity(
-            tombstone.parent, entry["tombstone_parent"], "cleanup tombstone"
+            tombstone.parent, expected_tombstone_parent, "cleanup tombstone"
         )
         source.rename(tombstone)
         lifecycle_hook(f"cleanup.{purpose}.source.move.after")
@@ -2893,6 +2907,7 @@ def move_cleanup_sources_to_tombstones(target: Path, entries: list[dict[str, Any
         fsync_directory(tombstone.parent, "cleanup tombstone parent")
         lifecycle_hook(f"cleanup.{purpose}.tombstone.parent.fsync")
         validate_cleanup_tree(tombstone, entry["snapshot"], f"cleanup tombstone {purpose}")
+        expected_tombstone_parent = cleanup_parent_identity(tombstone.parent, "cleanup tombstone")
 
 
 def cleanup_path_matches(path: Path, expected: dict[str, Any], label: str) -> bool:
@@ -2903,13 +2918,9 @@ def cleanup_path_matches(path: Path, expected: dict[str, Any], label: str) -> bo
     return True
 
 
-def cleanup_replacements_present(
-    target: Path, replacements: list[dict[str, Any]]
-) -> bool:
+def cleanup_replacements_present(target: Path, replacements: list[dict[str, Any]]) -> bool:
     for replacement in replacements:
-        source = anchored_path(
-            target, replacement["source_anchor"], replacement["source_relative"]
-        )
+        source = anchored_path(target, replacement["source_anchor"], replacement["source_relative"])
         if stat_optional(source, f"cleanup replacement {replacement['purpose']}") is None:
             return False
         validate_cleanup_parent_stable_identity(
@@ -2921,9 +2932,7 @@ def cleanup_replacements_present(
     return True
 
 
-def desired_software_state_is_current(
-    target: Path, replacements: list[dict[str, Any]]
-) -> bool:
+def desired_software_state_is_current(target: Path, replacements: list[dict[str, Any]]) -> bool:
     if not replacements or not cleanup_replacements_present(target, replacements):
         return False
     try:
@@ -2933,13 +2942,41 @@ def desired_software_state_is_current(
     return bool(status.get("current"))
 
 
-def delete_cleanup_replacements(target: Path, replacements: list[dict[str, Any]]) -> None:
+def delete_cleanup_replacements(
+    target: Path,
+    replacements: list[dict[str, Any]],
+    entries: list[dict[str, Any]],
+) -> None:
+    original_entries = {
+        (entry["purpose"], entry["source_anchor"], entry["source_relative"]): entry
+        for entry in entries
+    }
     for replacement in reversed(replacements):
-        source = anchored_path(
-            target, replacement["source_anchor"], replacement["source_relative"]
-        )
+        source = anchored_path(target, replacement["source_anchor"], replacement["source_relative"])
         if stat_optional(source, f"cleanup replacement {replacement['purpose']}") is None:
             continue
+        key = (
+            replacement["purpose"],
+            replacement["source_anchor"],
+            replacement["source_relative"],
+        )
+        original = original_entries.get(key)
+        if original is not None:
+            tombstone = anchored_path(
+                target,
+                original["tombstone_anchor"],
+                original["tombstone_relative"],
+            )
+            if stat_optional(tombstone, f"cleanup tombstone {replacement['purpose']}") is None:
+                validate_cleanup_parent_identity(
+                    source.parent, original["source_parent"], "cleanup source"
+                )
+                validate_cleanup_tree(
+                    source,
+                    original["snapshot"],
+                    f"cleanup original {replacement['purpose']}",
+                )
+                continue
         validate_cleanup_parent_stable_identity(
             source.parent, replacement["source_parent"], "cleanup replacement"
         )
@@ -3005,7 +3042,7 @@ def recover_cleanup_intent(target: Path) -> bool:
             delete_file(cleanup_intent_path(target))
             fsync_directory(cleanup_parent(target), "cleanup parent")
         return True
-    delete_cleanup_replacements(target, replacements)
+    delete_cleanup_replacements(target, replacements, entries)
     restore_cleanup_entries_from_tombstones(target, entries)
     restore_cleanup_parents(target, restore_parents)
     try:
@@ -5031,7 +5068,9 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                     )
                     staged_entrypoint_file.rename(software_entrypoint(target))
                     lifecycle_hook("software.entrypoint.rename.after")
-                    fsync_directory(software_entrypoint(target).parent, "software entrypoint parent")
+                    fsync_directory(
+                        software_entrypoint(target).parent, "software entrypoint parent"
+                    )
                     validate_cleanup_tree(
                         software_entrypoint(target),
                         replacements[1]["snapshot"],
@@ -5247,9 +5286,7 @@ def command_launch(target: Path, raw_workspace: str | None, forwarded: list[str]
         command, child_env = prepare_launch_invocation(target, forwarded)
         lifecycle_hook("launch.before_spawn")
         try:
-            completed = subprocess.run(
-                command, env=child_env, cwd=str(workspace.path), check=False
-            )
+            completed = subprocess.run(command, env=child_env, cwd=str(workspace.path), check=False)
         except FileNotFoundError:
             fail("target-owned pi executable is missing")
         return completed.returncode

@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-import importlib.util
 import contextlib
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -214,6 +214,100 @@ def validate_software_rollback_identity(errors: list[str]) -> None:
             errors.append(f"cli-tools/nddev_pi.py: stale byte-copy rollback helper {fragment!r}")
 
 
+def validate_transaction_rollback_behavior(errors: list[str]) -> None:
+    manager = ROOT / "cli-tools" / "nddev_pi.py"
+    name = "nddev_pi_public_validator_transaction_rollback"
+    try:
+        spec = importlib.util.spec_from_file_location(name, manager)
+        if spec is None or spec.loader is None:
+            errors.append("cli-tools/nddev_pi.py: cannot load manager module spec")
+            return
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-managed-rollback.") as tmp:
+            target = Path(tmp) / "target"
+            managed = target / module.SETTINGS_NAME
+            managed.parent.mkdir(parents=True, mode=module.OWNER_DIRECTORY_MODE)
+            managed.write_text('{"owned":"original"}\n', encoding="utf-8")
+            managed.chmod(module.OWNER_FILE_MODE)
+            before_parent = module.directory_metadata(target, "managed rollback target")
+            before_file = managed.lstat()
+            transaction = module.ManagedFileTransaction(target, [module.SETTINGS_NAME])
+            managed.unlink()
+            managed.write_text('{"owned":"replacement"}\n', encoding="utf-8")
+            managed.chmod(module.OWNER_FILE_MODE)
+            transaction.rollback()
+            after_parent = module.directory_metadata(target, "managed rollback target")
+            after_file = managed.lstat()
+            if after_parent != before_parent:
+                errors.append("cli-tools/nddev_pi.py: managed rollback changed target metadata")
+            if (after_file.st_dev, after_file.st_ino) != (
+                before_file.st_dev,
+                before_file.st_ino,
+            ) or managed.read_text(encoding="utf-8") != '{"owned":"original"}\n':
+                errors.append(
+                    "cli-tools/nddev_pi.py: managed rollback changed original file identity"
+                )
+            if any(path.name.startswith(".nddev-pi-tx-") for path in target.iterdir()):
+                errors.append("cli-tools/nddev_pi.py: managed rollback left transaction residue")
+        with tempfile.TemporaryDirectory(prefix="nddev-pi-public-multi-cleanup.") as tmp:
+            target = Path(tmp) / "target"
+            current = target / module.SOFTWARE_DIR_NAME / module.SOFTWARE_CURRENT_NAME
+            entrypoint = module.software_entrypoint(target)
+            stamp = module.software_stamp_path(target)
+            current.mkdir(parents=True, mode=module.OWNER_DIRECTORY_MODE)
+            (current / "payload.txt").write_text("current\n", encoding="utf-8")
+            entrypoint.parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+            entrypoint.write_text("entrypoint\n", encoding="utf-8")
+            stamp.write_text("stamp\n", encoding="utf-8")
+            for path in (current / "payload.txt", entrypoint, stamp):
+                path.chmod(module.OWNER_FILE_MODE)
+            originals = {
+                path: (path.lstat().st_dev, path.lstat().st_ino, path.read_bytes())
+                for path in (current / "payload.txt", entrypoint, stamp)
+            }
+            entries = module.prepare_cleanup_intent(
+                target,
+                [
+                    {
+                        "purpose": "software-current",
+                        "source_anchor": "target",
+                        "source_relative": (
+                            f"{module.SOFTWARE_DIR_NAME}/{module.SOFTWARE_CURRENT_NAME}"
+                        ),
+                    },
+                    {
+                        "purpose": "software-entrypoint",
+                        "source_anchor": "target",
+                        "source_relative": module.software_entrypoint_relative().as_posix(),
+                    },
+                    {
+                        "purpose": "software-stamp",
+                        "source_anchor": "target",
+                        "source_relative": module.SOFTWARE_STAMP_NAME,
+                    },
+                ],
+                replacements=[],
+                restore_parents={},
+            )
+            module.move_cleanup_sources_to_tombstones(target, entries)
+            module.recover_cleanup_intent(target)
+            for path, expected in originals.items():
+                info = path.lstat()
+                actual = (info.st_dev, info.st_ino, path.read_bytes())
+                if actual != expected:
+                    errors.append(
+                        f"cli-tools/nddev_pi.py: multi-source rollback changed {path.name}"
+                    )
+            if module.cleanup_parent(target).exists():
+                errors.append("cli-tools/nddev_pi.py: multi-source rollback left cleanup residue")
+    except Exception as exc:  # pragma: no cover - validator reports instead of crashing
+        errors.append(f"cli-tools/nddev_pi.py: transaction rollback behavior check failed: {exc}")
+    finally:
+        sys.modules.pop(name, None)
+
+
 def validate_external_anchor_recovery(errors: list[str]) -> None:
     manager = ROOT / "cli-tools" / "nddev_pi.py"
     try:
@@ -231,7 +325,7 @@ def validate_external_anchor_recovery(errors: list[str]) -> None:
         "lock.{expected['kind']}.stage.final.visible",
         "lock.{expected['kind']}.stage.unlink",
         "external lock pre-publication stage binding mismatch",
-        "parent_metadata_before_temp = directory_metadata(parent, \"external lock parent\")",
+        'parent_metadata_before_temp = directory_metadata(parent, "external lock parent")',
         "restore_directory_metadata(\n                parent,",
         "system_root_metadata = directory_metadata(",
         "restore_directory_metadata(\n                        bootstrap_system_temp_root()",
@@ -278,7 +372,9 @@ def validate_external_anchor_behavior(errors: list[str]) -> None:
                     os.close(descriptor)
                 stages.append(stage)
             try:
-                module.ensure_anchor(final, binding, exclusive=False, create=False, recover_alias=False)
+                module.ensure_anchor(
+                    final, binding, exclusive=False, create=False, recover_alias=False
+                )
             except module.PiSetupError as exc:
                 if "pre-publication stage exists without final anchor" not in str(exc):
                     errors.append(f"cli-tools/nddev_pi.py: unexpected read-only stage error: {exc}")
@@ -293,7 +389,9 @@ def validate_external_anchor_behavior(errors: list[str]) -> None:
             if len(stage_snapshots) != 3:
                 errors.append("cli-tools/nddev_pi.py: read-only mutated pre-publication stages")
                 return
-            lock = module.ensure_anchor(final, binding, exclusive=True, create=True, recover_alias=True)
+            lock = module.ensure_anchor(
+                final, binding, exclusive=True, create=True, recover_alias=True
+            )
             try:
                 final_info = final.lstat()
                 if stat.S_IMODE(final_info.st_mode) != module.OWNER_FILE_MODE:
@@ -396,7 +494,9 @@ def validate_external_anchor_behavior(errors: list[str]) -> None:
                 for stage in (valid, malformed)
             ]
             try:
-                module.ensure_anchor(final, binding, exclusive=True, create=True, recover_alias=True)
+                module.ensure_anchor(
+                    final, binding, exclusive=True, create=True, recover_alias=True
+                )
             except module.PiSetupError as exc:
                 if "pre-publication stage binding mismatch" not in str(exc):
                     errors.append(f"cli-tools/nddev_pi.py: unexpected malformed stage error: {exc}")
@@ -516,7 +616,9 @@ def validate_cleanup_metadata_behavior(errors: list[str]) -> None:
             module.restore_directory_metadata(parent, before, "metadata smoke parent")
             after = module.directory_metadata(parent, "metadata smoke parent")
             if after != before:
-                errors.append("cli-tools/nddev_pi.py: parent metadata restore did not restore exact state")
+                errors.append(
+                    "cli-tools/nddev_pi.py: parent metadata restore did not restore exact state"
+                )
         with tempfile.TemporaryDirectory(prefix="nddev-pi-public-cleanup-failure.") as tmp:
             parent = Path(tmp) / "cleanup"
             parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
@@ -539,13 +641,17 @@ def validate_cleanup_metadata_behavior(errors: list[str]) -> None:
                     errors.append(f"cli-tools/nddev_pi.py: unexpected cleanup failure error: {exc}")
                     return
             else:
-                errors.append("cli-tools/nddev_pi.py: injected cleanup publication failure succeeded")
+                errors.append(
+                    "cli-tools/nddev_pi.py: injected cleanup publication failure succeeded"
+                )
                 return
             if list(parent.iterdir()):
                 errors.append("cli-tools/nddev_pi.py: cleanup publication failure left residue")
             after = module.directory_metadata(parent, "metadata smoke cleanup parent")
             if after != before:
-                errors.append("cli-tools/nddev_pi.py: cleanup publication failure changed parent metadata")
+                errors.append(
+                    "cli-tools/nddev_pi.py: cleanup publication failure changed parent metadata"
+                )
     except Exception as exc:  # pragma: no cover - validator reports instead of crashing
         errors.append(f"cli-tools/nddev_pi.py: cleanup metadata behavior check failed: {exc}")
     finally:
@@ -659,7 +765,9 @@ def validate_launch_workspace_behavior(errors: list[str]) -> None:
                     ]
                 )
                 if rc != FakeCompleted.returncode or len(captures) != 1:
-                    errors.append("cli-tools/nddev_pi.py: explicit workspace launch did not spawn once")
+                    errors.append(
+                        "cli-tools/nddev_pi.py: explicit workspace launch did not spawn once"
+                    )
                     return
                 explicit_capture = captures[-1]
                 expected_command = [
@@ -691,7 +799,9 @@ def validate_launch_workspace_behavior(errors: list[str]) -> None:
                 }
                 for key, expected_path in expected_env.items():
                     if env.get(key) != str(expected_path.resolve()):
-                        errors.append(f"cli-tools/nddev_pi.py: launch env {key} is not target-owned")
+                        errors.append(
+                            f"cli-tools/nddev_pi.py: launch env {key} is not target-owned"
+                        )
                 if env.get("PI_OFFLINE") != "1" or env.get("PI_TELEMETRY") != "0":
                     errors.append("cli-tools/nddev_pi.py: launch network/telemetry env drifted")
 
@@ -699,7 +809,9 @@ def validate_launch_workspace_behavior(errors: list[str]) -> None:
                 os.chdir(default_workspace)
                 rc = invoke(["launch", "--json", "--target", str(target), "--", "--version"])
                 if rc != FakeCompleted.returncode or len(captures) != 1:
-                    errors.append("cli-tools/nddev_pi.py: default workspace launch did not spawn once")
+                    errors.append(
+                        "cli-tools/nddev_pi.py: default workspace launch did not spawn once"
+                    )
                     return
                 if captures[-1]["cwd"] != str(default_workspace.resolve()):
                     errors.append("cli-tools/nddev_pi.py: caller cwd was not captured as workspace")
@@ -920,7 +1032,9 @@ def validate_switch_noop_behavior(errors: list[str]) -> None:
             if snapshot_tree(canonical) != before_target:
                 errors.append("cli-tools/nddev_pi.py: identical switch changed active target graph")
             if snapshot_tree(backup) != before_backup:
-                errors.append("cli-tools/nddev_pi.py: identical switch created or changed backup graph")
+                errors.append(
+                    "cli-tools/nddev_pi.py: identical switch created or changed backup graph"
+                )
 
             source = canonical / module.SOFTWARE_STAMP_NAME
             source.write_text("cleanup payload", encoding="utf-8")
@@ -1007,15 +1121,21 @@ def validate_switch_noop_behavior(errors: list[str]) -> None:
             if "error" not in failure:
                 errors.append("cli-tools/nddev_pi.py: malformed cleanup did not return JSON error")
             if snapshot_tree(cleanup_root) != malformed_before:
-                errors.append("cli-tools/nddev_pi.py: malformed cleanup failure mutated cleanup graph")
+                errors.append(
+                    "cli-tools/nddev_pi.py: malformed cleanup failure mutated cleanup graph"
+                )
             active_after_malformed = {
                 relative: snapshot_tree(canonical / relative)
                 for relative in module.managed_file_relatives()
             }
             if active_after_malformed != active_before_malformed:
-                errors.append("cli-tools/nddev_pi.py: malformed cleanup failure changed active files")
+                errors.append(
+                    "cli-tools/nddev_pi.py: malformed cleanup failure changed active files"
+                )
             if snapshot_tree(backup) != backup_before_malformed:
-                errors.append("cli-tools/nddev_pi.py: malformed cleanup failure changed backup graph")
+                errors.append(
+                    "cli-tools/nddev_pi.py: malformed cleanup failure changed backup graph"
+                )
     except Exception as exc:  # pragma: no cover - validator reports instead of crashing
         errors.append(f"cli-tools/nddev_pi.py: switch no-op behavior check failed: {exc}")
     finally:
@@ -1032,6 +1152,7 @@ def main() -> int:
     validate_npm_json_output_bound(errors)
     validate_cold_read_coordination(errors)
     validate_software_rollback_identity(errors)
+    validate_transaction_rollback_behavior(errors)
     validate_external_anchor_recovery(errors)
     validate_external_anchor_behavior(errors)
     validate_cleanup_metadata_behavior(errors)
@@ -1179,8 +1300,7 @@ def main() -> int:
         )
         if (
             not isinstance(software_rollback, dict)
-            or software_rollback.get("strategy")
-            != "object-preserving cleanup intent replacements"
+            or software_rollback.get("strategy") != "object-preserving cleanup intent replacements"
             or software_rollback.get("restores_original_file_identity") is not True
             or software_rollback.get("prepare_intent_before_visible_replacement") is not True
             or software_rollback.get("committed_success_cleanup_pending") is not True
@@ -1352,8 +1472,7 @@ def main() -> int:
         software_rollback = contract.get("safety", {}).get("software_rollback")
         if (
             not isinstance(software_rollback, dict)
-            or software_rollback.get("strategy")
-            != "object-preserving cleanup intent replacements"
+            or software_rollback.get("strategy") != "object-preserving cleanup intent replacements"
             or software_rollback.get("restores_original_file_identity") is not True
             or software_rollback.get("prepare_intent_before_visible_replacement") is not True
             or software_rollback.get("committed_success_cleanup_pending") is not True
@@ -1443,13 +1562,11 @@ def main() -> int:
             or launch_scope.get("target_role") != "configuration-runtime-home"
             or launch_scope.get("default_workspace_source") != "caller-cwd-captured-once"
             or launch_scope.get("manager_workspace_option") != "--workspace <absolute-existing-dir>"
-            or launch_scope.get("explicit_workspace_requirements")
-            != LAUNCH_WORKSPACE_REQUIREMENTS
+            or launch_scope.get("explicit_workspace_requirements") != LAUNCH_WORKSPACE_REQUIREMENTS
             or launch_scope.get("child_cwd") != "resolved-workspace"
             or launch_scope.get("native_workspace_argument_supported") is not False
             or launch_scope.get("native_workspace_argument") is not None
-            or launch_scope.get("official_cli_grammar", {}).get("workspace_project_cwd_flags")
-            != []
+            or launch_scope.get("official_cli_grammar", {}).get("workspace_project_cwd_flags") != []
         ):
             errors.append("references/pi-baseline.json: launch scope baseline mismatch")
 
