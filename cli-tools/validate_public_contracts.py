@@ -44,6 +44,7 @@ SEMVER = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
 PACKAGE_ID_PATTERN = re.compile(r"@[A-Za-z0-9._-]+/pi-coding-agent")
 REPOSITORY_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9._-]+/pi\b")
 NDDEV_MODULE_PATTERN = re.compile(r"nddev-[a-z0-9-]+-app")
+SHARED_WORKFLOW_PIN = "2ccb80e96f5771b6a6b4eae63a4f47e232906dc7"
 
 
 def read_json(relative: str, errors: list[str]) -> dict[str, Any] | None:
@@ -213,11 +214,49 @@ def validate_contracts(errors: list[str]) -> None:
     )
 
 
+def validate_release_and_runtime_integrity(errors: list[str]) -> None:
+    release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    for fragment in (
+        "permissions: {}",
+        'tags:\n      - "[0-9]+.[0-9]+.[0-9]+"',
+        f"release-supply-chain.yml@{SHARED_WORKFLOW_PIN}",
+        "version: ${{ github.ref_name }}",
+        "package_name: nddev-pi-app",
+        "archive_paths:",
+        "runtime_paths:",
+    ):
+        require(fragment in release, f"release workflow omits {fragment}", errors)
+    required_roots = {
+        "README.md", "LICENSE", "VERSION", "build", "builder", "cli-tools",
+        "config", "docs", "references", "setups",
+    }
+    require(
+        required_roots.issubset(set(release.split())),
+        "release archive/runtime membership is incomplete",
+        errors,
+    )
+    manager = (ROOT / "cli-tools/nddev_pi.py").read_text(encoding="utf-8")
+    for fragment in (
+        "NPM_JSON_OUTPUT_MAX_BYTES",
+        "cold_product_namespace_snapshot",
+        "recover_anchor_publication_alias",
+        "cleanup_pending",
+        "verify_tarball_identity",
+        "require_safe_launch_args",
+        "workspace",
+        "PI_CODING_AGENT_DIR",
+    ):
+        require(fragment in manager, f"manager runtime-integrity fragment missing: {fragment}", errors)
+    for fragment in ("plugin_marketplace", "marketplace.json", "default target"):
+        require(fragment not in manager, f"manager contains unsupported surface: {fragment}", errors)
+
+
 def main() -> int:
     errors: list[str] = []
     validate_identity(errors)
     validate_catalog(errors)
     validate_contracts(errors)
+    validate_release_and_runtime_integrity(errors)
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
