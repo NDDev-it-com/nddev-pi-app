@@ -176,7 +176,6 @@
       ]
     },
     "staged_tree_policy": {
-      "verified_calibration": "references/pi-baseline.json:manager_installation.verified_tree_calibration",
       "max_paths_per_tree": 25000,
       "max_logical_bytes_per_tree": 201326592,
       "preserved_checks": [
