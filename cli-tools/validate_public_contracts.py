@@ -251,12 +251,50 @@ def validate_release_and_runtime_integrity(errors: list[str]) -> None:
         require(fragment not in manager, f"manager contains unsupported surface: {fragment}", errors)
 
 
+def validate_public_instruction_surface(errors: list[str]) -> None:
+    claude = ROOT / ".claude"
+    try:
+        claude_info = claude.lstat()
+    except OSError:
+        claude_info = None
+    require(
+        claude_info is not None
+        and claude_info.st_mode & 0o170000 == 0o040000
+        and not claude.is_symlink(),
+        ".claude must be a real directory",
+        errors,
+    )
+    if claude_info is not None and claude_info.st_mode & 0o170000 == 0o040000:
+        require(
+            sorted(path.name for path in claude.iterdir()) == ["CLAUDE.md"],
+            ".claude must contain exactly CLAUDE.md",
+            errors,
+        )
+    for relative in ("AGENTS.md", ".claude/CLAUDE.md"):
+        path = ROOT / relative
+        try:
+            info = path.lstat()
+        except OSError:
+            info = None
+        require(
+            info is not None
+            and info.st_mode & 0o170000 == 0o100000
+            and not path.is_symlink(),
+            f"{relative} must be a real file",
+            errors,
+        )
+    bridge = ROOT / ".claude/CLAUDE.md"
+    if bridge.is_file() and not bridge.is_symlink():
+        require(bridge.read_bytes() == b"@../AGENTS.md\n", "Claude bridge is invalid", errors)
+
+
 def main() -> int:
     errors: list[str] = []
     validate_identity(errors)
     validate_catalog(errors)
     validate_contracts(errors)
     validate_release_and_runtime_integrity(errors)
+    validate_public_instruction_surface(errors)
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
