@@ -265,9 +265,13 @@ def validate_release_and_runtime_integrity(errors: list[str]) -> None:
         "workspace",
         "PI_CODING_AGENT_DIR",
     ):
-        require(fragment in manager, f"manager runtime-integrity fragment missing: {fragment}", errors)
+        require(
+            fragment in manager, f"manager runtime-integrity fragment missing: {fragment}", errors
+        )
     for fragment in ("plugin_marketplace", "marketplace.json", "default target"):
-        require(fragment not in manager, f"manager contains unsupported surface: {fragment}", errors)
+        require(
+            fragment not in manager, f"manager contains unsupported surface: {fragment}", errors
+        )
 
 
 def validate_public_instruction_surface(errors: list[str]) -> None:
@@ -296,9 +300,7 @@ def validate_public_instruction_surface(errors: list[str]) -> None:
         except OSError:
             info = None
         require(
-            info is not None
-            and info.st_mode & 0o170000 == 0o100000
-            and not path.is_symlink(),
+            info is not None and info.st_mode & 0o170000 == 0o100000 and not path.is_symlink(),
             f"{relative} must be a real file",
             errors,
         )
