@@ -15,9 +15,6 @@
     "tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz",
     "integrity": "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==",
     "shasum": "c7382fd5e2958b75fdc2313eae67e9f6d12ac690",
-    "published": "2026-07-25T12:47:12.883Z",
-    "file_count": 880,
-    "unpacked_size": 13036707,
     "node": ">=22.19.0",
     "repository_directory": "packages/coding-agent"
   },
