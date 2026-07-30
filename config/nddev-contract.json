@@ -86,7 +86,7 @@
     "child_cwd": "resolved-workspace",
     "native_workspace_argument_supported": false,
     "native_workspace_argument": null,
-    "native_workspace_source": "@earendil-works/pi-coding-agent@0.82.1 dist/cli/args.js and official CLI reference do not expose a workspace/project/cwd option",
+    "native_workspace_source": "@earendil-works/pi-coding-agent@0.83.0 dist/cli/args.js and official CLI reference do not expose a workspace/project/cwd option",
     "blocked_forwarded_scope_overrides": [
       "--workspace",
       "--project",
@@ -107,12 +107,12 @@
   },
   "software": {
     "package": "@earendil-works/pi-coding-agent",
-    "current_version": "0.82.1",
+    "current_version": "0.83.0",
     "command": "pi",
     "bin": "dist/cli.js",
     "node_requirement": ">=22.19.0",
-    "registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
-    "registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+    "registry_integrity": "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==",
+    "registry_shasum": "c7382fd5e2958b75fdc2313eae67e9f6d12ac690",
     "repository": "https://github.com/earendil-works/pi",
     "plan_command": "python3 cli-tools/nddev_pi.py software-plan --target <absolute-dir> [--json]",
     "status_command": "python3 cli-tools/nddev_pi.py software-status --target <absolute-dir> [--json]",
@@ -124,7 +124,7 @@
       "tool": "npm",
       "metadata_argv": [
         "view",
-        "@earendil-works/pi-coding-agent@0.82.1",
+        "@earendil-works/pi-coding-agent@0.83.0",
         "dist",
         "--json"
       ],
@@ -134,7 +134,7 @@
         "--ignore-scripts",
         "--pack-destination",
         "<stage>/tarballs",
-        "@earendil-works/pi-coding-agent@0.82.1"
+        "@earendil-works/pi-coding-agent@0.83.0"
       ],
       "argv": [
         "install",
@@ -149,10 +149,10 @@
       ],
       "trust": false,
       "byte_verification": {
-        "metadata_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
-        "metadata_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
-        "tarball_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
-        "tarball_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+        "metadata_integrity": "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==",
+        "metadata_shasum": "c7382fd5e2958b75fdc2313eae67e9f6d12ac690",
+        "tarball_integrity": "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==",
+        "tarball_shasum": "c7382fd5e2958b75fdc2313eae67e9f6d12ac690",
         "verified_before_extract": true
       },
       "env": {
@@ -206,7 +206,7 @@
       "persisted_symlink": false
     },
     "version_identity": {
-      "required_package_version": "0.82.1",
+      "required_package_version": "0.83.0",
     "package_version_source": ".nddev-pi-software/current/install/node_modules/@earendil-works/pi-coding-agent/package.json",
       "probe_argv": [
         "bin/pi",
@@ -222,7 +222,7 @@
       "status_executes_target_binary": false,
       "launch_uses_target_entrypoint": true
     },
-    "registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz"
+    "registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz"
   },
   "builder_projection": {
     "default_on": true,

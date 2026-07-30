@@ -4,13 +4,13 @@
   "python_requires": ">=3.9",
   "pi_product_name": "Pi Coding Agent",
   "pi_package_name": "@earendil-works/pi-coding-agent",
-  "pi_coding_agent_tested": "0.82.1",
+  "pi_coding_agent_tested": "0.83.0",
   "pi_command": "pi",
   "pi_package_bin": "dist/cli.js",
   "pi_node_requires": ">=22.19.0",
-  "pi_registry_integrity": "sha512-zbkAhoIuDPMF3pKuja0ajZabrMWU29FUMV9A/XMXT/XC1yXs5xt6t6t13GogQFsDrDqbFP4DkZQO1w8rWRAzYA==",
-  "pi_registry_shasum": "39c00809ff5531b6552b9ecb2c41f4c3529ec988",
+  "pi_registry_integrity": "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==",
+  "pi_registry_shasum": "c7382fd5e2958b75fdc2313eae67e9f6d12ac690",
   "runtime_baseline_ref": "references/pi-baseline.json",
   "nddev_builder_package_version": "0.1.0",
-  "pi_registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.82.1.tgz"
+  "pi_registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz"
 }
