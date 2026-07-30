@@ -134,6 +134,11 @@ def validate_contracts(errors: list[str]) -> None:
     assert settings is not None
     assert package is not None
 
+    require(
+        "verified_date" not in baseline,
+        "baseline currentness observation must remain private",
+        errors,
+    )
     require(SEMVER.fullmatch(version_text) is not None, "VERSION: invalid semantic version", errors)
     require(set(version) == REQUIRED_VERSION_KEYS, "build/version.json: key mismatch", errors)
     require(version.get("build_version") == version_text, "build version mismatch", errors)

@@ -1,7 +1,6 @@
 {
   "schema_version": 1,
   "verified_ref": "references/pi-baseline.json",
-  "verified_date": "2026-07-26",
   "product": {
     "name": "Pi Coding Agent",
     "site": "https://pi.dev/",
