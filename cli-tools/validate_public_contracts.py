@@ -232,14 +232,28 @@ def validate_release_and_runtime_integrity(errors: list[str]) -> None:
     ):
         require(fragment in release, f"release workflow omits {fragment}", errors)
     required_roots = {
-        "README.md", "LICENSE", "VERSION", "build", "builder", "cli-tools",
-        "config", "docs", "references", "setups",
+        "README.md",
+        "LICENSE",
+        "VERSION",
+        "AGENTS.md",
+        ".claude",
+        "build",
+        "builder",
+        "cli-tools",
+        "config",
+        "docs",
+        "profiles",
+        "references",
+        "setups",
     }
-    require(
-        required_roots.issubset(set(release.split())),
-        "release archive/runtime membership is incomplete",
-        errors,
-    )
+    for closure in ("archive_paths", "runtime_paths"):
+        match = re.search(rf"(?m)^      {closure}: >-\n((?:        .+\n?)+)", release)
+        members = set(match.group(1).split()) if match else set()
+        require(
+            required_roots.issubset(members),
+            f"release {closure} membership is incomplete",
+            errors,
+        )
     manager = (ROOT / "cli-tools/nddev_pi.py").read_text(encoding="utf-8")
     for fragment in (
         "NPM_JSON_OUTPUT_MAX_BYTES",
