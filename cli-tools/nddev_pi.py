@@ -604,6 +604,51 @@ def file_sha256(path: Path, *, label: str, max_bytes: int = SOFTWARE_FILE_MAX_BY
     return sha256_bytes(content)
 
 
+def require_untamperable_by_others(info: os.stat_result, path: Path, label: str) -> None:
+    """Require a path no *other* account can rewrite.
+
+    Target-owned artifacts must belong to the current user, but an external
+    system runtime legitimately belongs to root and is immutable to us. The
+    threat is substitution by a third account, so the rules differ by owner:
+
+    - world-writable without the sticky bit is always rejected;
+    - a component we own grants no other account anything, so its group bit is
+      not evidence of exposure;
+    - a component owned by anyone but root is rejected outright, and a
+      root-owned one must not be group-writable.
+    """
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o002 and not mode & stat.S_ISVTX:
+        fail(f"{label} must not be world-writable: {path}")
+    if not hasattr(os, "geteuid") or info.st_uid == os.geteuid():
+        return
+    if info.st_uid != 0:
+        fail(f"{label} must be owned by root or the current user: {path}")
+    if mode & 0o020:
+        fail(f"{label} must not be group-writable: {path}")
+
+
+def system_runtime_sha256(path: Path, *, label: str) -> str:
+    """Digest an external system runtime without demanding we own it.
+
+    A writable parent defeats a digest: the binary can be swapped between the
+    hash and the launch. Every component from the filesystem root is therefore
+    checked, not just the file, and the path must already be canonical so no
+    component can be a symlink into somewhere weaker.
+    """
+    if not path.is_absolute() or path != Path(os.path.realpath(path)):
+        fail(f"{label} must be an already-canonical absolute path: {path}")
+    for component in (path, *path.parents):
+        try:
+            component_info = component.lstat()
+        except OSError:
+            fail(f"{label} path component is unreadable: {component}")
+        require_untamperable_by_others(component_info, component, label)
+    content = read_regular_file(path, label, max_bytes=SOFTWARE_FILE_MAX_BYTES)
+    require_regular_file(path, label, max_bytes=SOFTWARE_FILE_MAX_BYTES)
+    return sha256_bytes(content)
+
+
 def software_tree_identity(root: Path) -> tuple[str, int, int]:
     root_info = require_directory(root, "software tree")
     require_current_user_owner(root_info, "software tree")
@@ -4392,7 +4437,7 @@ def resolve_node_runtime(stage_workspace: Path) -> dict[str, str]:
     return {
         "path": str(canonical),
         "version": output,
-        "sha256": file_sha256(canonical, label="node runtime"),
+        "sha256": system_runtime_sha256(canonical, label="node runtime"),
         "requirement": PI_NODE_REQUIREMENT,
     }
 
@@ -4736,7 +4781,9 @@ def software_status_payload(target: Path, *, validate_cleanup: bool = True) -> d
                 )
                 if stat.S_ISLNK(node_info.st_mode):
                     drift.append("node_runtime")
-                if file_sha256(node_path, label="node runtime") != node_runtime.get("sha256"):
+                if system_runtime_sha256(node_path, label="node runtime") != node_runtime.get(
+                    "sha256"
+                ):
                     drift.append("node_runtime")
         expected_wrapper = node_wrapper_content(
             str(stamp.get("node_runtime", {}).get("path", "")),
