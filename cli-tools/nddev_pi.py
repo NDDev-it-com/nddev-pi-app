@@ -44,6 +44,11 @@ BACKUP_NAME = "NDDEV-PI-BACKUP.json"
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 METADATA_MAX_BYTES = 256 * 1024
+# Cleanup intent/journal documents snapshot the full target-owned software
+# tree (e.g. a transitive npm node_modules install), which routinely exceeds
+# the 256 KiB metadata bound. Give the cleanup serialization surface its own
+# larger bound, matching the cleanup-document limits in sibling harnesses.
+CLEANUP_DOCUMENT_MAX_BYTES = 16 * 1024 * 1024
 MANAGED_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
 LOCK_BINDING_MAX_BYTES = 16 * 1024
 LOCK_NAMESPACE_NAME = "nddev-pi-app-locks"
@@ -2021,8 +2026,6 @@ def bounded_relative(value: str, label: str) -> Path:
     relative = Path(value)
     if any(part in {"", ".", ".."} for part in relative.parts):
         fail(f"{label} must be bounded and normalized")
-    if len(relative.as_posix()) > 160:
-        fail(f"{label} is too long")
     return relative
 
 
@@ -2645,7 +2648,7 @@ def validate_cleanup_document(
 
 def publish_json_no_replace(path: Path, payload: dict[str, Any], label: str) -> None:
     content = canonical_json(payload)
-    if len(content) > METADATA_MAX_BYTES:
+    if len(content) > CLEANUP_DOCUMENT_MAX_BYTES:
         fail(f"{label} is too large")
     ensure_directory(path.parent)
     parent_metadata_before_temp = directory_metadata(path.parent, f"{label} parent")
@@ -2730,7 +2733,7 @@ def validate_cleanup_document_file(
         fail(f"{label} is missing")
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         fail(f"{label} must be a regular non-symlink file")
-    require_bounded_size(info, label, METADATA_MAX_BYTES)
+    require_bounded_size(info, label, CLEANUP_DOCUMENT_MAX_BYTES)
     require_current_user_owner(info, label)
     if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
         fail(f"{label} must have mode 0600")
@@ -2753,7 +2756,7 @@ def validate_cleanup_document_file(
             fail(f"{label} changed to an unsafe file")
         if opened.st_nlink != info.st_nlink:
             fail(f"{label} link count changed while opening")
-        content = read_fd_bounded(descriptor, label, max_bytes=METADATA_MAX_BYTES)
+        content = read_fd_bounded(descriptor, label, max_bytes=CLEANUP_DOCUMENT_MAX_BYTES)
     finally:
         os.close(descriptor)
     document = parse_json_object(content, label)
