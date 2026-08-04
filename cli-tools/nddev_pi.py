@@ -5179,7 +5179,7 @@ def install_or_update_software(target: Path, *, update: bool) -> dict[str, Any]:
                 remove_created_target_if_empty(target)
                 restore_directory_metadata(target.parent, target_parent_state, "target parent")
             else:
-                restore_directory_metadata(target, target_state, "target")
+                restore_directory_metadata(target, target_state, "target", require_nlink=False)
                 restore_directory_metadata(target.parent, target_parent_state, "target parent")
             raise
 
