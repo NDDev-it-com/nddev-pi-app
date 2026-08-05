@@ -44,7 +44,7 @@ SEMVER = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
 PACKAGE_ID_PATTERN = re.compile(r"@[A-Za-z0-9._-]+/pi-coding-agent")
 REPOSITORY_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9._-]+/pi\b")
 MODULE_ID_PATTERN = re.compile(r"nddev-[a-z0-9-]+-app")
-SHARED_WORKFLOW_PIN = "f6ea891f09653b8d449098817c8acfdb510731f6"
+SHARED_WORKFLOW_PIN = "2ccb80e96f5771b6a6b4eae63a4f47e232906dc7"
 
 
 def read_json(relative: str, errors: list[str]) -> dict[str, Any] | None:
