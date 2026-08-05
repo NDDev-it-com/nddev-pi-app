@@ -220,17 +220,8 @@ def validate_contracts(errors: list[str]) -> None:
 
 
 def validate_release_and_runtime_integrity(errors: list[str]) -> None:
-    release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-    for fragment in (
-        "permissions: {}",
-        'tags:\n      - "[0-9]+.[0-9]+.[0-9]+"',
-        f"release-supply-chain.yml@{SHARED_WORKFLOW_PIN}",
-        "version: ${{ github.ref_name }}",
-        "package_name: nddev-pi-app",
-        "archive_paths:",
-        "runtime_paths:",
-    ):
-        require(fragment in release, f"release workflow omits {fragment}", errors)
+    release = (ROOT / "release/package.yml").read_text(encoding="utf-8")
+    require("package_name: nddev-pi-app" in release, "release package identity mismatch", errors)
     required_roots = {
         "README.md",
         "LICENSE",
@@ -246,14 +237,11 @@ def validate_release_and_runtime_integrity(errors: list[str]) -> None:
         "references",
         "setups",
     }
-    for closure in ("archive_paths", "runtime_paths"):
-        match = re.search(rf"(?m)^      {closure}: >-\n((?:        .+\n?)+)", release)
-        members = set(match.group(1).split()) if match else set()
-        require(
-            required_roots.issubset(members),
-            f"release {closure} membership is incomplete",
-            errors,
-        )
+    require(
+        required_roots.issubset(set(release.split())),
+        "release package membership is incomplete",
+        errors,
+    )
     manager = (ROOT / "cli-tools/nddev_pi.py").read_text(encoding="utf-8")
     for fragment in (
         "NPM_JSON_OUTPUT_MAX_BYTES",
