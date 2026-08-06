@@ -9,11 +9,11 @@
   },
   "package": {
     "name": "@earendil-works/pi-coding-agent",
-    "version": "0.83.0",
+    "version": "0.84.0",
     "registry": "https://registry.npmjs.org/@earendil-works%2fpi-coding-agent",
-    "tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz",
-    "integrity": "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==",
-    "shasum": "c7382fd5e2958b75fdc2313eae67e9f6d12ac690",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.84.0.tgz",
+    "integrity": "sha512-oxEU7BT9xuVT6UKNwUNDzNP5dVGb+DZRGfaEyMyAab8dRlqTSxxyhSlMAxmYsu//YOeasj9E8n2+px1BzIai0g==",
+    "shasum": "09f82d950bce5fe706a559f53a5c1728fff66fe3",
     "node": ">=22.19.0",
     "repository_directory": "packages/coding-agent"
   },
@@ -46,7 +46,7 @@
     "native_workspace_argument_supported": false,
     "native_workspace_argument": null,
     "official_cli_grammar": {
-      "package": "@earendil-works/pi-coding-agent@0.83.0",
+      "package": "@earendil-works/pi-coding-agent@0.84.0",
       "parser": "dist/cli/args.js",
       "documentation": "https://pi.dev/docs/latest/usage",
       "workspace_project_cwd_flags": []
@@ -82,7 +82,7 @@
     },
     "metadata_argv": [
       "view",
-      "@earendil-works/pi-coding-agent@0.83.0",
+      "@earendil-works/pi-coding-agent@0.84.0",
       "dist",
       "--json"
     ],
@@ -92,13 +92,13 @@
       "--ignore-scripts",
       "--pack-destination",
       "<stage>/tarballs",
-      "@earendil-works/pi-coding-agent@0.83.0"
+      "@earendil-works/pi-coding-agent@0.84.0"
     ],
     "byte_verification": {
-      "metadata_integrity": "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==",
-      "metadata_shasum": "c7382fd5e2958b75fdc2313eae67e9f6d12ac690",
-      "tarball_integrity": "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==",
-      "tarball_shasum": "c7382fd5e2958b75fdc2313eae67e9f6d12ac690",
+      "metadata_integrity": "sha512-oxEU7BT9xuVT6UKNwUNDzNP5dVGb+DZRGfaEyMyAab8dRlqTSxxyhSlMAxmYsu//YOeasj9E8n2+px1BzIai0g==",
+      "metadata_shasum": "09f82d950bce5fe706a559f53a5c1728fff66fe3",
+      "tarball_integrity": "sha512-oxEU7BT9xuVT6UKNwUNDzNP5dVGb+DZRGfaEyMyAab8dRlqTSxxyhSlMAxmYsu//YOeasj9E8n2+px1BzIai0g==",
+      "tarball_shasum": "09f82d950bce5fe706a559f53a5c1728fff66fe3",
       "verified_before_extract": true
     },
     "local_extraction": {
