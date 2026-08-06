@@ -56,6 +56,9 @@ LOCK_PRODUCT_ANCHOR_NAME = "global.lock"
 LOCK_TARGET_SUFFIX = ".target.lock"
 LOCK_TEMP_PREFIX = ".nddev-pi-publish."
 LOCK_NAMESPACE_SCAN_ENTRY_LIMIT = 1024
+LOCK_LEGACY_BUILD_VERSION_PATTERN = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
+)
 CLEANUP_DIR_NAME = ".nddev-pi-cleanup"
 CLEANUP_INTENT_NAME = "prepare-intent.json"
 CLEANUP_JOURNAL_NAME = "pending.json"
@@ -180,14 +183,14 @@ SENSITIVE_ENVIRONMENT_EXACT = {
     "NPM_TOKEN",
 }
 PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent"
-PI_PACKAGE_VERSION = "0.83.0"
+PI_PACKAGE_VERSION = "0.84.0"
 PI_PACKAGE_BIN = "dist/cli.js"
 PI_CLI_VERSION_OUTPUT = "0.0.0"
 PI_NODE_REQUIREMENT = ">=22.19.0"
-PI_REGISTRY_INTEGRITY = "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw=="
-PI_REGISTRY_SHASUM = "c7382fd5e2958b75fdc2313eae67e9f6d12ac690"
+PI_REGISTRY_INTEGRITY = "sha512-oxEU7BT9xuVT6UKNwUNDzNP5dVGb+DZRGfaEyMyAab8dRlqTSxxyhSlMAxmYsu//YOeasj9E8n2+px1BzIai0g=="
+PI_REGISTRY_SHASUM = "09f82d950bce5fe706a559f53a5c1728fff66fe3"
 PI_REGISTRY_TARBALL_URL = (
-    "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz"
+    "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.84.0.tgz"
 )
 NPM_VIEW_ARGV = [
     "view",
@@ -1136,7 +1139,6 @@ def anchor_binding(kind: str, canonical_target: Path | None = None) -> dict[str,
     binding: dict[str, Any] = {
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
-        "build_version": VERSION,
         "kind": kind,
         "namespace": LOCK_NAMESPACE_NAME,
     }
@@ -1147,6 +1149,24 @@ def anchor_binding(kind: str, canonical_target: Path | None = None) -> dict[str,
         binding["target_digest"] = target_anchor_digest(canonical_target)
         return binding
     fail("invalid external lock binding request")
+
+
+def normalized_anchor_binding(binding: dict[str, Any]) -> dict[str, Any] | None:
+    """Drop the obsolete non-identity build version from a legacy lock binding."""
+    normalized = dict(binding)
+    if "build_version" in normalized:
+        legacy_version = normalized.pop("build_version")
+        if (
+            not isinstance(legacy_version, str)
+            or LOCK_LEGACY_BUILD_VERSION_PATTERN.fullmatch(legacy_version) is None
+        ):
+            return None
+    return normalized
+
+
+def anchor_binding_matches(binding: dict[str, Any], expected: dict[str, Any]) -> bool:
+    normalized = normalized_anchor_binding(binding)
+    return normalized is not None and normalized == expected
 
 
 def read_fd_bounded(descriptor: int, label: str, *, max_bytes: int) -> bytes:
@@ -1198,7 +1218,7 @@ def validate_anchor_descriptor(
     if not content:
         fail("external lock binding is empty")
     binding = parse_json_object(content, "external lock binding")
-    if binding != expected_binding:
+    if not anchor_binding_matches(binding, expected_binding):
         fail("external lock binding mismatch")
     return opened
 
@@ -1294,23 +1314,25 @@ def validate_anchor_stage(
 
 
 def validate_anchor_stage_binding(binding: dict[str, Any]) -> None:
+    normalized = normalized_anchor_binding(binding)
+    if normalized is None:
+        fail("external lock pre-publication stage binding mismatch")
     common = {
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
-        "build_version": VERSION,
         "namespace": LOCK_NAMESPACE_NAME,
     }
-    kind = binding.get("kind")
+    kind = normalized.get("kind")
     if kind == "product":
-        if binding != {**common, "kind": "product"}:
+        if normalized != {**common, "kind": "product"}:
             fail("external lock pre-publication stage binding mismatch")
         return
     if kind != "target":
         fail("external lock pre-publication stage binding mismatch")
-    if set(binding) != {*common.keys(), "kind", "canonical_target", "target_digest"}:
+    if set(normalized) != {*common.keys(), "kind", "canonical_target", "target_digest"}:
         fail("external lock pre-publication stage binding mismatch")
-    canonical = binding.get("canonical_target")
-    digest = binding.get("target_digest")
+    canonical = normalized.get("canonical_target")
+    digest = normalized.get("target_digest")
     if not isinstance(canonical, str) or not canonical.startswith("/"):
         fail("external lock pre-publication stage binding mismatch")
     if not isinstance(digest, str) or digest != target_anchor_digest(Path(canonical)):
@@ -1336,7 +1358,7 @@ def validated_anchor_stages(
         _, binding = validate_anchor_stage(stage, allow_linked_final=allow_linked_final)
         if anchor_stage_destination(parent, binding) != final:
             continue
-        if binding != expected_binding:
+        if not anchor_binding_matches(binding, expected_binding):
             fail("external lock pre-publication stage binding mismatch")
         matching.append(stage)
     return matching
