@@ -183,14 +183,14 @@ SENSITIVE_ENVIRONMENT_EXACT = {
     "NPM_TOKEN",
 }
 PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent"
-PI_PACKAGE_VERSION = "0.84.0"
+PI_PACKAGE_VERSION = "0.84.1"
 PI_PACKAGE_BIN = "dist/cli.js"
 PI_CLI_VERSION_OUTPUT = "0.0.0"
 PI_NODE_REQUIREMENT = ">=22.19.0"
-PI_REGISTRY_INTEGRITY = "sha512-oxEU7BT9xuVT6UKNwUNDzNP5dVGb+DZRGfaEyMyAab8dRlqTSxxyhSlMAxmYsu//YOeasj9E8n2+px1BzIai0g=="
-PI_REGISTRY_SHASUM = "09f82d950bce5fe706a559f53a5c1728fff66fe3"
+PI_REGISTRY_INTEGRITY = "sha512-ncAqFrG+iybuPGOhMiZoEHkEzTpJgz3guYD32pD+M7ucc0WeHmauP6wa7qwP8V/KWvsZDVNa5XGsdZ7fkC7w7A=="
+PI_REGISTRY_SHASUM = "e098cada629fdeeb9df6e77c6d480d43e1b2c553"
 PI_REGISTRY_TARBALL_URL = (
-    "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.84.0.tgz"
+    "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.84.1.tgz"
 )
 NPM_VIEW_ARGV = [
     "view",
