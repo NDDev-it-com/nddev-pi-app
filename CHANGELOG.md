@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2] - 2026-08-08
+
+- Update Pi Coding Agent to `0.84.1` with its exact npm SRI, shasum, and
+  tarball identity.
+- Revalidate the unchanged Node `>=22.19.0` floor, `pi` entrypoint, package
+  layout, wrapper version identity, and target-owned install lifecycle; the
+  package-family dependency set advances coherently to `0.84.1`.
+
 ## [0.1.1] - 2026-08-06
 
 - Update Pi Coding Agent to `0.84.0`, including exact npm integrity and tarball

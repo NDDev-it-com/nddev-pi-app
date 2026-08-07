@@ -1,16 +1,16 @@
 {
   "schema_version": 2,
-  "build_version": "0.1.1",
+  "build_version": "0.1.2",
   "python_requires": ">=3.9",
   "pi_product_name": "Pi Coding Agent",
   "pi_package_name": "@earendil-works/pi-coding-agent",
-  "pi_coding_agent_tested": "0.84.0",
+  "pi_coding_agent_tested": "0.84.1",
   "pi_command": "pi",
   "pi_package_bin": "dist/cli.js",
   "pi_node_requires": ">=22.19.0",
-  "pi_registry_integrity": "sha512-oxEU7BT9xuVT6UKNwUNDzNP5dVGb+DZRGfaEyMyAab8dRlqTSxxyhSlMAxmYsu//YOeasj9E8n2+px1BzIai0g==",
-  "pi_registry_shasum": "09f82d950bce5fe706a559f53a5c1728fff66fe3",
+  "pi_registry_integrity": "sha512-ncAqFrG+iybuPGOhMiZoEHkEzTpJgz3guYD32pD+M7ucc0WeHmauP6wa7qwP8V/KWvsZDVNa5XGsdZ7fkC7w7A==",
+  "pi_registry_shasum": "e098cada629fdeeb9df6e77c6d480d43e1b2c553",
   "runtime_baseline_ref": "references/pi-baseline.json",
   "nddev_builder_package_version": "0.1.0",
-  "pi_registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.84.0.tgz"
+  "pi_registry_tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.84.1.tgz"
 }
